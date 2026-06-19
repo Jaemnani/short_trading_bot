@@ -1,0 +1,181 @@
+"""Idempotent order management + fill application.
+
+Idempotency: the ``client_order_id`` row is persisted BEFORE the broker call, and a
+second ``submit`` with the same id never re-sends — it returns the existing order's
+ack. Fills update the order state machine and the owning PositionLot, and every step
+is written to the append-only ``audit_log``.
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..domain.enums import OrderState, Side
+from ..infra.logging import get_logger
+from ..persistence.db import session_scope
+from ..persistence.models import AuditLog, Order, Position
+from ..persistence.models import Fill as FillRow
+from .broker.base import BrokerAdapter
+from .types import Fill, OrderAck, OrderRequest
+
+
+class OrderManager:
+    def __init__(
+        self,
+        broker: BrokerAdapter,
+        session_factory: async_sessionmaker[AsyncSession],
+        logger: Any = None,
+    ) -> None:
+        self._broker = broker
+        self._sf = session_factory
+        self._log = logger or get_logger("order_manager")
+        broker.fill_handler = self.handle_fill  # route fills back here
+
+    async def submit(self, req: OrderRequest) -> OrderAck:
+        # 1) Idempotency check + persist PENDING_NEW BEFORE any network call.
+        async with session_scope(self._sf) as s:
+            existing = await self._find_order(s, req.client_order_id)
+            if existing is not None:
+                self._log.info(
+                    "order.idempotent.skip",
+                    client_order_id=req.client_order_id,
+                    state=existing.state,
+                )
+                return OrderAck(
+                    client_order_id=req.client_order_id,
+                    accepted=existing.state != OrderState.REJECTED,
+                    broker_order_no=existing.broker_order_no,
+                    tr_id=existing.tr_id,
+                )
+            s.add(
+                Order(
+                    order_id=str(uuid4()),
+                    lot_id=req.lot_id,
+                    client_order_id=req.client_order_id,
+                    side=req.side.value,
+                    qty=req.qty,
+                    price=req.price,
+                    ord_dvsn=req.ord_dvsn,
+                    state=OrderState.PENDING_NEW.value,
+                )
+            )
+            s.add(self._audit("order.pending", req.lot_id, {"client_order_id": req.client_order_id}))
+
+        # 2) Network call (outside the persist transaction).
+        ack = await self._broker.submit_order(req)
+
+        # 3) Record outcome. Guard against overwriting a fill that already arrived.
+        async with session_scope(self._sf) as s:
+            order = await self._find_order(s, req.client_order_id)
+            assert order is not None
+            if ack.accepted:
+                order.broker_order_no = ack.broker_order_no
+                order.tr_id = ack.tr_id
+                if order.state == OrderState.PENDING_NEW.value:
+                    order.state = OrderState.NEW.value
+                evt = "order.accepted"
+            else:
+                order.state = OrderState.REJECTED.value
+                evt = "order.rejected"
+            s.add(
+                self._audit(
+                    evt,
+                    req.lot_id,
+                    {"client_order_id": req.client_order_id, "reason": ack.reject_reason},
+                )
+            )
+        return ack
+
+    async def handle_fill(self, fill: Fill) -> None:
+        async with session_scope(self._sf) as s:
+            order = await self._find_order(s, fill.client_order_id)
+            if order is None:
+                self._log.warning("fill.unknown_order", client_order_id=fill.client_order_id)
+                return
+
+            s.add(
+                FillRow(
+                    fill_id=str(uuid4()),
+                    order_id=order.order_id,
+                    lot_id=order.lot_id,
+                    qty=fill.qty,
+                    price=fill.price,
+                    fee=fill.fee,
+                    tax=fill.tax,
+                    currency=fill.currency.value,
+                    filled_at=fill.ts,
+                    source=fill.source,
+                )
+            )
+
+            total_filled = await self._total_filled(s, order.order_id) + fill.qty
+            order.state = (
+                OrderState.FILLED.value
+                if total_filled >= order.qty
+                else OrderState.PARTIALLY_FILLED.value
+            )
+
+            await self._apply_to_position(s, order, fill)
+            s.add(
+                self._audit(
+                    "fill.applied",
+                    order.lot_id,
+                    {
+                        "client_order_id": fill.client_order_id,
+                        "qty": str(fill.qty),
+                        "price": str(fill.price),
+                        "order_state": order.state,
+                    },
+                )
+            )
+
+    # -- internals -------------------------------------------------------
+
+    @staticmethod
+    async def _find_order(s: AsyncSession, client_order_id: str) -> Order | None:
+        return (
+            await s.execute(select(Order).where(Order.client_order_id == client_order_id))
+        ).scalar_one_or_none()
+
+    @staticmethod
+    async def _total_filled(s: AsyncSession, order_id: str) -> Decimal:
+        rows = (
+            await s.execute(select(FillRow.qty).where(FillRow.order_id == order_id))
+        ).scalars().all()
+        return sum(rows, Decimal(0))
+
+    async def _apply_to_position(self, s: AsyncSession, order: Order, fill: Fill) -> None:
+        pos = (
+            await s.execute(select(Position).where(Position.lot_id == order.lot_id))
+        ).scalar_one_or_none()
+        if pos is None:
+            self._log.warning("fill.no_position", lot_id=order.lot_id)
+            return
+
+        if order.side == Side.BUY:
+            new_qty = pos.qty_filled + fill.qty
+            if new_qty > 0:
+                pos.avg_entry_price = (
+                    pos.avg_entry_price * pos.qty_filled + fill.price * fill.qty
+                ) / new_qty
+            pos.qty_filled = new_qty
+        else:  # SELL closes part/all of the long -> realize P&L on the held portion only
+            realized_qty = min(fill.qty, pos.qty_filled) if pos.qty_filled > 0 else Decimal(0)
+            pos.realized_pnl += (fill.price - pos.avg_entry_price) * realized_qty - fill.fee - fill.tax
+            pos.qty_filled = max(Decimal(0), pos.qty_filled - fill.qty)
+            if fill.qty > realized_qty:  # over-sell => drift/double-fill; never fabricate PnL
+                self._log.warning(
+                    "fill.oversell",
+                    lot_id=order.lot_id,
+                    fill_qty=str(fill.qty),
+                    held=str(realized_qty),
+                )
+
+    @staticmethod
+    def _audit(event_type: str, lot_id: str | None, payload: dict[str, Any]) -> AuditLog:
+        return AuditLog(event_type=event_type, lot_id=lot_id, payload_json=payload)

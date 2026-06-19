@@ -1,0 +1,217 @@
+"""TradingService — the async engine orchestrator.
+
+Wires the pipeline: Feed → IndicatorEngine → per-ticker PositionLot.evaluate → RiskManager
+gate → OrderManager (idempotent) → BrokerAdapter. Fills flow back through a composed handler
+that persists (OrderManager) AND syncs the in-memory lot (strategy source of truth). Remote
+control: PAUSE blocks new entries (risk gate); STOP requests a flat-all liquidation that the
+loop executes promptly. The same service runs over a ReplayFeed (paper-over-history / tests)
+or a live KIS WebSocket feed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from decimal import Decimal
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..domain.enums import Currency, Side
+from ..domain.factory import PositionFactory
+from ..domain.position import PositionLot
+from ..domain.signal import Intent, IntentKind, Signal
+from ..execution.broker.base import BrokerAdapter
+from ..execution.order_manager import OrderManager
+from ..execution.types import Fill, OrderRequest
+from ..infra.logging import get_logger
+from ..infra.notifier.base import InMemoryNotifier, Notifier
+from ..market.feed import Feed
+from ..market.indicators import IndicatorEngine
+from ..market.types import Bar, IndicatorSnapshot
+from ..persistence.db import session_scope
+from ..persistence.models import Position
+from ..risk.limits import RiskSnapshot
+from ..risk.manager import RiskManager
+from ..strategy.templates import StrategyTemplate
+
+_ENTRY_KINDS = (IntentKind.ENTER, IntentKind.ADD)
+
+
+class TradingService:
+    def __init__(
+        self,
+        broker: BrokerAdapter,
+        session_factory: async_sessionmaker[AsyncSession],
+        risk: RiskManager,
+        watchlist: dict[str, StrategyTemplate],
+        *,
+        notifier: Notifier | None = None,
+        news_ewma: float | None = None,
+        news_provider: Callable[[str], float | None] | None = None,
+    ) -> None:
+        self._broker = broker
+        self._sf = session_factory
+        self._risk = risk
+        self._watchlist = watchlist
+        self._om = OrderManager(broker, session_factory)
+        self._engine = IndicatorEngine()
+        self._notifier = notifier or InMemoryNotifier()
+        self._news = news_ewma
+        self._news_provider = news_provider  # per-ticker EWMA (overrides scalar news_ewma)
+        self._log = get_logger("service")
+
+        self._lots: dict[str, PositionLot] = {}
+        self._prev: dict[str, IndicatorSnapshot] = {}
+        self._last_price: dict[str, Decimal] = {}
+        self._co_map: dict[str, tuple[PositionLot, Side, bool]] = {}
+        self._counter = 0
+
+        # Override OrderManager's fill handler with a composed one (persist + lot sync).
+        broker.fill_handler = self._on_fill
+        self.control = risk.control
+
+    @property
+    def lots(self) -> dict[str, PositionLot]:
+        return self._lots
+
+    async def run(self, feed: Feed) -> None:
+        async for bar in feed.stream():
+            await self.process(bar)
+
+    async def process(self, bar: Bar) -> None:
+        self._last_price[bar.ticker] = bar.close
+        # Kill switch: liquidate everything, then halt (no new entries/management).
+        if self.control.flat_all_requested:
+            await self._flat_all()
+            self.control.clear_flat_all()
+
+        snap = self._engine.update(bar)  # keep indicators warm even while halted
+        ticker = bar.ticker
+        if self.control.is_stopped:
+            self._prev[ticker] = snap
+            return
+
+        lot = self._lots.get(ticker)
+        if lot is not None and lot.is_open:
+            lot.on_bar(bar.high)
+        if (lot is None or lot.is_terminal) and ticker in self._watchlist:
+            lot = await self._spawn(ticker)
+        if lot is None:
+            self._prev[ticker] = snap
+            return
+
+        equity = await self._equity()
+        snapshot = self._risk_snapshot(equity)
+        news = self._news_provider(ticker) if self._news_provider is not None else self._news
+        for intent in lot.evaluate(snap, equity, prev=self._prev.get(ticker), news_ewma=news):
+            if intent.is_actionable:
+                await self._handle_intent(intent, lot, bar, snapshot)
+        self._prev[ticker] = snap
+
+    # -- intent handling -------------------------------------------------
+
+    async def _handle_intent(
+        self, intent: Intent, lot: PositionLot, bar: Bar, snapshot: RiskSnapshot
+    ) -> None:
+        qty = lot.qty if intent.kind is IntentKind.EXIT else intent.qty
+        if qty is None or qty <= 0:
+            return
+        decision = self._risk.check(
+            intent_kind=intent.kind,
+            ticker=lot.ticker,
+            order_notional=bar.close * qty,
+            snapshot=snapshot,
+        )
+        if not decision.allowed:
+            await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason=decision.reason)
+            return
+        await self._submit(
+            lot, intent.side, qty, bar.close, is_add=intent.kind is IntentKind.ADD, reason=intent.reason
+        )
+
+    async def _submit(
+        self, lot: PositionLot, side: Side, qty: Decimal, price: Decimal, *, is_add: bool, reason: str
+    ) -> None:
+        if qty <= 0:
+            return
+        cid = f"{lot.lot_id}-{self._counter}"
+        self._counter += 1
+        self._co_map[cid] = (lot, side, is_add)
+        req = OrderRequest(
+            client_order_id=cid,
+            lot_id=lot.lot_id,
+            ticker=lot.ticker,
+            market=lot.market,
+            side=side,
+            qty=qty,
+            price=price,  # marketable limit at last price
+            ord_dvsn="00",
+        )
+        ack = await self._om.submit(req)
+        await self._notifier.notify(
+            "order.accepted" if ack.accepted else "order.rejected",
+            ticker=lot.ticker,
+            side=side.value,
+            qty=str(qty),
+            reason=reason,
+        )
+
+    async def _flat_all(self) -> None:
+        for ticker, lot in list(self._lots.items()):
+            if lot.is_open:
+                price = self._last_price.get(ticker, lot.avg_entry)
+                await self._submit(lot, Side.SELL, lot.qty, price, is_add=False, reason="kill_switch")
+        await self._notifier.notify("kill_switch.flat_all")
+
+    # -- fills (composed: persist + in-memory lot sync) ------------------
+
+    async def _on_fill(self, fill: Fill) -> None:
+        await self._om.handle_fill(fill)  # DB: order/fill/position projection + audit
+        meta = self._co_map.get(fill.client_order_id)
+        if meta is not None:
+            lot, side, is_add = meta
+            lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
+
+    # -- helpers ---------------------------------------------------------
+
+    async def _spawn(self, ticker: str) -> PositionLot:
+        template = self._watchlist[ticker]
+        lot = PositionFactory.create(Signal(ticker=ticker, market=template.market), template)
+        self._lots[ticker] = lot
+        async with session_scope(self._sf) as session:
+            session.add(
+                Position(
+                    lot_id=lot.lot_id,
+                    ticker=ticker,
+                    market=lot.market.value,
+                    currency=lot.currency.value,
+                    side="BUY",
+                    state=lot.state.value,
+                    strategy_id=lot.params.strategy_id,
+                    params_json=lot.params.model_dump(mode="json"),
+                    resolution=lot.params.resolution.value,
+                    qty_target=Decimal(0),
+                )
+            )
+        return lot
+
+    async def _equity(self) -> Decimal:
+        balance = await self._broker.get_balance()
+        equity = balance.cash.get(Currency.KRW, Decimal(0))
+        for ticker, lot in self._lots.items():
+            if lot.qty > 0:
+                equity += lot.qty * self._last_price.get(ticker, lot.avg_entry)
+        return equity
+
+    def _risk_snapshot(self, equity: Decimal) -> RiskSnapshot:
+        open_lots = [lot for lot in self._lots.values() if lot.is_open]
+        exposure: dict[str, Decimal] = {}
+        for lot in open_lots:
+            price = self._last_price.get(lot.ticker, lot.avg_entry)
+            exposure[lot.ticker] = exposure.get(lot.ticker, Decimal(0)) + lot.qty * price
+        daily_pnl = sum((lot.realized_pnl for lot in self._lots.values()), Decimal(0))
+        return RiskSnapshot(
+            equity=equity,
+            open_positions=len(open_lots),
+            daily_pnl=daily_pnl,
+            ticker_exposure=exposure,
+        )
