@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     dart_api_key: str = ""
     notifier: NotifierSettings = Field(default_factory=NotifierSettings)
 
+    # API / dashboard (P10). Override in prod; serve behind HTTPS.
+    api_jwt_secret: str = "dev-insecure-change-me"
+    api_username: str = "admin"
+    api_password: str = "admin"
+
     @property
     def is_live(self) -> bool:
         return self.mode is Mode.LIVE

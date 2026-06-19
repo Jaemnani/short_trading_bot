@@ -29,8 +29,18 @@ cp .env.example .env        # KIS 키 등 입력 (절대 커밋 금지)
 .venv/bin/trader version        # 버전
 .venv/bin/trader config         # 효과적 설정(시크릿 마스킹)
 .venv/bin/alembic upgrade head  # DB 스키마 생성
-.venv/bin/trader serve          # 엔진 실행 (P1+에서 오케스트레이터 구현)
+.venv/bin/trader serve          # 트레이딩 엔진(TradingService)
+.venv/bin/trader api            # 대시보드 API + WebSocket (FastAPI) — 프로덕션은 HTTPS 뒤에
 ```
+
+### 대시보드 (PWA)
+
+```bash
+cd frontend && npm install && npm run build   # 또는 npm run dev (개발)
+```
+
+반응형 React PWA(모바일/태블릿/웹·설치형). API 기본 주소는 `VITE_API_BASE`로 설정. 로그인 후
+엔진 상태·보유 포지션·알고리즘 목록을 보고 **일시중지/재개/긴급중지(전량청산)** 를 원격 제어.
 
 ## 검증
 

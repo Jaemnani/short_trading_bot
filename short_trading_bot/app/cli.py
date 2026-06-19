@@ -79,7 +79,17 @@ def serve() -> None:
             hint="set STB_KIS__PAPER__* or STB_KIS__LIVE__* in .env",
         )
     log.info("engine.start.placeholder", mode=s.mode.value, dry_run=s.dry_run)
-    typer.echo("engine scaffold ready — orchestrator implemented in later phases (P1+).")
+    typer.echo("engine scaffold ready — wire a Feed + broker to TradingService (app/service.py).")
+
+
+@app.command("api")
+def serve_api(host: str = "0.0.0.0", port: int = 8000) -> None:
+    """Serve the dashboard API + WebSocket (FastAPI). Put HTTPS in front for production."""
+    import uvicorn
+
+    s = _bootstrap()
+    get_logger("api").info("api.start", host=host, port=port, mode=s.mode.value)
+    uvicorn.run("short_trading_bot.api.main:app", host=host, port=port)
 
 
 @campaign_app.command("list")

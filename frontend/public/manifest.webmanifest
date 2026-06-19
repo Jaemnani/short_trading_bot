@@ -1,0 +1,12 @@
+{
+  "name": "KIS 자동매매 대시보드",
+  "short_name": "KIS Bot",
+  "description": "한국투자증권 자동매매 봇 모니터링 + 원격 제어",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1f33",
+  "theme_color": "#0b1f33",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
