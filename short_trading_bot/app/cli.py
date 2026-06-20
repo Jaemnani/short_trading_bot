@@ -92,6 +92,23 @@ def serve_api(host: str = "0.0.0.0", port: int = 8000) -> None:
     uvicorn.run("short_trading_bot.api.main:app", host=host, port=port)
 
 
+@app.command()
+def preflight() -> None:
+    """Go-live readiness checks (run before flipping STB_MODE=LIVE)."""
+    from .engine import is_ready
+    from .engine import preflight as run_preflight
+
+    s = _bootstrap()
+    checks = run_preflight(s)
+    for c in checks:
+        mark = "OK" if c.ok else ("!!" if c.critical else "--")
+        typer.echo(f"[{mark}] {c.name}: {c.detail}")
+    ready = is_ready(checks)
+    typer.echo(f"\nready={ready} (mode={s.mode.value})")
+    if not ready:
+        raise typer.Exit(code=1)
+
+
 @campaign_app.command("list")
 def campaign_list() -> None:
     """List campaigns (placeholder)."""
