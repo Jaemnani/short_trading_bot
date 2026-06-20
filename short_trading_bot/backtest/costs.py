@@ -1,8 +1,8 @@
 """KR trading-cost model for realistic backtests / paper fills.
 
 - Brokerage fee on both sides (~0.015%).
-- 증권거래세 (securities transaction tax) on SELLS only, KRX domestic (~0.18%, declining
-  schedule — verify current rate); overseas has no KR transaction tax.
+- 증권거래세 (securities transaction tax) on SELLS only, KRX domestic — 2026: KOSPI 0.20%
+  (0.05% + 0.15% 농특세) and KOSDAQ 0.20%; overseas has no KR transaction tax.
 - Slippage applied to the reference (close) price.
 
 NOTE: ±30% price limits, 상한가/하한가 lock-ups, VI pauses, and T+2 cash settlement are
@@ -22,7 +22,7 @@ _BPS = Decimal(10000)
 @dataclass(slots=True)
 class CostModel:
     fee_bps: float = 1.5  # ~0.015% brokerage, each side
-    sell_tax_bps: float = 18.0  # ~0.18% KRX 증권거래세 (sell only)
+    sell_tax_bps: float = 20.0  # 0.20% KRX 증권거래세 (sell only), 2026 KOSPI & KOSDAQ
     slippage_bps: float = 5.0
 
     def buy_price(self, ref: Decimal) -> Decimal:

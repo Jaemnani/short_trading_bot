@@ -57,7 +57,8 @@ async def test_routing_without_overseas_raises() -> None:
 # --- KisWebSocketFeed parsing ---
 
 def _frame(ticker: str, hhmmss: str, price: str, volume: str) -> str:
-    fields = [ticker, hhmmss, price, *(["0"] * 10), volume]  # index 13 = volume
+    # CNTG_VOL (per-trade volume) is at index 12; index 13 is ACML_VOL (accumulated)
+    fields = [ticker, hhmmss, price, *(["0"] * 9), volume, "0"]
     return "0|H0STCNT0|001|" + "^".join(fields)
 
 

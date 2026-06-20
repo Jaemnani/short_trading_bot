@@ -2,10 +2,11 @@
 
 Mirrors the overseas adapter: injectable async transport makes request-building and
 response-parsing unit-testable without network. Real fills arrive via the WebSocket
-(H0STCNI0/H0STCNI9) or polling, wired by the runtime in P9.
+(H0STCNI0/H0STCNI9) or polling, wired by the runtime.
 
-⚠️ Response field names and the cancel TR_ID follow common KIS shapes; verify against the
-official sample repo / portal before live use.
+TR_IDs verified vs the KIS official sample repo (next-gen KRX/NXT): buy TTTC0012U,
+sell TTTC0011U, cancel TTTC0013U; bodies carry EXCG_ID_DVSN_CD (KRX/NXT/SOR), sell adds
+SLL_TYPE. ⚠️ Response field names still follow common KIS shapes — confirm on the portal.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from ...domain.enums import Currency, Market, Mode
+from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
 from ..types import AccountBalance, BalancePosition, OrderAck, OrderRequest
@@ -28,7 +29,6 @@ Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[
 _ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 _CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
-_CANCEL_TR_LIVE = "TTTC0803U"  # ⚠️ verify on portal
 
 
 class KisBrokerAdapter(BrokerAdapter):
@@ -75,7 +75,7 @@ class KisBrokerAdapter(BrokerAdapter):
         )
 
     async def cancel_order(self, req: OrderRequest, broker_order_no: str | None) -> OrderAck:
-        tr_id = ("V" + _CANCEL_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CANCEL_TR_LIVE
+        tr_id = self._router.cancel_tr_id(Market.KRX, self._mode)
         headers = await self._headers(tr_id)
         body = {
             "CANO": self._cano,
@@ -83,10 +83,11 @@ class KisBrokerAdapter(BrokerAdapter):
             "KRX_FWDG_ORD_ORGNO": "",
             "ORGN_ODNO": broker_order_no or "",
             "ORD_DVSN": req.ord_dvsn,
-            "RVSE_CNCL_DVSN_CD": "02",  # 02 = cancel
+            "RVSE_CNCL_DVSN_CD": "02",  # 02 = cancel, 01 = revise
             "ORD_QTY": str(req.qty),
             "ORD_UNPR": str(req.price),
             "QTY_ALL_ORD_YN": "Y",
+            "EXCG_ID_DVSN_CD": "KRX",
         }
         resp = await self._transport("POST", f"{self._base}{_CANCEL_PATH}", headers, body)
         return OrderAck(
@@ -126,14 +127,18 @@ class KisBrokerAdapter(BrokerAdapter):
         return self._creds.account_no.split("-")[0]
 
     def build_order_body(self, req: OrderRequest) -> dict[str, Any]:
-        return {
+        body: dict[str, Any] = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._creds.account_product_code,
             "PDNO": req.ticker,
             "ORD_DVSN": req.ord_dvsn,  # 00 limit, 01 market
             "ORD_QTY": str(req.qty),
             "ORD_UNPR": str(req.price),  # "0" for market
+            "EXCG_ID_DVSN_CD": "KRX",  # next-gen routing: KRX | NXT | SOR
         }
+        if req.side is Side.SELL:
+            body["SLL_TYPE"] = "01"  # normal sell
+        return body
 
     @staticmethod
     def _parse_balance(resp: dict[str, Any]) -> AccountBalance:

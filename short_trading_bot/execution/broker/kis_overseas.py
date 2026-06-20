@@ -3,8 +3,8 @@
 Implements :class:`BrokerAdapter` for 미국/홍콩/일본/중국/베트남. The HTTP transport is
 injectable so request-building + response-parsing are unit-testable without network.
 Fills are not pushed by KIS REST; the runtime delivers them via the overseas WebSocket
-(HDFSCNT0 / H0GSCNI0) or by polling — wired in P9. ``cancel_order`` is intentionally
-unimplemented because the overseas amend/cancel TR_ID is unverified (confirm on portal).
+(HDFSCNT0 / H0GSCNI0) or by polling. ``cancel_order`` is implemented for US (TTTT1004U,
+verified); non-US markets raise via the router until their cancel TR_IDs are confirmed.
 
 ⚠️ Response field names (ovrs_pdno, ovrs_cblc_qty, ...) follow common KIS shapes but must
 be verified against the official sample repo / portal before live use.
@@ -28,6 +28,7 @@ from .market_router import MarketRouter
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
+_CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 _NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 
@@ -79,8 +80,27 @@ class KisOverseasAdapter(BrokerAdapter):
         )
 
     async def cancel_order(self, req: OrderRequest, broker_order_no: str | None) -> OrderAck:
-        raise NotImplementedError(
-            "overseas amend/cancel TR_ID is unverified — confirm on the KIS portal before use"
+        # US verified (TTTT1004U); non-US markets raise (cancel TR unverified) via the router.
+        tr_id = self._router.cancel_tr_id(req.market, self._mode)
+        headers = await self._headers(tr_id)
+        body = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._creds.account_product_code,
+            "OVRS_EXCG_CD": self._router.trading_exchange_code(req.market),
+            "PDNO": req.ticker,
+            "ORGN_ODNO": broker_order_no or "",
+            "RVSE_CNCL_DVSN_CD": "02",  # 02 = cancel
+            "ORD_QTY": str(req.qty),
+            "OVRS_ORD_UNPR": "0",
+        }
+        resp = await self._transport("POST", f"{self._base}{_CANCEL_PATH}", headers, body)
+        ok = str(resp.get("rt_cd")) == "0"
+        return OrderAck(
+            client_order_id=req.client_order_id,
+            accepted=ok,
+            broker_order_no=broker_order_no,
+            tr_id=tr_id,
+            reject_reason=None if ok else str(resp.get("msg1", "rejected")),
         )
 
     async def get_balance(self) -> AccountBalance:

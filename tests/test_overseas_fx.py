@@ -17,9 +17,11 @@ ROUTER = MarketRouter()
 
 
 def test_domestic_order_tr_ids() -> None:
-    assert ROUTER.order_tr_id(Market.KRX, Side.BUY, Mode.LIVE) == "TTTC0802U"
-    assert ROUTER.order_tr_id(Market.KRX, Side.SELL, Mode.LIVE) == "TTTC0801U"
-    assert ROUTER.order_tr_id(Market.KRX, Side.BUY, Mode.PAPER) == "VTTC0802U"
+    assert ROUTER.order_tr_id(Market.KRX, Side.BUY, Mode.LIVE) == "TTTC0012U"
+    assert ROUTER.order_tr_id(Market.KRX, Side.SELL, Mode.LIVE) == "TTTC0011U"
+    assert ROUTER.order_tr_id(Market.KRX, Side.BUY, Mode.PAPER) == "VTTC0012U"
+    assert ROUTER.cancel_tr_id(Market.KRX, Mode.LIVE) == "TTTC0013U"
+    assert ROUTER.cancel_tr_id(Market.NASD, Mode.PAPER) == "VTTT1004U"
 
 
 def test_overseas_order_tr_ids() -> None:
@@ -153,6 +155,19 @@ async def test_get_balance_parses_holdings_and_cash() -> None:
     assert bal.cash[Currency.USD] == Decimal("1000.50")
 
 
-async def test_cancel_order_unimplemented() -> None:
-    with pytest.raises(NotImplementedError):
-        await _adapter(FakeTransport({})).cancel_order(_buy_req(), "0000123")
+async def test_overseas_cancel_us_builds_rvsecncl() -> None:
+    transport = FakeTransport({"rt_cd": "0", "msg1": "ok"})
+    ack = await _adapter(transport).cancel_order(_buy_req(), "0000123")
+    assert ack.accepted and ack.tr_id == "VTTT1004U"  # paper US cancel
+    _method, url, _headers, body = transport.calls[0]
+    assert url.endswith("/uapi/overseas-stock/v1/trading/order-rvsecncl")
+    assert body["RVSE_CNCL_DVSN_CD"] == "02" and body["ORGN_ODNO"] == "0000123"
+
+
+async def test_overseas_cancel_non_us_unverified_raises() -> None:
+    req = OrderRequest(
+        client_order_id="c", lot_id="l", ticker="0700", market=Market.SEHK,
+        side=Side.BUY, qty=Decimal("10"), price=Decimal("100"),
+    )
+    with pytest.raises(ValueError):
+        await _adapter(FakeTransport({})).cancel_order(req, "x")

@@ -27,8 +27,16 @@ _OVERSEAS_ORDER: dict[Market, tuple[str, str]] = {
     Market.VNSE: ("TTTS0311U", "TTTS0310U"),
 }
 
-# Domestic (KRX) order TR_IDs (live).
-_DOMESTIC_ORDER = {Side.BUY: "TTTC0802U", Side.SELL: "TTTC0801U"}
+# Domestic (KRX) order TR_IDs (live, next-gen KRX/NXT system — verified vs KIS sample repo).
+_DOMESTIC_ORDER = {Side.BUY: "TTTC0012U", Side.SELL: "TTTC0011U"}
+_DOMESTIC_CANCEL = "TTTC0013U"  # order-rvsecncl (정정/취소 통합)
+
+# Overseas cancel/revise (order-rvsecncl). US verified; non-US UNVERIFIED — confirm per exchange.
+_OVERSEAS_CANCEL: dict[Market, str] = {
+    Market.NASD: "TTTT1004U",
+    Market.NYSE: "TTTT1004U",
+    Market.AMEX: "TTTT1004U",
+}
 
 # Balance inquiry TR_IDs (live): domestic vs overseas.
 _DOMESTIC_BALANCE = "TTTC8434R"
@@ -51,6 +59,16 @@ class MarketRouter:
             if pair is None:
                 raise ValueError(f"no order TR_ID for market {market.value}")
             tr_id = pair[0] if side is Side.BUY else pair[1]
+        return _paper(tr_id) if mode is Mode.PAPER else tr_id
+
+    def cancel_tr_id(self, market: Market, mode: Mode) -> str:
+        if market is Market.KRX:
+            tr_id = _DOMESTIC_CANCEL
+        else:
+            cancel = _OVERSEAS_CANCEL.get(market)
+            if cancel is None:
+                raise ValueError(f"unverified cancel TR_ID for market {market.value}")
+            tr_id = cancel
         return _paper(tr_id) if mode is Mode.PAPER else tr_id
 
     def balance_tr_id(self, market: Market, mode: Mode) -> str:

@@ -48,15 +48,16 @@ async def test_domestic_submit_builds_request() -> None:
     transport = FakeTransport({"rt_cd": "0", "msg1": "ok", "output": {"ODNO": "0000999"}})
     ack = await _adapter(transport).submit_order(_buy())
     assert ack.accepted and ack.broker_order_no == "0000999"
-    assert ack.tr_id == "VTTC0802U"  # paper domestic buy
+    assert ack.tr_id == "VTTC0012U"  # paper domestic buy (next-gen TR_ID)
 
     method, url, headers, body = transport.calls[0]
     assert method == "POST" and url.endswith("/uapi/domestic-stock/v1/trading/order-cash")
-    assert headers["tr_id"] == "VTTC0802U"
+    assert headers["tr_id"] == "VTTC0012U"
     assert body["PDNO"] == "005930"
     assert body["ORD_QTY"] == "10"
     assert body["ORD_UNPR"] == "70000"
     assert body["CANO"] == "12345678"
+    assert body["EXCG_ID_DVSN_CD"] == "KRX"  # next-gen routing field
 
 
 async def test_domestic_rejection() -> None:

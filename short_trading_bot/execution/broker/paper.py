@@ -25,7 +25,7 @@ class PaperConfig:
     initial_cash: Decimal = Decimal("100000000")  # 1억 KRW
     slippage_bps: Decimal = Decimal("5")  # market-order slippage
     fee_bps: Decimal = Decimal("1.5")  # ~0.015% brokerage
-    sell_tax_bps: Decimal = Decimal("18")  # ~0.18% KRX 증권거래세 (sell only)
+    sell_tax_bps: Decimal = Decimal("20")  # 0.20% KRX 증권거래세 (sell only), 2026
     max_fill_chunks: int = 1  # >1 => simulate partial fills
     enforce_funds: bool = True
 

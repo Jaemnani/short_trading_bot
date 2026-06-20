@@ -4,9 +4,9 @@ Implements the Feed interface for live trading. The connection is injectable so 
 parsing (the tricky part) is unit-testable offline; the default connector uses ``websockets``.
 Heartbeat (PINGPONG) frames are echoed.
 
-⚠️ The H0STCNT0 field indices (price=2, time=1, volume=13) follow common KIS docs but must be
-verified against the portal/sample repo before live use; subscribe with the WebSocket
-approval_key (NOT the REST Bearer token).
+H0STCNT0 field indices verified vs the KIS sample repo: time=1, price=2, per-trade
+volume CNTG_VOL=12 (NOT 13 — index 13 is ACML_VOL accumulated volume). Subscribe with the
+WebSocket approval_key (NOT the REST Bearer token).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from .types import Bar, Tick
 
 KST = timezone(timedelta(hours=9))
 _TR_TRADE = "H0STCNT0"
-_IDX_TIME, _IDX_PRICE, _IDX_VOLUME = 1, 2, 13
+_IDX_TIME, _IDX_PRICE, _IDX_VOLUME = 1, 2, 12  # CNTG_VOL (per-trade); 13 = ACML_VOL (accumulated)
 
 
 class KisWebSocketFeed:
