@@ -6,12 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from short_trading_bot.app.service import TradingService
 from short_trading_bot.domain.enums import PositionState, Resolution
+from short_trading_bot.domain.params import PositionParams
 from short_trading_bot.execution.broker.paper import PaperBrokerAdapter, PaperConfig
 from short_trading_bot.infra.notifier.base import InMemoryNotifier
 from short_trading_bot.market.feed import ReplayFeed
 from short_trading_bot.market.types import Bar
 from short_trading_bot.persistence.db import session_scope
-from short_trading_bot.persistence.models import Order
+from short_trading_bot.persistence.models import Order, Position
 from short_trading_bot.risk.limits import RiskLimits
 from short_trading_bot.risk.manager import RiskManager
 from short_trading_bot.strategy.templates import StrategyTemplate
@@ -79,6 +80,25 @@ async def test_service_pause_blocks_entry(sf) -> None:
     bal = await broker.get_balance()
     assert bal.positions == []
     assert any(n.event == "intent.blocked" and n.fields.get("reason") == "paused" for n in notifier.sent)
+
+
+async def test_service_hydrate_from_db(sf) -> None:
+    params = PositionParams(strategy_id="trend_long_v1")
+    async with session_scope(sf) as s:
+        s.add(
+            Position(
+                lot_id="lotX", ticker=TICKER, market="KRX", currency="KRW", side="BUY",
+                state="HOLDING", strategy_id="trend_long_v1",
+                params_json=params.model_dump(mode="json"), resolution="1D",
+                qty_filled=Decimal("10"), avg_entry_price=Decimal("70000"),
+            )
+        )
+    svc, _broker, _ = _service(sf)
+    restored = await svc.hydrate()
+    assert restored == 1
+    lot = svc.lots[TICKER]
+    assert lot.state is PositionState.HOLDING
+    assert lot.qty == Decimal("10") and lot.avg_entry == Decimal("70000")
 
 
 async def test_service_kill_switch_flattens(sf) -> None:

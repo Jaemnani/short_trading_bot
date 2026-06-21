@@ -67,19 +67,50 @@ def initdb() -> None:
 
 
 @app.command()
-def serve() -> None:
-    """Run the trading engine (placeholder until the asyncio orchestrator lands)."""
+def serve(config: str = "watchlist.json") -> None:
+    """Run the engine: load watchlist+limits, hydrate from DB, stream the KIS feed.
+
+    Execution is SIMULATED (PaperBrokerAdapter) on live KIS data — a forward test. Real KIS
+    order execution needs the 체결통보 fill-delivery WS, the one remaining live integration.
+    """
+    import asyncio
+
+    from ..domain.enums import Resolution
+    from ..execution.broker.paper import PaperBrokerAdapter
+    from ..infra.kis_auth import KisAuth
+    from ..market.kis_ws_feed import KisWebSocketFeed
+    from .engine import build_trading_service, kis_rest_base, kis_ws_url
+    from .watchlist import load_trading_config
+
     s = _bootstrap()
     log = get_logger("serve")
-    active = s.active_kis()
-    if s.mode.value in {"PAPER", "LIVE"} and not active.configured:
-        log.warning(
-            "kis.credentials.missing",
-            mode=s.mode.value,
-            hint="set STB_KIS__PAPER__* or STB_KIS__LIVE__* in .env",
+    watchlist, limits = load_trading_config(config)
+    if not watchlist:
+        typer.echo(f"watchlist empty — add entries to {config} (see watchlist.example.json).")
+        raise typer.Exit(1)
+
+    creds = s.active_kis()
+    if not creds.configured:
+        typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
+        raise typer.Exit(1)
+
+    # Live data + simulated execution (forward test). Swap to KIS routing broker once
+    # fill delivery (H0STCNI0/H0GSCNI0) is wired.
+    service = build_trading_service(s, watchlist, limits=limits, broker=PaperBrokerAdapter())
+
+    async def _run() -> None:
+        restored = await service.hydrate()
+        auth = KisAuth(creds, kis_rest_base(s.mode))
+        approval = await auth.approval_key()
+        resolution = Resolution(next(iter(watchlist.values())).resolution)
+        feed = KisWebSocketFeed(approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode))
+        log.info(
+            "engine.start", mode=s.mode.value, tickers=len(watchlist), restored=restored,
+            execution="simulated",
         )
-    log.info("engine.start.placeholder", mode=s.mode.value, dry_run=s.dry_run)
-    typer.echo("engine scaffold ready — wire a Feed + broker to TradingService (app/service.py).")
+        await service.run(feed)
+
+    asyncio.run(_run())
 
 
 @app.command("api")

@@ -13,10 +13,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from decimal import Decimal
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..domain.enums import Currency, Side
+from ..domain.enums import Currency, Market, PositionState, Side
 from ..domain.factory import PositionFactory
+from ..domain.params import PositionParams
 from ..domain.position import PositionLot
 from ..domain.signal import Intent, IntentKind, Signal
 from ..execution.broker.base import BrokerAdapter
@@ -31,6 +33,7 @@ from ..persistence.db import session_scope
 from ..persistence.models import Position
 from ..risk.limits import RiskSnapshot
 from ..risk.manager import RiskManager
+from ..strategy.registry import create_strategy
 from ..strategy.templates import StrategyTemplate
 
 _ENTRY_KINDS = (IntentKind.ENTER, IntentKind.ADD)
@@ -72,6 +75,45 @@ class TradingService:
     @property
     def lots(self) -> dict[str, PositionLot]:
         return self._lots
+
+    async def hydrate(self) -> int:
+        """Rebuild in-memory lots from the DB Position projection (restart recovery).
+
+        Restores qty/avg/realized/state. Runtime stop state (initial_stop, peak_price,
+        tp_rungs_taken) is not yet persisted on the projection, so a hydrated lot manages
+        on indicator/trailing exits until those columns are added; reconcile against the
+        broker before resuming trading.
+        """
+        open_states = [
+            PositionState.HOLDING.value,
+            PositionState.SCALING.value,
+            PositionState.EXITING.value,
+            PositionState.WATCHING.value,
+        ]
+        async with session_scope(self._sf) as session:
+            rows = (
+                await session.execute(select(Position).where(Position.state.in_(open_states)))
+            ).scalars().all()
+        restored = 0
+        for row in rows:
+            if row.ticker in self._lots:
+                continue
+            params = PositionParams(**row.params_json)
+            self._lots[row.ticker] = PositionLot(
+                lot_id=row.lot_id,
+                ticker=row.ticker,
+                market=Market(row.market),
+                currency=Currency(row.currency),
+                params=params,
+                strategy=create_strategy(params.strategy_id, params.strategy_params),
+                state=PositionState(row.state),
+                qty=row.qty_filled,
+                avg_entry=row.avg_entry_price,
+                realized_pnl=row.realized_pnl,
+                peak_price=row.avg_entry_price,
+            )
+            restored += 1
+        return restored
 
     async def run(self, feed: Feed) -> None:
         async for bar in feed.stream():

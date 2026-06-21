@@ -16,6 +16,9 @@ venv/
 *.pem
 config.local.yaml
 
+# User trading config (operator-specific; example is committed)
+watchlist.json
+
 # Databases / data
 *.db
 *.sqlite

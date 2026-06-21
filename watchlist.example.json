@@ -1,0 +1,23 @@
+{
+  "limits": {
+    "daily_loss_limit": "500000",
+    "max_open_positions": 5,
+    "max_order_notional": "5000000",
+    "max_ticker_exposure": "10000000"
+  },
+  "watchlist": {
+    "005930": {
+      "strategy_id": "trend_long_v1",
+      "market": "KRX",
+      "resolution": "1D",
+      "risk_per_trade": 0.01,
+      "strategy_params": { "require_confirm": false }
+    },
+    "000660": {
+      "strategy_id": "trend_long_v1",
+      "market": "KRX",
+      "resolution": "5m",
+      "risk_per_trade": 0.005
+    }
+  }
+}

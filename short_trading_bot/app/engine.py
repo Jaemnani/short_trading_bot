@@ -63,8 +63,9 @@ def build_trading_service(
     control: ControlSwitch | None = None,
     notifier: Any = None,
     news_provider: Any = None,
+    broker: BrokerAdapter | None = None,
 ) -> TradingService:
-    broker = build_broker(settings)
+    broker = broker or build_broker(settings)
     engine = create_engine(settings.db_url)
     risk = RiskManager(limits or RiskLimits(), control or ControlSwitch())
     return TradingService(
