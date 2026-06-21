@@ -18,10 +18,10 @@ from typing import Any
 
 import httpx
 
-from ...domain.enums import Currency, Market, Mode
+from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
-from ..types import AccountBalance, BalancePosition, OrderAck, OrderRequest
+from ..types import AccountBalance, BalancePosition, Execution, OrderAck, OrderRequest
 from .base import BrokerAdapter
 from .market_router import MarketRouter
 
@@ -31,6 +31,8 @@ _ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 _CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 _NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
+_CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+_CCNL_TR_LIVE = "TTTS3035R"  # 해외 체결내역
 
 
 class KisOverseasAdapter(BrokerAdapter):
@@ -132,6 +134,37 @@ class KisOverseasAdapter(BrokerAdapter):
             OrderAck(client_order_id="", accepted=True, broker_order_no=str(row.get("odno", "")))
             for row in resp.get("output", [])
         ]
+
+    async def get_executions(self) -> list[Execution]:
+        tr_id = ("V" + _CCNL_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CCNL_TR_LIVE
+        headers = await self._headers(tr_id)
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._creds.account_product_code,
+            "OVRS_EXCG_CD": self._default_market.value,
+            "SORT_SQN": "DS",
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        resp = await self._transport("GET", f"{self._base}{_CCNL_PATH}", headers, params)
+        out: list[Execution] = []
+        for row in resp.get("output", []):
+            qty = Decimal(str(row.get("ft_ccld_qty", "0") or "0"))
+            if qty == 0:
+                continue
+            side = Side.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else Side.BUY
+            out.append(
+                Execution(
+                    exec_id=str(row.get("odno", "")) + ":" + str(row.get("ft_ccld_qty", "")),
+                    broker_order_no=str(row.get("odno", "")),
+                    ticker=str(row.get("ovrs_pdno", "")),
+                    side=side,
+                    qty=qty,
+                    price=Decimal(str(row.get("ft_ccld_unpr3", "0") or "0")),
+                    currency=self._default_market.currency,
+                )
+            )
+        return out
 
     # -- request building / parsing (pure, testable) ---------------------
 

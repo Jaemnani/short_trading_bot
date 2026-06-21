@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ..types import AccountBalance, FillHandler, OrderAck, OrderRequest
+from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRequest
 
 
 class BrokerAdapter(ABC):
@@ -33,3 +33,8 @@ class BrokerAdapter(ABC):
     @abstractmethod
     async def get_open_orders(self) -> list[OrderAck]:
         """Currently working (unfilled/partially-filled) orders at the broker."""
+
+    async def get_executions(self) -> list[Execution]:
+        """Authoritative executed-trade records (체결내역). Default empty; live adapters
+        override. The FillPoller polls this and dedups by exec_id — ground-truth fills."""
+        return []

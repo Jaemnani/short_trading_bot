@@ -10,7 +10,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from ...domain.enums import Market
-from ..types import AccountBalance, FillHandler, OrderAck, OrderRequest
+from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRequest
 from .base import BrokerAdapter
 
 
@@ -64,3 +64,9 @@ class RoutingBrokerAdapter(BrokerAdapter):
         if self._overseas is not None:
             orders.extend(await self._overseas.get_open_orders())
         return orders
+
+    async def get_executions(self) -> list[Execution]:
+        execs = list(await self._domestic.get_executions())
+        if self._overseas is not None:
+            execs.extend(await self._overseas.get_executions())
+        return execs

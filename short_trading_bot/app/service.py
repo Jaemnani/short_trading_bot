@@ -22,7 +22,9 @@ from ..domain.params import PositionParams
 from ..domain.position import PositionLot
 from ..domain.signal import Intent, IntentKind, Signal
 from ..execution.broker.base import BrokerAdapter
+from ..execution.fill_poller import FillPoller
 from ..execution.order_manager import OrderManager
+from ..execution.reconciler import Reconciler, ReconcileReport
 from ..execution.types import Fill, OrderRequest
 from ..infra.logging import get_logger
 from ..infra.notifier.base import InMemoryNotifier, Notifier
@@ -114,6 +116,14 @@ class TradingService:
             )
             restored += 1
         return restored
+
+    def make_fill_poller(self) -> FillPoller:
+        """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
+        return FillPoller(self._broker, self._sf, self._on_fill)
+
+    async def reconcile(self) -> ReconcileReport:
+        """Reconcile local open-position qty against the broker 잔고 (broker = source of truth)."""
+        return await Reconciler(self._broker, self._sf).reconcile()
 
     async def run(self, feed: Feed) -> None:
         async for bar in feed.stream():

@@ -67,11 +67,16 @@ def initdb() -> None:
 
 
 @app.command()
-def serve(config: str = "watchlist.json") -> None:
+def serve(
+    config: str = "watchlist.json",
+    live_exec: bool = False,
+    fill_poll_seconds: float = 2.0,
+) -> None:
     """Run the engine: load watchlist+limits, hydrate from DB, stream the KIS feed.
 
-    Execution is SIMULATED (PaperBrokerAdapter) on live KIS data — a forward test. Real KIS
-    order execution needs the 체결통보 fill-delivery WS, the one remaining live integration.
+    Default execution is SIMULATED (PaperBroker) on live KIS data — a forward test.
+    --live-exec uses the real KIS broker (routing 국내/해외) + a FillPoller (polls 체결내역,
+    the authoritative fill record) + a startup reconcile against 잔고.
     """
     import asyncio
 
@@ -79,7 +84,7 @@ def serve(config: str = "watchlist.json") -> None:
     from ..execution.broker.paper import PaperBrokerAdapter
     from ..infra.kis_auth import KisAuth
     from ..market.kis_ws_feed import KisWebSocketFeed
-    from .engine import build_trading_service, kis_rest_base, kis_ws_url
+    from .engine import build_broker, build_trading_service, kis_rest_base, kis_ws_url
     from .watchlist import load_trading_config
 
     s = _bootstrap()
@@ -94,21 +99,45 @@ def serve(config: str = "watchlist.json") -> None:
         typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
         raise typer.Exit(1)
 
-    # Live data + simulated execution (forward test). Swap to KIS routing broker once
-    # fill delivery (H0STCNI0/H0GSCNI0) is wired.
-    service = build_trading_service(s, watchlist, limits=limits, broker=PaperBrokerAdapter())
+    broker = build_broker(s) if live_exec else PaperBrokerAdapter()
+    service = build_trading_service(s, watchlist, limits=limits, broker=broker)
+
+    async def _poll_loop(poller: object) -> None:
+        from ..execution.fill_poller import FillPoller
+
+        assert isinstance(poller, FillPoller)
+        while True:
+            try:
+                await poller.poll_once()
+            except Exception:
+                log.exception("fill_poll.error")
+            await asyncio.sleep(fill_poll_seconds)
 
     async def _run() -> None:
         restored = await service.hydrate()
+        if live_exec:
+            report = await service.reconcile()
+            if not report.in_sync:
+                log.warning("reconcile.drift_on_start", mismatches=len(report.mismatches))
         auth = KisAuth(creds, kis_rest_base(s.mode))
         approval = await auth.approval_key()
         resolution = Resolution(next(iter(watchlist.values())).resolution)
         feed = KisWebSocketFeed(approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode))
         log.info(
-            "engine.start", mode=s.mode.value, tickers=len(watchlist), restored=restored,
-            execution="simulated",
+            "engine.start",
+            mode=s.mode.value,
+            tickers=len(watchlist),
+            restored=restored,
+            execution="live" if live_exec else "simulated",
         )
-        await service.run(feed)
+        poll_task = (
+            asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
+        )
+        try:
+            await service.run(feed)
+        finally:
+            if poll_task is not None:
+                poll_task.cancel()
 
     asyncio.run(_run())
 

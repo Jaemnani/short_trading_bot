@@ -62,6 +62,23 @@ class Fill:
 
 
 @dataclass(slots=True)
+class Execution:
+    """An authoritative executed-trade record from the broker (체결내역) — ground truth
+    for fills, including exact fee/tax. Polled and deduped by ``exec_id``."""
+
+    exec_id: str
+    broker_order_no: str
+    ticker: str
+    side: Side
+    qty: Decimal
+    price: Decimal
+    fee: Decimal = Decimal(0)
+    tax: Decimal = Decimal(0)
+    currency: Currency = Currency.KRW
+    ts: datetime | None = None
+
+
+@dataclass(slots=True)
 class BalancePosition:
     ticker: str
     market: Market

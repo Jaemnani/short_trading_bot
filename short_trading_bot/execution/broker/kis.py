@@ -12,6 +12,7 @@ SLL_TYPE. ⚠️ Response field names still follow common KIS shapes — confirm
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -20,7 +21,7 @@ import httpx
 from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
-from ..types import AccountBalance, BalancePosition, OrderAck, OrderRequest
+from ..types import AccountBalance, BalancePosition, Execution, OrderAck, OrderRequest
 from .base import BrokerAdapter
 from .market_router import MarketRouter
 
@@ -29,6 +30,8 @@ Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[
 _ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 _CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
+_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+_CCLD_TR_LIVE = "TTTC0081R"  # 일별주문체결조회 — ⚠️ verify on portal
 
 
 class KisBrokerAdapter(BrokerAdapter):
@@ -119,6 +122,50 @@ class KisBrokerAdapter(BrokerAdapter):
 
     async def get_open_orders(self) -> list[OrderAck]:
         return []  # 미체결조회 (inquire-psbl-rvsecncl) wired with the live feed in deployment
+
+    async def get_executions(self) -> list[Execution]:
+        tr_id = ("V" + _CCLD_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CCLD_TR_LIVE
+        headers = await self._headers(tr_id)
+        today = datetime.now(UTC).strftime("%Y%m%d")
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._creds.account_product_code,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "01",  # 01 = 체결
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        resp = await self._transport("GET", f"{self._base}{_CCLD_PATH}", headers, params)
+        return self._parse_executions(resp)
+
+    @staticmethod
+    def _parse_executions(resp: dict[str, Any]) -> list[Execution]:
+        out: list[Execution] = []
+        for row in resp.get("output1", []):
+            qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
+            if qty == 0:
+                continue
+            side = Side.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else Side.BUY
+            out.append(
+                Execution(
+                    exec_id=str(row.get("odno", "")) + ":" + str(row.get("tot_ccld_qty", "")),
+                    broker_order_no=str(row.get("odno", "")),
+                    ticker=str(row.get("pdno", "")),
+                    side=side,
+                    qty=qty,
+                    price=Decimal(str(row.get("avg_prvs", "0") or "0")),
+                    currency=Currency.KRW,
+                )
+            )
+        return out
 
     # -- request building / parsing (pure, testable) ---------------------
 

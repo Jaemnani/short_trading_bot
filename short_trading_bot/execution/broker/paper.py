@@ -14,7 +14,7 @@ from typing import Any
 
 from ...domain.enums import Currency, Market, Side
 from ...infra.logging import get_logger
-from ..types import AccountBalance, BalancePosition, Fill, OrderAck, OrderRequest
+from ..types import AccountBalance, BalancePosition, Execution, Fill, OrderAck, OrderRequest
 from .base import BrokerAdapter
 
 _BPS = Decimal(10000)
@@ -43,6 +43,8 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._holdings: dict[tuple[str, Market], _Holding] = {}
         self._prices: dict[str, Decimal] = {}
         self._seq = 0
+        self._exec_seq = 0
+        self._executions: list[Execution] = []
         self._log = logger or get_logger("paper_broker")
 
     @property
@@ -74,7 +76,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         broker_no = f"PAPER-{self._seq:08d}"
 
         for qty in self._chunk(req.qty):
-            await self._apply_and_emit(req, fill_price, qty, ccy)
+            await self._apply_and_emit(req, fill_price, qty, ccy, broker_no)
 
         return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_no, tr_id="PAPER")
 
@@ -98,6 +100,9 @@ class PaperBrokerAdapter(BrokerAdapter):
 
     async def get_open_orders(self) -> list[OrderAck]:
         return []
+
+    async def get_executions(self) -> list[Execution]:
+        return list(self._executions)
 
     # -- internals -------------------------------------------------------
 
@@ -125,7 +130,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         return out
 
     async def _apply_and_emit(
-        self, req: OrderRequest, price: Decimal, qty: Decimal, ccy: Currency
+        self, req: OrderRequest, price: Decimal, qty: Decimal, ccy: Currency, broker_no: str
     ) -> None:
         notional = price * qty
         fee = notional * self.config.fee_bps / _BPS
@@ -147,6 +152,21 @@ class PaperBrokerAdapter(BrokerAdapter):
             holding.qty -= qty
             self._cash[ccy] = self._cash.get(ccy, Decimal(0)) + notional - fee - tax
 
+        self._exec_seq += 1
+        self._executions.append(
+            Execution(
+                exec_id=f"PAPER-EXE-{self._exec_seq:08d}",
+                broker_order_no=broker_no,
+                ticker=req.ticker,
+                side=req.side,
+                qty=qty,
+                price=price,
+                fee=fee,
+                tax=tax,
+                currency=ccy,
+                ts=datetime.now(UTC),
+            )
+        )
         fill = Fill(
             client_order_id=req.client_order_id,
             qty=qty,
