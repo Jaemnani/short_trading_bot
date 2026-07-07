@@ -64,7 +64,8 @@ class Fill:
 @dataclass(slots=True)
 class Execution:
     """An authoritative executed-trade record from the broker (체결내역) — ground truth
-    for fills, including exact fee/tax. Polled and deduped by ``exec_id``."""
+    for fills, including exact fee/tax. ``qty`` is the CUMULATIVE executed quantity for
+    the order (KIS 체결내역 semantics); the FillPoller applies deltas against the DB."""
 
     exec_id: str
     broker_order_no: str

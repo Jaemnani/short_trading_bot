@@ -94,6 +94,16 @@ def serve(
         typer.echo(f"watchlist empty — add entries to {config} (see watchlist.example.json).")
         raise typer.Exit(1)
 
+    resolutions = {tmpl.resolution for tmpl in watchlist.values()}
+    if len(resolutions) > 1:
+        # One WS feed aggregates at one timeframe; mixed configs would evaluate lots on
+        # wrong-timeframe bars (the lot-level guard would then just HOLD forever).
+        typer.echo(
+            f"watchlist mixes resolutions {sorted(r.value for r in resolutions)} — "
+            "run one serve process per resolution (separate config files)."
+        )
+        raise typer.Exit(1)
+
     creds = s.active_kis()
     if not creds.configured:
         typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
@@ -120,9 +130,7 @@ def serve(
             if not report.in_sync:
                 log.warning("reconcile.drift_on_start", mismatches=len(report.mismatches))
         auth = KisAuth(creds, kis_rest_base(s.mode))
-        approval = await auth.approval_key()
         resolution = Resolution(next(iter(watchlist.values())).resolution)
-        feed = KisWebSocketFeed(approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode))
         log.info(
             "engine.start",
             mode=s.mode.value,
@@ -134,7 +142,23 @@ def serve(
             asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
         )
         try:
-            await service.run(feed)
+            # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
+            while not service.control.is_stopped:
+                approval = await auth.approval_key()
+                feed = KisWebSocketFeed(
+                    approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode)
+                )
+                try:
+                    await service.run(feed)
+                except Exception:
+                    log.exception("feed.error")
+                if service.control.is_stopped:
+                    break
+                if live_exec:  # recover anything missed while disconnected
+                    await service.make_fill_poller().poll_once()
+                    await service.reconcile()
+                log.info("feed.reconnect", delay_seconds=5)
+                await asyncio.sleep(5)
         finally:
             if poll_task is not None:
                 poll_task.cancel()
@@ -171,9 +195,33 @@ def preflight() -> None:
 
 @campaign_app.command("list")
 def campaign_list() -> None:
-    """List campaigns (placeholder)."""
-    _bootstrap()
-    typer.echo("no campaigns yet — campaign engine lands in P8.")
+    """List campaigns stored in the DB."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from ..persistence.db import create_engine, session_factory, session_scope
+    from ..persistence.models import Campaign
+
+    s = _bootstrap()
+
+    async def _list() -> list[Campaign]:
+        engine = create_engine(s.db_url)
+        try:
+            async with session_scope(session_factory(engine)) as session:
+                return list((await session.execute(select(Campaign))).scalars().all())
+        finally:
+            await engine.dispose()
+
+    rows = asyncio.run(_list())
+    if not rows:
+        typer.echo("no campaigns yet — run one via CampaignManager (backtest) or the API.")
+        return
+    for c in rows:
+        typer.echo(
+            f"{c.campaign_id}  {c.name}  [{c.status}]  budget={c.initial_budget} {c.currency}  "
+            f"{c.start_at:%Y-%m-%d} ~ {c.end_at:%Y-%m-%d}"
+        )
 
 
 if __name__ == "__main__":

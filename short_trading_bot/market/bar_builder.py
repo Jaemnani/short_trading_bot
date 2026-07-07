@@ -1,8 +1,8 @@
-"""Aggregate ticks into fixed minute bars (1/3/5/10/15/30/60m) per ticker.
+"""Aggregate ticks into bars per ticker: minute bars (1/3/5/10/15/30/60m) and daily (1D).
 
-One BarBuilder per intraday resolution; it buckets each ticker's ticks by
-``floor(epoch / bar_seconds)``. Ticks are assumed time-ordered per ticker.
-Daily/weekly/monthly bars come from period-bar loaders, not from tick aggregation.
+Minute bars bucket by ``floor(epoch / bar_seconds)``; daily bars bucket by the tick's
+calendar date (in the tick's timezone). Ticks are assumed time-ordered per ticker.
+Weekly/monthly bars come from period-bar loaders, not tick aggregation.
 """
 
 from __future__ import annotations
@@ -51,15 +51,21 @@ class _OpenBar:
 class BarBuilder:
     def __init__(self, resolution: Resolution) -> None:
         seconds = resolution.bar_seconds
-        if seconds is None:
-            raise ValueError(f"{resolution} is not an aggregatable minute resolution")
+        if seconds is None and resolution is not Resolution.D1:
+            raise ValueError(f"{resolution} is not tick-aggregatable (use a period-bar loader)")
         self.resolution = resolution
-        self._seconds = seconds
+        self._seconds = seconds  # None => daily (bucket by calendar date)
         self._open: dict[str, _OpenBar] = {}
+
+    def _bucket(self, tick: Tick) -> int:
+        if self._seconds is None:  # D1: midnight (UTC) of the tick's local calendar date
+            day = tick.ts.date()
+            return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+        return int(tick.ts.timestamp() // self._seconds) * self._seconds
 
     def on_tick(self, tick: Tick) -> list[Bar]:
         """Feed a tick; return any bar(s) completed by it (0 or 1)."""
-        bucket = int(tick.ts.timestamp() // self._seconds) * self._seconds
+        bucket = self._bucket(tick)
         ob = self._open.get(tick.ticker)
         if ob is None:
             self._open[tick.ticker] = _OpenBar(bucket, tick)

@@ -106,6 +106,9 @@ class PositionLot:
         news_ewma: float | None = None,
         now: datetime | None = None,
     ) -> list[Intent]:
+        if snapshot.resolution is not self.params.resolution:
+            # Never trade on bars of a different timeframe than this lot was configured for.
+            return [Intent(kind=IntentKind.HOLD, side=Side.BUY, reason="resolution_mismatch")]
         if snapshot.bar_count < self.strategy.warmup_bars:
             return [Intent(kind=IntentKind.HOLD, side=Side.BUY, reason="warming_up")]
 

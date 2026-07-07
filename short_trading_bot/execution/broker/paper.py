@@ -45,6 +45,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._seq = 0
         self._exec_seq = 0
         self._executions: list[Execution] = []
+        self._exec_cum: dict[str, Decimal] = {}  # broker_order_no -> cumulative executed qty
         self._log = logger or get_logger("paper_broker")
 
     @property
@@ -153,13 +154,15 @@ class PaperBrokerAdapter(BrokerAdapter):
             self._cash[ccy] = self._cash.get(ccy, Decimal(0)) + notional - fee - tax
 
         self._exec_seq += 1
+        cumulative = self._exec_cum.get(broker_no, Decimal(0)) + qty
+        self._exec_cum[broker_no] = cumulative
         self._executions.append(
             Execution(
                 exec_id=f"PAPER-EXE-{self._exec_seq:08d}",
                 broker_order_no=broker_no,
                 ticker=req.ticker,
                 side=req.side,
-                qty=qty,
+                qty=cumulative,  # cumulative per order (matches KIS 체결내역 semantics)
                 price=price,
                 fee=fee,
                 tax=tax,

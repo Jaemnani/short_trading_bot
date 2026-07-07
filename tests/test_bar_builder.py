@@ -44,7 +44,7 @@ def test_flush_emits_open_bar() -> None:
 
 def test_non_aggregatable_resolution_rejected() -> None:
     with pytest.raises(ValueError):
-        BarBuilder(Resolution.D1)
+        BarBuilder(Resolution.W1)  # weekly/monthly come from period-bar loaders; D1 is supported
 
 
 def test_out_of_order_tick_rejected() -> None:

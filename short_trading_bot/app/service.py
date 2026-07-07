@@ -11,7 +11,7 @@ or a live KIS WebSocket feed.
 from __future__ import annotations
 
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -113,6 +113,7 @@ class TradingService:
                 avg_entry=row.avg_entry_price,
                 realized_pnl=row.realized_pnl,
                 peak_price=row.avg_entry_price,
+                original_qty=row.qty_filled,  # best effort: TP fractions base on current qty
             )
             restored += 1
         return restored
@@ -165,6 +166,11 @@ class TradingService:
         self, intent: Intent, lot: PositionLot, bar: Bar, snapshot: RiskSnapshot
     ) -> None:
         qty = lot.qty if intent.kind is IntentKind.EXIT else intent.qty
+        if qty is None and intent.fraction is not None:
+            # Fraction-based TRIM: convert to an absolute quantity of the current position.
+            raw = lot.qty * Decimal(str(intent.fraction))
+            qty = raw if lot.market.is_overseas else raw.to_integral_value(rounding=ROUND_DOWN)
+            qty = min(qty, lot.qty)
         if qty is None or qty <= 0:
             return
         decision = self._risk.check(

@@ -16,7 +16,7 @@
     "000660": {
       "strategy_id": "trend_long_v1",
       "market": "KRX",
-      "resolution": "5m",
+      "resolution": "1D",
       "risk_per_trade": 0.005
     }
   }
