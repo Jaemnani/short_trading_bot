@@ -45,6 +45,9 @@ class IndicatorSnapshot:
     close: Decimal
     bar_count: int
     indicators: dict[str, float | None] = field(default_factory=dict)
+    high: Decimal = Decimal(0)  # last bar's high/low/volume (intraday strategies need them)
+    low: Decimal = Decimal(0)
+    volume: Decimal = Decimal(0)
 
     def get(self, key: str) -> float | None:
         return self.indicators.get(key)

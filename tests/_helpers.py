@@ -13,6 +13,9 @@ def make_snapshot(
     resolution: Resolution = Resolution.D1,
     ts: datetime | None = None,
     bar_count: int = 300,
+    high: float | None = None,
+    low: float | None = None,
+    volume: float = 1000.0,
     **indicators: Any,
 ) -> IndicatorSnapshot:
     inds: dict[str, float | None] = {
@@ -25,4 +28,7 @@ def make_snapshot(
         close=Decimal(str(close)),
         bar_count=bar_count,
         indicators=inds,
+        high=Decimal(str(high if high is not None else close)),
+        low=Decimal(str(low if low is not None else close)),
+        volume=Decimal(str(volume)),
     )

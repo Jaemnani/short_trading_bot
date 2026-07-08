@@ -328,4 +328,7 @@ class IndicatorEngine:
             close=last.close,
             bar_count=len(bars),
             indicators=indicators,
+            high=last.high,
+            low=last.low,
+            volume=last.volume,
         )
