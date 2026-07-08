@@ -181,6 +181,70 @@ def serve_api(host: str = "0.0.0.0", port: int = 8000) -> None:
 
 
 @app.command()
+def scan(
+    market: str = "KOSPI",
+    limit: int = 100,
+    top: int = 15,
+    days: int = 120,
+    min_vol_ratio: float = 1.2,
+) -> None:
+    """거래량 상승 + 우상향 종목 스캔 (watchlist 후보). 시총 상위 limit개 대상."""
+    from datetime import UTC, datetime, timedelta
+    from decimal import Decimal
+
+    try:
+        import FinanceDataReader as fdr
+    except ImportError:
+        typer.echo("FinanceDataReader가 필요합니다: .venv/bin/pip install finance-datareader")
+        raise typer.Exit(1) from None
+
+    from ..domain.enums import Resolution
+    from ..market.scanner import scan_volume_leaders
+    from ..market.types import Bar
+
+    _bootstrap()
+    listing = fdr.StockListing(market)
+    if "Marcap" in listing.columns:
+        listing = listing.sort_values("Marcap", ascending=False)
+    listing = listing.head(limit)
+    start = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    candidates: dict[str, tuple[str, list[Bar]]] = {}
+    for _, row in listing.iterrows():
+        code, name = str(row["Code"]), str(row["Name"])
+        try:
+            df = fdr.DataReader(code, start)
+        except Exception:
+            continue
+        bars = []
+        for idx, r in df.iterrows():
+            if r.isna().any() or r["Volume"] == 0:
+                continue
+            c = Decimal(str(r["Close"]))
+            v = Decimal(str(int(r["Volume"])))
+            bars.append(
+                Bar(
+                    ticker=code, resolution=Resolution.D1,
+                    ts=datetime(idx.year, idx.month, idx.day, tzinfo=UTC),
+                    open=Decimal(str(r["Open"])), high=Decimal(str(r["High"])),
+                    low=Decimal(str(r["Low"])), close=c, volume=v, value=c * v,
+                )
+            )
+        candidates[code] = (name, bars)
+
+    leaders = scan_volume_leaders(candidates, min_vol_ratio=min_vol_ratio, top=top)
+    if not leaders:
+        typer.echo("조건에 맞는 종목 없음 (거래량 증가 + 우상향)")
+        return
+    typer.echo(f"{'코드':<8}{'종목':<12}{'거래량비':>8}{'당일RVOL':>10}{'거래대금(억)':>12}{'종가':>10}")
+    for r in leaders:
+        typer.echo(
+            f"{r.ticker:<8}{r.name:<12}{r.vol_ratio:>7.2f}x{r.rvol_today:>9.2f}x"
+            f"{r.avg_value / 1e8:>11.0f}{r.close:>10,.0f}"
+        )
+
+
+@app.command()
 def preflight() -> None:
     """Go-live readiness checks (run before flipping STB_MODE=LIVE)."""
     from .engine import is_ready

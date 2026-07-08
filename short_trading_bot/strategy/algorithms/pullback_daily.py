@@ -40,6 +40,19 @@ class PullbackParams(BaseModel):
     require_turn_up: bool = True  # close > prev close on the entry bar
     news_block: float = -0.3
 
+    # 거래량 조건: 거래량이 줄어드는 반등에는 진입하지 않는다.
+    require_vol_expansion: bool = True  # 진입봉 거래량 > 직전봉 거래량 (수축→확장 전환)
+    min_rvol: float = Field(default=0.8, ge=0)  # 진입봉 RVOL 하한 (0 = off)
+
+    # 레짐 적응 리스크: 강세 레짐(ADX≥bull_adx_min, +DI>-DI)에서 리스크를 배수로 상향.
+    bull_risk_mult: float = Field(default=1.5, ge=1.0, le=3.0)  # 1.0 = off
+    bull_adx_min: float = Field(default=25.0, ge=0, le=100)
+
+    # 분할매수(피라미딩): +add_trigger_r 이상 수익 중 새 눌림목 셋업에서만 추가 (승자에만 불타기).
+    max_adds: int = Field(default=1, ge=0, le=3)  # 0 = off
+    add_fraction: float = Field(default=0.5, gt=0, le=1.0)  # 원 수량 대비 추가 크기
+    add_trigger_r: float = Field(default=0.5, ge=0)  # 최소 +0.5R 이익 중일 때만
+
 
 @register_strategy("pullback_daily_v1")
 class PullbackDaily(Strategy):
@@ -55,9 +68,53 @@ class PullbackDaily(Strategy):
     )
     ParamsModel: ClassVar[type[BaseModel]] = PullbackParams
 
+    def __init__(self, params: BaseModel) -> None:
+        super().__init__(params)
+        self._adds = 0  # pyramid adds used in this lot's lifetime
+
     @property
     def warmup_bars(self) -> int:
         return 61  # MA60 + 1
+
+    # -- shared setup check (entry & pyramid add) -----------------------------
+
+    def _setup_fail(self, ctx: StrategyContext, p: PullbackParams) -> str | None:
+        """Return a fail reason for the pullback setup, or None when it's valid."""
+        sma20, sma60, rsi = ctx.ind("sma_20"), ctx.ind("sma_60"), ctx.ind("rsi_14")
+        if sma20 is None or sma60 is None or rsi is None:
+            return "warming_up"
+        close = float(ctx.snapshot.close)
+        low = float(ctx.snapshot.low if ctx.snapshot.low > 0 else ctx.snapshot.close)
+        if not (close > sma60 and sma20 > sma60):
+            return "no_uptrend"
+        if low > sma20 * (1 + p.touch_band_pct):
+            return "no_pullback"
+        if close < sma20 * (1 - p.max_below_pct):
+            return "broke_ma20"
+        if not (p.rsi_min <= rsi <= p.rsi_max):
+            return "rsi_out_of_zone"
+        if p.require_turn_up:
+            prev_close = float(ctx.prev.close) if ctx.prev is not None else None
+            if prev_close is None or close <= prev_close:
+                return "no_turn_up"
+        # 거래량: 반등봉의 거래량이 직전봉보다 줄었거나(수축 지속) 평균 대비 빈약하면 스킵.
+        if p.require_vol_expansion and ctx.prev is not None and ctx.prev.volume > 0:
+            if ctx.snapshot.volume <= ctx.prev.volume:
+                return "volume_declining"
+        rvol = ctx.ind("rvol")
+        if p.min_rvol > 0 and rvol is not None and rvol < p.min_rvol:
+            return "volume_declining"
+        if ctx.news_ewma is not None and ctx.news_ewma < p.news_block:
+            return "news_negative"
+        return None
+
+    def _strong_regime(self, ctx: StrategyContext, p: PullbackParams) -> bool:
+        """강세 레짐: 추세 강도(ADX)와 방향(+DI>-DI)이 확인될 때 리스크 상향."""
+        adx, pdi, mdi = ctx.ind("adx_14"), ctx.ind("plus_di"), ctx.ind("minus_di")
+        return (
+            adx is not None and adx >= p.bull_adx_min
+            and pdi is not None and mdi is not None and pdi > mdi
+        )
 
     def evaluate(self, ctx: StrategyContext) -> list[Intent]:
         if ctx.state in (PositionState.HOLDING, PositionState.SCALING):
@@ -70,48 +127,26 @@ class PullbackDaily(Strategy):
 
     def _entry(self, ctx: StrategyContext) -> list[Intent]:
         p: PullbackParams = self.params  # type: ignore[assignment]
-        sma20, sma60, rsi = ctx.ind("sma_20"), ctx.ind("sma_60"), ctx.ind("rsi_14")
-        if sma20 is None or sma60 is None or rsi is None:
-            return _hold("warming_up")
-
-        close = float(ctx.snapshot.close)
-        low = float(ctx.snapshot.low if ctx.snapshot.low > 0 else ctx.snapshot.close)
-
-        # 1) Regime: established uptrend only.
-        if not (close > sma60 and sma20 > sma60):
-            return _hold("no_uptrend")
-
-        # 2) Setup: the bar dipped to/near MA20 but the close held.
-        if low > sma20 * (1 + p.touch_band_pct):
-            return _hold("no_pullback")
-        if close < sma20 * (1 - p.max_below_pct):
-            return _hold("broke_ma20")
-
-        # 3) Trigger: turning back up, RSI in the healthy-pullback zone.
-        if not (p.rsi_min <= rsi <= p.rsi_max):
-            return _hold("rsi_out_of_zone")
-        if p.require_turn_up:
-            prev_close = float(ctx.prev.close) if ctx.prev is not None else None
-            if prev_close is None or close <= prev_close:
-                return _hold("no_turn_up")
-
-        # 4) News gate.
-        if ctx.news_ewma is not None and ctx.news_ewma < p.news_block:
-            return _hold("news_negative")
+        fail = self._setup_fail(ctx, p)
+        if fail is not None:
+            return _hold(fail)
 
         entry = ctx.snapshot.close
         stop = self._initial_stop(ctx, entry)
         if stop is None:
             return _hold("no_stop")
+
+        # 레짐 적응 리스크: 강세 레짐에서 리스크를 bull_risk_mult배로 상향.
+        strong = p.bull_risk_mult > 1.0 and self._strong_regime(ctx, p)
+        risk = ctx.params.risk_per_trade * (p.bull_risk_mult if strong else 1.0)
         qty = risk_based_qty(
-            ctx.equity, ctx.params.risk_per_trade, entry, stop,
+            ctx.equity, risk, entry, stop,
             allow_fractional=ctx.params.market.is_overseas,
         )
         if qty <= 0:
             return _hold("size_zero")
-        return [
-            Intent(kind=IntentKind.ENTER, side=Side.BUY, qty=qty, stop_price=stop, reason="pullback_buy")
-        ]
+        reason = "pullback_buy_bull" if strong else "pullback_buy"
+        return [Intent(kind=IntentKind.ENTER, side=Side.BUY, qty=qty, stop_price=stop, reason=reason)]
 
     def _initial_stop(self, ctx: StrategyContext, entry: Decimal) -> Decimal | None:
         cfg = ctx.params.stop
@@ -149,7 +184,30 @@ class PullbackDaily(Strategy):
         if sma60 is not None and close < sma60:
             return [Intent(IntentKind.EXIT, Side.SELL, reason="trend_break")]
 
+        add = self._pyramid_add(ctx, close)
+        if add is not None:
+            return [add]
+
         return _hold("holding")
+
+    def _pyramid_add(self, ctx: StrategyContext, close: float) -> Intent | None:
+        """분할매수: 최소 +add_trigger_r R 이익 중 + 새 눌림목 셋업일 때만 추가 (물타기 금지)."""
+        p: PullbackParams = self.params  # type: ignore[assignment]
+        if p.max_adds <= 0 or self._adds >= p.max_adds:
+            return None
+        if ctx.initial_stop is None or ctx.original_qty <= 0:
+            return None
+        risk0 = float(ctx.avg_entry) - float(ctx.initial_stop)
+        if risk0 <= 0 or close < float(ctx.avg_entry) + p.add_trigger_r * risk0:
+            return None  # 이익 중이 아니면 절대 추가하지 않음
+        if self._setup_fail(ctx, p) is not None:
+            return None  # 새 눌림목-반등 셋업에서만
+        raw = ctx.original_qty * Decimal(str(p.add_fraction))
+        qty = raw if ctx.params.market.is_overseas else raw.to_integral_value(rounding=ROUND_DOWN)
+        if qty <= 0:
+            return None
+        self._adds += 1
+        return Intent(kind=IntentKind.ADD, side=Side.BUY, qty=qty, reason="pyramid_add")
 
     def _take_profit(self, ctx: StrategyContext, close: float) -> Intent | None:
         rungs = ctx.params.take_profit

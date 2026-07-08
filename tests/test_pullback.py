@@ -37,13 +37,14 @@ def _ctx(
     original: float = 0.0,
     bars_held: int = 0,
     news: float | None = None,
+    vol: float = 1500.0,  # entry-bar volume (> prev 1000 by default = expansion)
     **ind: float,
 ) -> StrategyContext:
     prev: IndicatorSnapshot | None = None
     if prev_close is not None:
-        prev = make_snapshot(prev_close, resolution=Resolution.D1)
+        prev = make_snapshot(prev_close, resolution=Resolution.D1)  # prev volume = 1000
     return StrategyContext(
-        snapshot=make_snapshot(close, resolution=Resolution.D1, low=low, **ind),
+        snapshot=make_snapshot(close, resolution=Resolution.D1, low=low, volume=vol, **ind),
         state=state,
         qty=Decimal(str(qty)),
         avg_entry=Decimal(str(avg)),
@@ -123,6 +124,54 @@ def test_take_profit_ladder() -> None:
     )
     assert out[0].kind is IntentKind.TRIM and out[0].reason == "take_profit_1"
     assert out[0].qty == Decimal("3")  # floor(12 * float(1/3))
+
+
+def test_volume_declining_blocks_entry() -> None:
+    # 반등봉 거래량(800)이 직전봉(1000)보다 감소 → 진입 금지
+    shrinking = STRAT.evaluate(
+        _ctx(PositionState.WATCHING, 102, low=99.8, prev_close=100.5, rsi_14=48.0, vol=800.0, **UPTREND)
+    )
+    assert shrinking[0].reason == "volume_declining"
+    # RVOL이 하한(0.8) 미만이어도 진입 금지 (평균 대비 빈약한 거래량)
+    anemic = STRAT.evaluate(
+        _ctx(PositionState.WATCHING, 102, low=99.8, prev_close=100.5, rsi_14=48.0, rvol=0.5, **UPTREND)
+    )
+    assert anemic[0].reason == "volume_declining"
+
+
+def test_bull_regime_scales_risk_up() -> None:
+    strat = PullbackDaily(PullbackParams(bull_risk_mult=2.0))
+    base = dict(low=99.8, prev_close=100.5, rsi_14=48.0, **UPTREND)
+    weak = strat.evaluate(_ctx(PositionState.WATCHING, 102, adx_14=15.0, **base))
+    strong = strat.evaluate(
+        _ctx(PositionState.WATCHING, 102, adx_14=30.0, plus_di=30.0, minus_di=10.0, **base)
+    )
+    assert weak[0].reason == "pullback_buy" and strong[0].reason == "pullback_buy_bull"
+    assert strong[0].qty == weak[0].qty * 2  # 2x risk => 2x size (same stop distance)
+
+
+def test_pyramid_add_only_in_profit_with_new_setup() -> None:
+    strat = PullbackDaily(PullbackParams(max_adds=1, add_trigger_r=0.5))
+    # holding from 102 with stop 98 (risk0=4); new pullback setup at close 105 (>= +0.5R=104)
+    winning = dict(
+        qty=12.0, avg=102.0, stop=98.0, peak=107.0, original=12.0,
+        low=99.9, prev_close=104.0, rsi_14=48.0, sma_20=100.0, sma_60=90.0, atr_14=10.0,
+    )
+    out = strat.evaluate(_ctx(PositionState.HOLDING, 105, **winning))
+    assert out[0].kind is IntentKind.ADD and out[0].reason == "pyramid_add"
+    assert out[0].qty == Decimal("6")  # 0.5 * original 12
+    again = strat.evaluate(_ctx(PositionState.HOLDING, 105, **winning))
+    assert again[0].kind is not IntentKind.ADD  # max_adds=1 exhausted
+
+
+def test_no_pyramid_add_when_losing() -> None:
+    strat = PullbackDaily(PullbackParams(max_adds=1, add_trigger_r=0.5))
+    losing = dict(
+        qty=12.0, avg=102.0, stop=98.0, peak=103.0, original=12.0,
+        low=99.9, prev_close=100.0, rsi_14=48.0, sma_20=100.0, sma_60=90.0, atr_14=10.0,
+    )
+    out = strat.evaluate(_ctx(PositionState.HOLDING, 101, **losing))  # below +0.5R
+    assert out[0].kind is IntentKind.HOLD  # 물타기 금지
 
 
 def test_daily_only_contract_and_registry() -> None:
