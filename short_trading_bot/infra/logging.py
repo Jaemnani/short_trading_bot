@@ -21,6 +21,9 @@ def configure_logging(level: str = "INFO", fmt: str = "console") -> None:
 
     log_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=log_level)
+    # httpx logs full request URLs at INFO — that would leak webhook/token URLs into logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     shared: list[Any] = [
         structlog.contextvars.merge_contextvars,
