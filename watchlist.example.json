@@ -1,23 +1,30 @@
 {
   "limits": {
-    "daily_loss_limit": "500000",
+    "daily_loss_limit": "400000",
     "max_open_positions": 5,
     "max_order_notional": "5000000",
     "max_ticker_exposure": "10000000"
   },
   "watchlist": {
     "005930": {
-      "strategy_id": "trend_long_v1",
+      "strategy_id": "pullback_daily_v1",
       "market": "KRX",
       "resolution": "1D",
-      "risk_per_trade": 0.01,
-      "strategy_params": { "require_confirm": false }
+      "risk_per_trade": 0.02,
+      "strategy_params": {
+        "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02,
+        "bull_risk_mult": 2.0, "max_adds": 1
+      }
     },
     "000660": {
-      "strategy_id": "trend_long_v1",
+      "strategy_id": "pullback_daily_v1",
       "market": "KRX",
       "resolution": "1D",
-      "risk_per_trade": 0.005
+      "risk_per_trade": 0.02,
+      "strategy_params": {
+        "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02,
+        "bull_risk_mult": 2.0, "max_adds": 1
+      }
     }
   }
 }
