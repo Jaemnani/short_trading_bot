@@ -109,8 +109,12 @@ def serve(
         typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
         raise typer.Exit(1)
 
+    from ..infra.notifier.factory import build_notifier
+
     broker = build_broker(s) if live_exec else PaperBrokerAdapter()
-    service = build_trading_service(s, watchlist, limits=limits, broker=broker)
+    service = build_trading_service(
+        s, watchlist, limits=limits, broker=broker, notifier=build_notifier(s)
+    )
 
     async def _poll_loop(poller: object) -> None:
         from ..execution.fill_poller import FillPoller

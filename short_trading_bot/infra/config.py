@@ -35,6 +35,7 @@ class KisSettings(BaseModel):
 
 
 class NotifierSettings(BaseModel):
+    discord_webhook_url: str = ""  # Discord 채널 웹후크 URL (권장)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
