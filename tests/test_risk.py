@@ -64,6 +64,43 @@ def test_entry_allowed_within_limits() -> None:
     assert _check(rm, IntentKind.ENTER, notional="1000000").allowed
 
 
+def test_daily_loss_pct_scales_with_equity() -> None:
+    rm = RiskManager(RiskLimits(daily_loss_pct=0.03))  # 자본의 3%
+    # 자본 1,000만원: -30만원부터 차단
+    ok = _check(rm, IntentKind.ENTER, snap=_snap(daily_pnl=Decimal("-299999")))
+    blocked = _check(rm, IntentKind.ENTER, snap=_snap(daily_pnl=Decimal("-300000")))
+    assert ok.allowed and blocked.reason == "daily_loss_pct"
+    # 자본이 500만원으로 줄면 한도도 -15만원으로 자동 축소 (anti-martingale)
+    shrunk = _check(
+        rm, IntentKind.ENTER,
+        snap=_snap(equity=Decimal("5000000"), daily_pnl=Decimal("-150000")),
+    )
+    assert shrunk.reason == "daily_loss_pct"
+
+
+def test_max_drawdown_brake_stops_the_bleed() -> None:
+    # "매일 한도만큼 잃고 리셋" 시나리오 차단: 피크 대비 15% 하락 시 daily와 무관하게 전면 차단
+    rm = RiskManager(RiskLimits(daily_loss_pct=0.03, max_drawdown_pct=0.15))
+    bled_down = _check(
+        rm, IntentKind.ENTER,
+        snap=_snap(equity=Decimal("8500000"), daily_pnl=Decimal("0"),
+                   peak_equity=Decimal("10000000")),  # 피크 1,000만 → 850만 (-15%)
+    )
+    assert bled_down.reason == "max_drawdown"
+    # 낙폭 미달이면 통과
+    fine = _check(
+        rm, IntentKind.ENTER,
+        snap=_snap(equity=Decimal("9000000"), peak_equity=Decimal("10000000")),
+    )
+    assert fine.allowed
+    # 청산은 낙폭 브레이크 중에도 항상 허용
+    exit_ok = _check(
+        rm, IntentKind.EXIT,
+        snap=_snap(equity=Decimal("8000000"), peak_equity=Decimal("10000000")),
+    )
+    assert exit_ok.allowed
+
+
 # --- ControlSwitch ---
 
 def test_control_transitions() -> None:

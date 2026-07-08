@@ -101,6 +101,24 @@ async def test_service_hydrate_from_db(sf) -> None:
     assert lot.qty == Decimal("10") and lot.avg_entry == Decimal("70000")
 
 
+async def test_daily_realized_resets_on_new_day(sf) -> None:
+    svc, _broker, _ = _service(sf)
+    day1 = _bar(100.0, datetime(2026, 1, 5, 10, 0, tzinfo=UTC))
+    await svc.process(day1)
+    svc._daily_realized = Decimal("-300000")  # 당일 실현손실 가정
+    assert svc._risk_snapshot(Decimal("10000000")).daily_pnl == Decimal("-300000")
+
+    day2 = _bar(101.0, datetime(2026, 1, 6, 9, 0, tzinfo=UTC))  # 다음 거래일
+    await svc.process(day2)
+    assert svc._daily_realized == Decimal("0")  # 자정 리셋
+
+    # 피크 자본은 위로만 래칫(자본이 줄어도 피크 유지) — 총 낙폭 브레이크 기준
+    peak_before = svc._peak_equity
+    higher = peak_before + Decimal("1000000")
+    assert svc._risk_snapshot(higher).peak_equity == higher
+    assert svc._risk_snapshot(Decimal("1000")).peak_equity == higher  # 하락해도 피크 불변
+
+
 async def test_service_kill_switch_flattens(sf) -> None:
     svc, broker, _ = _service(sf)
     tape = _uptrend()

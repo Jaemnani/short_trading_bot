@@ -88,7 +88,11 @@ class PreflightCheck:
 
 def preflight(settings: Settings, *, limits: RiskLimits | None = None) -> list[PreflightCheck]:
     creds = settings.active_kis()
-    daily = limits.daily_loss_limit if limits else None
+    daily_abs = limits.daily_loss_limit if limits else None
+    daily_pct = limits.daily_loss_pct if limits else None
+    has_daily = (daily_abs is not None and daily_abs > Decimal(0)) or (
+        daily_pct is not None and daily_pct > 0
+    )
     live = settings.mode is Mode.LIVE
     return [
         PreflightCheck("mode", settings.mode in (Mode.PAPER, Mode.LIVE), settings.mode.value, True),
@@ -100,8 +104,8 @@ def preflight(settings: Settings, *, limits: RiskLimits | None = None) -> list[P
         ),
         PreflightCheck(
             "daily_loss_limit",
-            daily is not None and daily > Decimal(0),
-            f"daily_loss_limit={daily}",
+            has_daily,
+            f"abs={daily_abs} pct={daily_pct}",
             critical=live,
         ),
         PreflightCheck("db_persistent", ":memory:" not in settings.db_url, settings.db_url, True),

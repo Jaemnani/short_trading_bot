@@ -12,6 +12,8 @@ def test_load_trading_config(tmp_path) -> None:
             {
                 "limits": {
                     "daily_loss_limit": "500000",
+                    "daily_loss_pct": 0.03,
+                    "max_drawdown_pct": 0.15,
                     "max_open_positions": 5,
                     "max_order_notional": "5000000",
                     "max_ticker_exposure": "10000000",
@@ -40,6 +42,8 @@ def test_load_trading_config(tmp_path) -> None:
     assert tmpl.strategy_params == {"require_confirm": False}
 
     assert limits.daily_loss_limit == Decimal("500000")
+    assert limits.daily_loss_pct == 0.03
+    assert limits.max_drawdown_pct == 0.15
     assert limits.max_open_positions == 5
     assert limits.max_order_notional == Decimal("5000000")
 

@@ -41,5 +41,7 @@ def load_trading_config(path: str | Path) -> tuple[dict[str, StrategyTemplate], 
         max_order_notional=_dec(lim.get("max_order_notional")),
         max_ticker_exposure=_dec(lim.get("max_ticker_exposure")),
         daily_loss_limit=_dec(lim.get("daily_loss_limit")),
+        daily_loss_pct=lim.get("daily_loss_pct"),  # 권장: 자본 대비 비율 (예: 0.03)
+        max_drawdown_pct=lim.get("max_drawdown_pct"),  # 총 낙폭 브레이크 (예: 0.15)
     )
     return watchlist, limits

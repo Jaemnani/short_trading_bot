@@ -69,6 +69,9 @@ class TradingService:
         self._last_price: dict[str, Decimal] = {}
         self._co_map: dict[str, tuple[PositionLot, Side, bool]] = {}
         self._counter = 0
+        self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
+        self._daily_date: object | None = None
+        self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
 
         # Override OrderManager's fill handler with a composed one (persist + lot sync).
         broker.fill_handler = self._on_fill
@@ -132,6 +135,10 @@ class TradingService:
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close
+        bar_day = bar.ts.date()
+        if self._daily_date != bar_day:  # 새 거래일: 일일 실현손익 리셋
+            self._daily_date = bar_day
+            self._daily_realized = Decimal(0)
         # Kill switch: liquidate everything, then halt (no new entries/management).
         if self.control.flat_all_requested:
             await self._flat_all()
@@ -227,7 +234,9 @@ class TradingService:
         meta = self._co_map.get(fill.client_order_id)
         if meta is not None:
             lot, side, is_add = meta
+            before = lot.realized_pnl
             lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
+            self._daily_realized += lot.realized_pnl - before  # 당일 한도 계산용 (비용 포함)
 
     # -- helpers ---------------------------------------------------------
 
@@ -266,10 +275,11 @@ class TradingService:
         for lot in open_lots:
             price = self._last_price.get(lot.ticker, lot.avg_entry)
             exposure[lot.ticker] = exposure.get(lot.ticker, Decimal(0)) + lot.qty * price
-        daily_pnl = sum((lot.realized_pnl for lot in self._lots.values()), Decimal(0))
+        self._peak_equity = max(self._peak_equity, equity)
         return RiskSnapshot(
             equity=equity,
             open_positions=len(open_lots),
-            daily_pnl=daily_pnl,
+            daily_pnl=self._daily_realized,  # 당일 실현손익 (자정 리셋)
             ticker_exposure=exposure,
+            peak_equity=self._peak_equity,
         )

@@ -45,6 +45,15 @@ class RiskManager:
         limits = self._limits
         if limits.daily_loss_limit is not None and snapshot.daily_pnl <= -limits.daily_loss_limit:
             return RiskDecision.block("daily_loss_limit")
+        if limits.daily_loss_pct is not None and snapshot.equity > 0:
+            # 비율 기반 일일 한도: 자본이 줄면 한도도 함께 줄어드는 anti-martingale.
+            if snapshot.daily_pnl <= -(Decimal(str(limits.daily_loss_pct)) * snapshot.equity):
+                return RiskDecision.block("daily_loss_pct")
+        if limits.max_drawdown_pct is not None and snapshot.peak_equity is not None:
+            # 총 낙폭 브레이크: 일일 한도를 매일 채워도 누적 손실이 여기서 멈춘다.
+            floor = snapshot.peak_equity * (Decimal(1) - Decimal(str(limits.max_drawdown_pct)))
+            if snapshot.equity <= floor:
+                return RiskDecision.block("max_drawdown")
         if (
             limits.max_open_positions is not None
             and snapshot.open_positions >= limits.max_open_positions
