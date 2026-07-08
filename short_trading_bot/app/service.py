@@ -121,6 +121,18 @@ class TradingService:
             restored += 1
         return restored
 
+    def prime(self, bars: list[Bar]) -> int:
+        """과거 봉으로 지표 워밍업(백필). 평가/주문 없이 IndicatorEngine만 채운다.
+
+        일봉 전략은 워밍업에 60+봉이 필요하므로, 시작 시 히스토리를 주입하지 않으면
+        수십 거래일 동안 관망만 하게 된다. run(feed) 전에 호출할 것.
+        """
+        for bar in sorted(bars, key=lambda b: b.ts):
+            snap = self._engine.update(bar)
+            self._prev[bar.ticker] = snap
+            self._last_price[bar.ticker] = bar.close
+        return len(bars)
+
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
         return FillPoller(self._broker, self._sf, self._on_fill)

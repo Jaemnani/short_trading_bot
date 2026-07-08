@@ -127,6 +127,61 @@ def serve(
                 log.exception("fill_poll.error")
             await asyncio.sleep(fill_poll_seconds)
 
+    def _backfill_daily() -> int:
+        """일봉 워밍업 백필 (FinanceDataReader, 최근 ~200일)."""
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        import FinanceDataReader as fdr
+
+        from ..market.types import Bar
+
+        start = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%d")
+        bars: list[Bar] = []
+        for ticker in watchlist:
+            try:
+                df = fdr.DataReader(ticker, start)
+            except Exception:
+                log.warning("backfill.failed", ticker=ticker)
+                continue
+            for idx, row in df.iterrows():
+                if row.isna().any() or row["Volume"] == 0:
+                    continue
+                c = Decimal(str(row["Close"]))
+                v = Decimal(str(int(row["Volume"])))
+                bars.append(
+                    Bar(ticker, Resolution.D1,
+                        datetime(idx.year, idx.month, idx.day, tzinfo=UTC),
+                        Decimal(str(row["Open"])), Decimal(str(row["High"])),
+                        Decimal(str(row["Low"])), c, v, c * v)
+                )
+        return service.prime(bars)
+
+    async def _backfill_intraday(auth: KisAuth, resolution: Resolution) -> int:
+        """분봉 워밍업 백필 (KIS 분봉, 최근 5거래일 — 디스크 캐시 우선)."""
+        from datetime import date, timedelta
+
+        from ..market.kis_history import KisMinuteHistory, resample
+
+        hist = KisMinuteHistory(auth, creds, kis_rest_base(s.mode))
+        days: list[date] = []
+        d = date.today() - timedelta(days=1)
+        while len(days) < 5:
+            if d.weekday() < 5:
+                days.append(d)
+            d -= timedelta(days=1)
+        total = 0
+        for ticker in watchlist:
+            try:
+                one_min = await hist.fetch_days(ticker, days)
+            except Exception:
+                log.warning("backfill.intraday_failed", ticker=ticker)
+                continue
+            total += service.prime(
+                one_min if resolution is Resolution.M1 else resample(one_min, resolution)
+            )
+        return total
+
     async def _run() -> None:
         restored = await service.hydrate()
         if live_exec:
@@ -135,6 +190,14 @@ def serve(
                 log.warning("reconcile.drift_on_start", mismatches=len(report.mismatches))
         auth = KisAuth(creds, kis_rest_base(s.mode))
         resolution = Resolution(next(iter(watchlist.values())).resolution)
+        # 지표 워밍업 백필 — 없으면 일봉 전략은 수십 거래일간 관망만 한다.
+        if resolution is Resolution.D1:
+            primed = _backfill_daily()
+        elif resolution.is_intraday and resolution is not Resolution.TICK:
+            primed = await _backfill_intraday(auth, resolution)
+        else:
+            primed = 0
+        log.info("backfill.primed", bars=primed, resolution=resolution.value)
         log.info(
             "engine.start",
             mode=s.mode.value,
