@@ -95,6 +95,32 @@ class _FakeWs:
             yield frame
 
 
+async def test_ws_feed_shared_builder_survives_reconnect() -> None:
+    """재접속(새 피드 인스턴스)에도 공유 BarBuilder가 만들던 봉을 보존한다."""
+    from short_trading_bot.market.bar_builder import BarBuilder
+
+    shared = BarBuilder(Resolution.M1)
+    feed1 = KisWebSocketFeed(
+        "a", ["005930"], Resolution.M1, connect=lambda: _FakeWs([_frame("005930", "090000", "100", "5")]),
+        session_date=date(2026, 1, 2), bar_builder=shared, flush_on_close=False,
+    )
+    assert [b async for b in feed1.stream()] == []  # 부분 봉 방출 없음 (유실도 없음)
+
+    feed2 = KisWebSocketFeed(  # 재접속: 같은 분(09:00) 틱 + 다음 분 틱
+        "a", ["005930"], Resolution.M1,
+        connect=lambda: _FakeWs([
+            _frame("005930", "090030", "105", "5"),
+            _frame("005930", "090100", "101", "1"),
+        ]),
+        session_date=date(2026, 1, 2), bar_builder=shared, flush_on_close=False,
+    )
+    bars = [b async for b in feed2.stream()]
+    assert len(bars) == 1
+    # 09:00 봉이 단절 전(100/5) + 후(105/5) 틱을 모두 포함
+    assert bars[0].open == Decimal("100") and bars[0].high == Decimal("105")
+    assert bars[0].volume == Decimal("10")
+
+
 async def test_ws_feed_streams_bars() -> None:
     frames = [
         _frame("005930", "093000", "100", "5"),

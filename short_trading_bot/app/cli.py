@@ -208,12 +208,16 @@ def serve(
         poll_task = (
             asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
         )
+        from ..market.bar_builder import BarBuilder
+
+        shared_builder = BarBuilder(resolution)  # 재접속에도 만들던 봉 보존
         try:
             # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
             while not service.control.is_stopped:
                 approval = await auth.approval_key()
                 feed = KisWebSocketFeed(
-                    approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode)
+                    approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode),
+                    bar_builder=shared_builder, flush_on_close=False,
                 )
                 try:
                     await service.run(feed)
