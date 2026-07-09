@@ -70,6 +70,13 @@ def test_risk_based_qty_invalid() -> None:
     assert risk_based_qty(Decimal("100"), 0.01, Decimal("100"), Decimal("100")) == Decimal("0")
 
 
+def test_risk_based_qty_capped_by_equity() -> None:
+    # 타이트한 손절(0.1% 거리) → 리스크식 수량(2000주)이 계좌 초과 → 자본 95% 캡(95주)
+    qty = risk_based_qty(Decimal("10000000"), 0.02, Decimal("100000"), Decimal("99900"))
+    assert qty == Decimal("95")
+    assert qty * Decimal("100000") <= Decimal("10000000") * Decimal("0.95")
+
+
 def test_stops() -> None:
     assert atr_stop(Decimal("110"), 2.0, 2.0) == Decimal("106.0")
     assert chandelier_stop(Decimal("120"), 2.0, 3.0) == Decimal("114.0")

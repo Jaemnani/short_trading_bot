@@ -16,12 +16,19 @@ def risk_based_qty(
     stop: Decimal,
     *,
     allow_fractional: bool = False,
+    max_notional_pct: float = 0.95,
 ) -> Decimal:
-    """shares = (equity * risk_per_trade) / (entry - stop); 0 if inputs invalid."""
+    """shares = (equity * risk_per_trade) / (entry - stop); 0 if inputs invalid.
+
+    Capped so notional never exceeds ``max_notional_pct`` of equity — a tight stop
+    otherwise produces an order larger than the account (silently unfillable).
+    """
     if entry <= 0 or stop <= 0 or entry <= stop:
         return Decimal(0)
     budget = equity * _d(risk_per_trade)
     raw = budget / (entry - stop)
+    cap = equity * _d(max_notional_pct) / entry  # 자본 상한 캡
+    raw = min(raw, cap)
     if allow_fractional:
         return raw
     return raw.to_integral_value(rounding=ROUND_DOWN)
