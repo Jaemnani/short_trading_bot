@@ -1,0 +1,25 @@
+{
+  "limits": {
+    "daily_loss_pct": 0.03,
+    "max_drawdown_pct": 0.15,
+    "max_open_positions": 2,
+    "max_order_notional": "5000000",
+    "max_ticker_exposure": "10000000"
+  },
+  "watchlist": {
+    "122630": {
+      "strategy_id": "orb_intraday_v1",
+      "market": "KRX",
+      "resolution": "5m",
+      "risk_per_trade": 0.01,
+      "strategy_params": { "or_minutes": 30, "min_rvol": 1.5, "atr_stop_mult": 1.0 }
+    },
+    "233740": {
+      "strategy_id": "orb_intraday_v1",
+      "market": "KRX",
+      "resolution": "5m",
+      "risk_per_trade": 0.01,
+      "strategy_params": { "or_minutes": 30, "min_rvol": 1.5, "atr_stop_mult": 1.0 }
+    }
+  }
+}
