@@ -61,10 +61,11 @@ class PullbackDaily(Strategy):
         name="눌림목 매수 (일봉)",
         version="1",
         description=(
-            "상승추세(종가>MA60, MA20>MA60) 종목이 20일선까지 눌렸다가 반등(전일 대비 상승, "
-            "RSI 40~60)할 때 매수. ATR 손절 + 트레일링 + 익절 래더, MA60 이탈 시 청산."
+            "상승추세(종가>MA60, MA20>MA60) 종목이 20선까지 눌렸다가 반등(직전봉 대비 상승, "
+            "RSI 40~60)할 때 매수. ATR 손절 + 트레일링 + 익절 래더, MA60 이탈 시 청산. "
+            "일봉·60분봉 지원(로직은 봉 개수 기준)."
         ),
-        supported_resolutions=[Resolution.D1],
+        supported_resolutions=[Resolution.M60, Resolution.D1],
     )
     ParamsModel: ClassVar[type[BaseModel]] = PullbackParams
 

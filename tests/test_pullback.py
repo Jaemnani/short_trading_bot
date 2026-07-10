@@ -188,3 +188,8 @@ def test_daily_only_contract_and_registry() -> None:
         StrategyTemplate(strategy_id="pullback_daily_v1", resolution=Resolution.D1),
     )
     assert lot.params.resolution is Resolution.D1
+    hourly = PositionFactory.create(  # 시간봉도 지원
+        Signal(ticker="005930"),
+        StrategyTemplate(strategy_id="pullback_daily_v1", resolution=Resolution.M60),
+    )
+    assert hourly.params.resolution is Resolution.M60
