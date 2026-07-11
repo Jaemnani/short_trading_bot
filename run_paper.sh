@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# 모의투자 가동: 멀티 전략 엔진 + 대시보드 API.
-# 본인 터미널에서 실행하세요 (개발 세션과 독립적으로 살아있게).
+# 모의투자 가동: tmux 세션 'stb' 에 엔진 + 대시보드 API.
+# 보기: tmux attach -t stb   (창 전환 Ctrl-b n, 분리 Ctrl-b d)
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p logs
 
-if [ -f logs/serve.pid ] && ps -p "$(cat logs/serve.pid)" >/dev/null 2>&1; then
-  echo "이미 가동 중입니다 (engine PID $(cat logs/serve.pid)). 먼저 ./stop_paper.sh"
+command -v tmux >/dev/null 2>&1 || { echo "tmux가 필요합니다: brew install tmux"; exit 1; }
+
+if tmux has-session -t stb 2>/dev/null; then
+  echo "이미 가동 중입니다 → tmux attach -t stb  (중지: ./stop_paper.sh)"
   exit 1
 fi
 
-nohup .venv/bin/trader serve --config watchlist.json > logs/serve.log 2>&1 &
-echo $! > logs/serve.pid
-nohup .venv/bin/trader api > logs/api.log 2>&1 &
-echo $! > logs/api.pid
+mkdir -p logs
+tmux new-session -d -s stb -n engine \
+  "$(pwd)/.venv/bin/trader serve --config watchlist.json 2>&1 | tee -a logs/serve.log"
+tmux new-window -t stb -n api \
+  "$(pwd)/.venv/bin/trader api 2>&1 | tee -a logs/api.log"
 
 sleep 3
-echo "── 가동 완료 ─────────────────────────────"
-echo "engine PID $(cat logs/serve.pid) → logs/serve.log"
-echo "api    PID $(cat logs/api.pid)  → http://localhost:8000 (PWA: cd frontend && npm run dev)"
-echo "중지: ./stop_paper.sh   |   긴급중지(전량청산)는 대시보드에서"
-tail -5 logs/serve.log
+echo "── tmux 세션 'stb' 가동 완료 ──────────────────"
+echo "  실시간 보기 : tmux attach -t stb   (engine/api 창 전환: Ctrl-b n, 나가기: Ctrl-b d)"
+echo "  로그 파일   : logs/serve.log, logs/api.log"
+echo "  대시보드    : http://localhost:8000"
+echo "  중지        : ./stop_paper.sh   (긴급중지·전량청산은 대시보드에서)"

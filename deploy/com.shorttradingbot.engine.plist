@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shorttradingbot.engine</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT__/.venv/bin/trader</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>__PROJECT__/watchlist.json</string>
+  </array>
+
+  <!-- .env/.env.local 과 상대경로 DB는 여기 기준으로 읽힌다 -->
+  <key>WorkingDirectory</key>
+  <string>__PROJECT__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 크래시(비정상 종료) 시에만 자동 재시작.
+       긴급중지(킬스위치)로 정상 종료(exit 0)하면 재시작하지 않는다 —
+       비상 정지가 자동으로 되살아나면 안 되므로. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT__/logs/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT__/logs/serve.log</string>
+</dict>
+</plist>
