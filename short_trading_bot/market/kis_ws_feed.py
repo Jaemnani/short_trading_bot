@@ -38,16 +38,19 @@ class KisWebSocketFeed:
         connect: Callable[[], Any] | None = None,
         session_date: Any = None,
         bar_builder: BarBuilder | None = None,
+        bar_builders: list[BarBuilder] | None = None,
         flush_on_close: bool = True,
     ) -> None:
-        """``bar_builder``를 공유하면 재접속(새 피드 인스턴스) 간에 만들던 봉이 보존된다.
-        공유 시에는 ``flush_on_close=False``로 두어 부분 봉이 조기 방출되지 않게 할 것."""
+        """``bar_builder(s)``를 공유하면 재접속(새 피드 인스턴스) 간에 만들던 봉이 보존된다.
+        공유 시에는 ``flush_on_close=False``로 두어 부분 봉이 조기 방출되지 않게 할 것.
+        ``bar_builders``로 여러 해상도의 빌더를 주면 한 WS 연결(틱)에서 동시에 집계된다
+        (KIS는 appkey당 WS 1연결이라 멀티 해상도는 이 방식이 유일하다)."""
         self._approval = approval_key
         self._tickers = tickers
         self._tr_id = tr_id
         self._url = ws_url
         self._connect = connect or self._default_connect
-        self._bar = bar_builder or BarBuilder(resolution)
+        self._builders = bar_builders or [bar_builder or BarBuilder(resolution)]
         self._flush_on_close = flush_on_close
         self._session_date = session_date
 
@@ -62,11 +65,13 @@ class KisWebSocketFeed:
                         await ws.send(raw)  # echo heartbeat
                     continue
                 for tick in self.parse_ticks(raw, base_date, tr_id=self._tr_id):
-                    for bar in self._bar.on_tick(tick):
-                        yield bar
+                    for builder in self._builders:
+                        for bar in builder.on_tick(tick):
+                            yield bar
             if self._flush_on_close:  # 공유 빌더는 flush 금지 (부분 봉 조기 방출 방지)
-                for bar in self._bar.flush():
-                    yield bar
+                for builder in self._builders:
+                    for bar in builder.flush():
+                        yield bar
 
     @staticmethod
     def parse_ticks(raw: str, base_date: Any, *, tr_id: str = _TR_TRADE) -> list[Tick]:

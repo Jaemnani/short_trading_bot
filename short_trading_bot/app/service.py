@@ -1,11 +1,16 @@
 """TradingService — the async engine orchestrator.
 
-Wires the pipeline: Feed → IndicatorEngine → per-ticker PositionLot.evaluate → RiskManager
+Wires the pipeline: Feed → IndicatorEngine → per-lot PositionLot.evaluate → RiskManager
 gate → OrderManager (idempotent) → BrokerAdapter. Fills flow back through a composed handler
 that persists (OrderManager) AND syncs the in-memory lot (strategy source of truth). Remote
 control: PAUSE blocks new entries (risk gate); STOP requests a flat-all liquidation that the
 loop executes promptly. The same service runs over a ReplayFeed (paper-over-history / tests)
 or a live KIS WebSocket feed.
+
+MULTI-RESOLUTION: lots are keyed ``ticker@resolution`` and a bar routes ONLY to lots of its
+own resolution, so one process can run e.g. 1D 눌림목 + 60m 눌림목 + 5m ORB simultaneously —
+including the same ticker on different timeframes (watchlist keys may be ``ticker@label``).
+This matters because KIS allows a single concurrent WS connection per appkey.
 """
 
 from __future__ import annotations
@@ -57,6 +62,16 @@ class TradingService:
         self._sf = session_factory
         self._risk = risk
         self._watchlist = watchlist
+        # config 키는 "TICKER" 또는 "TICKER@라벨" — 같은 종목을 여러 해상도로 운용 가능.
+        self._by_ticker: dict[str, list[StrategyTemplate]] = {}
+        seen: set[tuple[str, str]] = set()
+        for key, template in watchlist.items():
+            ticker = key.split("@")[0]
+            pair = (ticker, template.resolution.value)
+            if pair in seen:
+                raise ValueError(f"duplicate watchlist entry for {ticker}@{template.resolution.value}")
+            seen.add(pair)
+            self._by_ticker.setdefault(ticker, []).append(template)
         self._om = OrderManager(broker, session_factory)
         self._engine = IndicatorEngine()
         self._notifier = notifier or InMemoryNotifier()
@@ -77,9 +92,23 @@ class TradingService:
         broker.fill_handler = self._on_fill
         self.control = risk.control
 
+    @staticmethod
+    def lot_key(ticker: str, resolution: object) -> str:
+        return f"{ticker}@{getattr(resolution, 'value', resolution)}"
+
     @property
     def lots(self) -> dict[str, PositionLot]:
+        """Keyed ``ticker@resolution`` (e.g. "005930@1D")."""
         return self._lots
+
+    def lot(self, ticker: str, resolution: object | None = None) -> PositionLot | None:
+        """Convenience lookup; without resolution returns the first lot for the ticker."""
+        if resolution is not None:
+            return self._lots.get(self.lot_key(ticker, resolution))
+        for key, lot in self._lots.items():
+            if key.split("@")[0] == ticker:
+                return lot
+        return None
 
     async def hydrate(self) -> int:
         """Rebuild in-memory lots from the DB Position projection (restart recovery).
@@ -101,10 +130,11 @@ class TradingService:
             ).scalars().all()
         restored = 0
         for row in rows:
-            if row.ticker in self._lots:
-                continue
             params = PositionParams(**row.params_json)
-            self._lots[row.ticker] = PositionLot(
+            key = self.lot_key(row.ticker, params.resolution)
+            if key in self._lots:
+                continue
+            self._lots[key] = PositionLot(
                 lot_id=row.lot_id,
                 ticker=row.ticker,
                 market=Market(row.market),
@@ -158,26 +188,31 @@ class TradingService:
 
         snap = self._engine.update(bar)  # keep indicators warm even while halted
         ticker = bar.ticker
+        pkey = self.lot_key(ticker, bar.resolution)  # prev/lot 모두 (종목, 해상도) 단위
         if self.control.is_stopped:
-            self._prev[ticker] = snap
+            self._prev[pkey] = snap
             return
 
-        lot = self._lots.get(ticker)
-        if lot is not None and lot.is_open:
+        # 이 봉의 해상도에 해당하는 템플릿만 라우팅 (멀티 해상도 동시 운용의 핵심).
+        template = next(
+            (t for t in self._by_ticker.get(ticker, []) if t.resolution is bar.resolution), None
+        )
+        lot = self._lots.get(pkey)
+        if template is not None and (lot is None or lot.is_terminal):
+            lot = await self._spawn(ticker, template)
+        if lot is None:  # 워치리스트 밖 + 복원 lot도 없음
+            self._prev[pkey] = snap
+            return
+
+        if lot.is_open:
             lot.on_bar(bar.high)
-        if (lot is None or lot.is_terminal) and ticker in self._watchlist:
-            lot = await self._spawn(ticker)
-        if lot is None:
-            self._prev[ticker] = snap
-            return
-
         equity = await self._equity()
         snapshot = self._risk_snapshot(equity)
         news = self._news_provider(ticker) if self._news_provider is not None else self._news
-        for intent in lot.evaluate(snap, equity, prev=self._prev.get(ticker), news_ewma=news):
+        for intent in lot.evaluate(snap, equity, prev=self._prev.get(pkey), news_ewma=news):
             if intent.is_actionable:
                 await self._handle_intent(intent, lot, bar, snapshot)
-        self._prev[ticker] = snap
+        self._prev[pkey] = snap
 
     # -- intent handling -------------------------------------------------
 
@@ -233,9 +268,9 @@ class TradingService:
         )
 
     async def _flat_all(self) -> None:
-        for ticker, lot in list(self._lots.items()):
+        for lot in list(self._lots.values()):
             if lot.is_open:
-                price = self._last_price.get(ticker, lot.avg_entry)
+                price = self._last_price.get(lot.ticker, lot.avg_entry)
                 await self._submit(lot, Side.SELL, lot.qty, price, is_add=False, reason="kill_switch")
         await self._notifier.notify("kill_switch.flat_all")
 
@@ -252,10 +287,9 @@ class TradingService:
 
     # -- helpers ---------------------------------------------------------
 
-    async def _spawn(self, ticker: str) -> PositionLot:
-        template = self._watchlist[ticker]
+    async def _spawn(self, ticker: str, template: StrategyTemplate) -> PositionLot:
         lot = PositionFactory.create(Signal(ticker=ticker, market=template.market), template)
-        self._lots[ticker] = lot
+        self._lots[self.lot_key(ticker, template.resolution)] = lot
         async with session_scope(self._sf) as session:
             session.add(
                 Position(
@@ -276,9 +310,9 @@ class TradingService:
     async def _equity(self) -> Decimal:
         balance = await self._broker.get_balance()
         equity = balance.cash.get(Currency.KRW, Decimal(0))
-        for ticker, lot in self._lots.items():
+        for lot in self._lots.values():
             if lot.qty > 0:
-                equity += lot.qty * self._last_price.get(ticker, lot.avg_entry)
+                equity += lot.qty * self._last_price.get(lot.ticker, lot.avg_entry)
         return equity
 
     def _risk_snapshot(self, equity: Decimal) -> RiskSnapshot:

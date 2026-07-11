@@ -60,7 +60,7 @@ async def test_service_enters_position(sf) -> None:
     svc, broker, notifier = _service(sf)
     await svc.run(ReplayFeed(_uptrend()))
 
-    lot = svc.lots[TICKER]
+    lot = svc.lot(TICKER)
     assert lot.is_open and lot.qty > 0  # entered and holding
     assert await _order_count(sf) > 0  # OrderManager persisted orders
     bal = await broker.get_balance()
@@ -76,7 +76,7 @@ async def test_service_pause_blocks_entry(sf) -> None:
     svc, broker, notifier = _service(sf, control=control)
     await svc.run(ReplayFeed(_uptrend()))
 
-    assert svc.lots[TICKER].state is PositionState.WATCHING  # never entered
+    assert svc.lot(TICKER).state is PositionState.WATCHING  # never entered
     bal = await broker.get_balance()
     assert bal.positions == []
     assert any(n.event == "intent.blocked" and n.fields.get("reason") == "paused" for n in notifier.sent)
@@ -96,7 +96,7 @@ async def test_service_hydrate_from_db(sf) -> None:
     svc, _broker, _ = _service(sf)
     restored = await svc.hydrate()
     assert restored == 1
-    lot = svc.lots[TICKER]
+    lot = svc.lot(TICKER)
     assert lot.state is PositionState.HOLDING
     assert lot.qty == Decimal("10") and lot.avg_entry == Decimal("70000")
 
@@ -123,12 +123,12 @@ async def test_service_kill_switch_flattens(sf) -> None:
     svc, broker, _ = _service(sf)
     tape = _uptrend()
     await svc.run(ReplayFeed(tape))
-    assert svc.lots[TICKER].is_open  # holding before kill switch
+    assert svc.lot(TICKER).is_open  # holding before kill switch
 
     svc.control.stop()  # 긴급중지
     extra = _bar(260.0, tape[-1].ts + timedelta(days=1))
     await svc.process(extra)  # flat-all runs at start of process
 
-    assert svc.lots[TICKER].state is PositionState.CLOSED
+    assert svc.lot(TICKER).state is PositionState.CLOSED
     bal = await broker.get_balance()
     assert all(p.qty == 0 for p in bal.positions)

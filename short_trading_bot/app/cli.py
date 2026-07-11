@@ -94,15 +94,9 @@ def serve(
         typer.echo(f"watchlist empty — add entries to {config} (see watchlist.example.json).")
         raise typer.Exit(1)
 
-    resolutions = {tmpl.resolution for tmpl in watchlist.values()}
-    if len(resolutions) > 1:
-        # One WS feed aggregates at one timeframe; mixed configs would evaluate lots on
-        # wrong-timeframe bars (the lot-level guard would then just HOLD forever).
-        typer.echo(
-            f"watchlist mixes resolutions {sorted(r.value for r in resolutions)} — "
-            "run one serve process per resolution (separate config files)."
-        )
-        raise typer.Exit(1)
+    # 멀티 해상도: 한 WS 연결(틱)에서 필요한 모든 해상도의 봉을 동시에 집계한다.
+    resolutions = sorted({tmpl.resolution for tmpl in watchlist.values()}, key=lambda r: r.value)
+    tickers = sorted({key.split("@")[0] for key in watchlist})
 
     creds = s.active_kis()
     if not creds.configured:
@@ -127,7 +121,7 @@ def serve(
                 log.exception("fill_poll.error")
             await asyncio.sleep(fill_poll_seconds)
 
-    def _backfill_daily() -> int:
+    def _backfill_daily(daily_tickers: list[str]) -> int:
         """일봉 워밍업 백필 (FinanceDataReader, 최근 ~200일)."""
         from datetime import UTC, datetime, timedelta
         from decimal import Decimal
@@ -138,7 +132,7 @@ def serve(
 
         start = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%d")
         bars: list[Bar] = []
-        for ticker in watchlist:
+        for ticker in daily_tickers:
             try:
                 df = fdr.DataReader(ticker, start)
             except Exception:
@@ -157,7 +151,9 @@ def serve(
                 )
         return service.prime(bars)
 
-    async def _backfill_intraday(auth: KisAuth, resolution: Resolution) -> int:
+    async def _backfill_intraday(
+        auth: KisAuth, resolution: Resolution, res_tickers: list[str]
+    ) -> int:
         """분봉 워밍업 백필 (KIS 분봉, 최근 5거래일 — 디스크 캐시 우선)."""
         from datetime import date, timedelta
 
@@ -171,7 +167,7 @@ def serve(
                 days.append(d)
             d -= timedelta(days=1)
         total = 0
-        for ticker in watchlist:
+        for ticker in res_tickers:
             try:
                 one_min = await hist.fetch_days(ticker, days)
             except Exception:
@@ -182,6 +178,11 @@ def serve(
             )
         return total
 
+    def _tickers_for(resolution: Resolution) -> list[str]:
+        return sorted({
+            key.split("@")[0] for key, tmpl in watchlist.items() if tmpl.resolution is resolution
+        })
+
     async def _run() -> None:
         restored = await service.hydrate()
         if live_exec:
@@ -189,19 +190,24 @@ def serve(
             if not report.in_sync:
                 log.warning("reconcile.drift_on_start", mismatches=len(report.mismatches))
         auth = KisAuth(creds, kis_rest_base(s.mode))
-        resolution = Resolution(next(iter(watchlist.values())).resolution)
-        # 지표 워밍업 백필 — 없으면 일봉 전략은 수십 거래일간 관망만 한다.
-        if resolution is Resolution.D1:
-            primed = _backfill_daily()
-        elif resolution.is_intraday and resolution is not Resolution.TICK:
-            primed = await _backfill_intraday(auth, resolution)
-        else:
-            primed = 0
-        log.info("backfill.primed", bars=primed, resolution=resolution.value)
+        # 지표 워밍업 백필 — 해상도별로. 없으면 저빈도 전략은 수십 거래일간 관망만 한다.
+        primed = 0
+        for res in resolutions:
+            res_tickers = _tickers_for(res)
+            if res is Resolution.D1:
+                primed += _backfill_daily(res_tickers)
+            elif res.is_intraday and res is not Resolution.TICK:
+                primed += await _backfill_intraday(auth, res, res_tickers)
+        log.info(
+            "backfill.primed", bars=primed,
+            resolutions=[r.value for r in resolutions],
+        )
         log.info(
             "engine.start",
             mode=s.mode.value,
-            tickers=len(watchlist),
+            tickers=len(tickers),
+            entries=len(watchlist),
+            resolutions=[r.value for r in resolutions],
             restored=restored,
             execution="live" if live_exec else "simulated",
         )
@@ -210,14 +216,15 @@ def serve(
         )
         from ..market.bar_builder import BarBuilder
 
-        shared_builder = BarBuilder(resolution)  # 재접속에도 만들던 봉 보존
+        # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
+        shared_builders = [BarBuilder(res) for res in resolutions]
         try:
             # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
             while not service.control.is_stopped:
                 approval = await auth.approval_key()
                 feed = KisWebSocketFeed(
-                    approval, list(watchlist), resolution, ws_url=kis_ws_url(s.mode),
-                    bar_builder=shared_builder, flush_on_close=False,
+                    approval, tickers, resolutions[0], ws_url=kis_ws_url(s.mode),
+                    bar_builders=shared_builders, flush_on_close=False,
                 )
                 try:
                     await service.run(feed)

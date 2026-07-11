@@ -159,7 +159,7 @@ async def test_fraction_trim_converts_to_qty(sf) -> None:
     lot.state = PositionState.HOLDING
     lot.qty = Decimal("10")
     lot.avg_entry = Decimal("100")
-    svc.lots["005930"] = lot
+    svc.lots[svc.lot_key("005930", lot.params.resolution)] = lot
     async with session_scope(sf) as s:
         from short_trading_bot.persistence.models import Position
 

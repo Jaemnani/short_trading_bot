@@ -134,5 +134,5 @@ async def test_negative_news_blocks_entry(sf) -> None:
     )
     await svc.run(ReplayFeed(_uptrend()))
 
-    assert svc.lots["005930"].state is PositionState.WATCHING  # entry vetoed by news
+    assert svc.lot("005930").state is PositionState.WATCHING  # entry vetoed by news
     assert (await broker.get_balance()).positions == []

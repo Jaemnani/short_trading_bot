@@ -1,0 +1,44 @@
+{
+  "limits": {
+    "daily_loss_pct": 0.03,
+    "max_drawdown_pct": 0.15,
+    "max_open_positions": 7,
+    "max_order_notional": "5000000",
+    "max_ticker_exposure": "10000000"
+  },
+  "watchlist": {
+    "005930@1D": {
+      "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "1D",
+      "risk_per_trade": 0.02,
+      "strategy_params": { "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02, "bull_risk_mult": 2.0, "max_adds": 1 }
+    },
+    "000660@1D": {
+      "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "1D",
+      "risk_per_trade": 0.02,
+      "strategy_params": { "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02, "bull_risk_mult": 2.0, "max_adds": 1 }
+    },
+    "005380@1D": {
+      "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "1D",
+      "risk_per_trade": 0.02,
+      "strategy_params": { "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02, "bull_risk_mult": 2.0, "max_adds": 1 }
+    },
+    "005930@60m": {
+      "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "60m",
+      "risk_per_trade": 0.01
+    },
+    "000660@60m": {
+      "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "60m",
+      "risk_per_trade": 0.01
+    },
+    "122630@5m": {
+      "strategy_id": "orb_intraday_v1", "market": "KRX", "resolution": "5m",
+      "risk_per_trade": 0.01,
+      "strategy_params": { "or_minutes": 30, "min_rvol": 1.5, "atr_stop_mult": 1.0 }
+    },
+    "233740@5m": {
+      "strategy_id": "orb_intraday_v1", "market": "KRX", "resolution": "5m",
+      "risk_per_trade": 0.01,
+      "strategy_params": { "or_minutes": 30, "min_rvol": 1.5, "atr_stop_mult": 1.0 }
+    }
+  }
+}
