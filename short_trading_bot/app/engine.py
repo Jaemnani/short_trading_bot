@@ -20,6 +20,7 @@ from ..execution.broker.kis import KisBrokerAdapter
 from ..execution.broker.kis_overseas import KisOverseasAdapter
 from ..execution.broker.paper import PaperBrokerAdapter
 from ..execution.broker.routing import RoutingBrokerAdapter
+from ..execution.fx import FxRates
 from ..infra.config import Settings
 from ..infra.kis_auth import KisAuth
 from ..infra.logging import get_logger
@@ -64,6 +65,7 @@ def build_trading_service(
     notifier: Any = None,
     news_provider: Any = None,
     broker: BrokerAdapter | None = None,
+    fx_rates: FxRates | None = None,
 ) -> TradingService:
     broker = broker or build_broker(settings)
     engine = create_engine(settings.db_url)
@@ -75,6 +77,7 @@ def build_trading_service(
         watchlist,
         notifier=notifier,
         news_provider=news_provider,
+        fx_rates=fx_rates,
     )
 
 

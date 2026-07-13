@@ -54,18 +54,30 @@ class FillPoller:
                 # Ack may not be persisted yet — retry on the next poll (don't mark seen).
                 self._log.warning("fill_poll.unresolved", broker_order_no=ex.broker_order_no)
                 continue
-            client_order_id, already = resolved
-            delta = ex.qty - already
+            client_order_id, already_qty, already_notional, already_fee, already_tax = resolved
+            delta = ex.qty - already_qty
             if delta <= 0:  # nothing new (restart replay / duplicate row)
                 self._seen.add(ex.exec_id)
                 continue
+            delta_notional = ex.qty * ex.price - already_notional
+            if delta_notional <= 0:
+                # ex.price is a broker-rounded cumulative average while already_notional
+                # sums exact DB rows — never let rounding produce a zero/negative price.
+                self._log.warning(
+                    "fill_poll.notional_regression",
+                    broker_order_no=ex.broker_order_no,
+                    delta=str(delta),
+                )
+                delta_price = ex.price
+            else:
+                delta_price = delta_notional / delta
             await self._handler(
                 Fill(
                     client_order_id=client_order_id,
                     qty=delta,
-                    price=ex.price,
-                    fee=ex.fee,
-                    tax=ex.tax,
+                    price=delta_price,
+                    fee=max(Decimal(0), ex.fee - already_fee),
+                    tax=max(Decimal(0), ex.tax - already_tax),
                     currency=ex.currency,
                     ts=ex.ts,
                     source="poll",
@@ -75,8 +87,10 @@ class FillPoller:
             applied += 1
         return applied
 
-    async def _resolve(self, broker_order_no: str) -> tuple[str, Decimal] | None:
-        """Map broker_order_no -> (client_order_id, already-filled qty in DB)."""
+    async def _resolve(
+        self, broker_order_no: str
+    ) -> tuple[str, Decimal, Decimal, Decimal, Decimal] | None:
+        """Map an order to already applied cumulative execution totals."""
         async with session_scope(self._sf) as session:
             order = (
                 await session.execute(
@@ -86,6 +100,14 @@ class FillPoller:
             if order is None:
                 return None
             rows = (
-                await session.execute(select(FillRow.qty).where(FillRow.order_id == order.order_id))
-            ).scalars().all()
-            return order.client_order_id, sum(rows, Decimal(0))
+                await session.execute(
+                    select(FillRow.qty, FillRow.price, FillRow.fee, FillRow.tax).where(
+                        FillRow.order_id == order.order_id
+                    )
+                )
+            ).all()
+            qty = sum((row.qty for row in rows), Decimal(0))
+            notional = sum((row.qty * row.price for row in rows), Decimal(0))
+            fee = sum((row.fee for row in rows), Decimal(0))
+            tax = sum((row.tax for row in rows), Decimal(0))
+            return order.client_order_id, qty, notional, fee, tax

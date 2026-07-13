@@ -63,6 +63,7 @@ async def test_buy_fill_updates_position_and_order_state(sf) -> None:
     pos = await _position(sf)
     assert pos.qty_filled == Decimal("10")
     assert pos.avg_entry_price == Decimal("70035")  # market buy w/ slippage
+    assert pos.state == "HOLDING"
 
     async with session_scope(sf) as s:
         order = (await s.execute(select(Order).where(Order.client_order_id == "c1"))).scalar_one()
@@ -98,6 +99,8 @@ async def test_sell_realizes_pnl(sf) -> None:
     pos = await _position(sf)
     assert pos.qty_filled == Decimal("0")
     assert pos.realized_pnl > 0  # sold higher than avg entry (net of fees/tax)
+    assert pos.state == "CLOSED"
+    assert pos.closed_at is not None
 
 
 async def test_rejected_order_recorded(sf) -> None:

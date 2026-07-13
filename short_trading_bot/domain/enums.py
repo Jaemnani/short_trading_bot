@@ -156,6 +156,7 @@ class PositionState(StrEnum):
 
 class OrderState(StrEnum):
     PENDING_NEW = "PENDING_NEW"
+    UNKNOWN = "UNKNOWN"  # broker outcome is ambiguous (timeout/disconnect)
     NEW = "NEW"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"

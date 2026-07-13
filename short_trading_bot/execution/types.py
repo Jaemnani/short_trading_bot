@@ -64,8 +64,10 @@ class Fill:
 @dataclass(slots=True)
 class Execution:
     """An authoritative executed-trade record from the broker (체결내역) — ground truth
-    for fills, including exact fee/tax. ``qty`` is the CUMULATIVE executed quantity for
-    the order (KIS 체결내역 semantics); the FillPoller applies deltas against the DB."""
+    for fills, including exact fee/tax. ``qty``, ``fee`` and ``tax`` are CUMULATIVE per
+    order and ``price`` is the cumulative average (KIS 체결내역 semantics); the FillPoller
+    derives per-fill deltas against the DB. NOTE: the KIS adapters currently leave
+    fee/tax at 0 (the API rows don't carry them) — only the paper broker populates them."""
 
     exec_id: str
     broker_order_no: str

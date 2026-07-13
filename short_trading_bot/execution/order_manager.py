@@ -8,6 +8,7 @@ is written to the append-only ``audit_log``.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -15,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..domain.enums import OrderState, Side
+from ..domain.enums import OrderState, PositionState, Side
 from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
@@ -46,11 +47,17 @@ class OrderManager:
                     client_order_id=req.client_order_id,
                     state=existing.state,
                 )
+                accepted = existing.state in {
+                    OrderState.NEW.value,
+                    OrderState.PARTIALLY_FILLED.value,
+                    OrderState.FILLED.value,
+                }
                 return OrderAck(
                     client_order_id=req.client_order_id,
-                    accepted=existing.state != OrderState.REJECTED,
+                    accepted=accepted,
                     broker_order_no=existing.broker_order_no,
                     tr_id=existing.tr_id,
+                    reject_reason=None if accepted else f"existing_order_{existing.state.lower()}",
                 )
             s.add(
                 Order(
@@ -67,7 +74,17 @@ class OrderManager:
             s.add(self._audit("order.pending", req.lot_id, {"client_order_id": req.client_order_id}))
 
         # 2) Network call (outside the persist transaction).
-        ack = await self._broker.submit_order(req)
+        try:
+            ack = await self._broker.submit_order(req)
+        except Exception:
+            # A timeout does not mean the broker rejected the order. Preserve the
+            # ambiguity so callers cannot mistake a stranded PENDING_NEW row for success.
+            async with session_scope(self._sf) as s:
+                order = await self._find_order(s, req.client_order_id)
+                if order is not None:
+                    order.state = OrderState.UNKNOWN.value
+                    s.add(self._audit("order.unknown", req.lot_id, {"client_order_id": req.client_order_id}))
+            raise
 
         # 3) Record outcome. Guard against overwriting a fill that already arrived.
         async with session_scope(self._sf) as s:
@@ -164,10 +181,18 @@ class OrderManager:
                     pos.avg_entry_price * pos.qty_filled + fill.price * fill.qty
                 ) / new_qty
             pos.qty_filled = new_qty
+            # Only the WATCHING->HOLDING edge belongs here; richer states (SCALING,
+            # EXITING) are owned by the domain lot — stomping them to HOLDING would
+            # corrupt what hydrate() restores after a restart.
+            if pos.state == PositionState.WATCHING.value:
+                pos.state = PositionState.HOLDING.value
         else:  # SELL closes part/all of the long -> realize P&L on the held portion only
             realized_qty = min(fill.qty, pos.qty_filled) if pos.qty_filled > 0 else Decimal(0)
             pos.realized_pnl += (fill.price - pos.avg_entry_price) * realized_qty - fill.fee - fill.tax
             pos.qty_filled = max(Decimal(0), pos.qty_filled - fill.qty)
+            if pos.qty_filled == 0:
+                pos.state = PositionState.CLOSED.value
+                pos.closed_at = datetime.now(UTC)
             if fill.qty > realized_qty:  # over-sell => drift/double-fill; never fabricate PnL
                 self._log.warning(
                     "fill.oversell",
