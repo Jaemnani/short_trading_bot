@@ -80,22 +80,26 @@ def serve(
     """
     import asyncio
 
-    from ..domain.enums import Resolution
+    from ..domain.enums import Mode, Resolution
     from ..execution.broker.paper import PaperBrokerAdapter
     from ..infra.kis_auth import KisAuth
     from ..market.kis_ws_feed import KisWebSocketFeed
     from .engine import build_broker, build_trading_service, kis_rest_base, kis_ws_url
-    from .watchlist import load_trading_config
+    from .watchlist import load_scanner_config, load_trading_config
 
     s = _bootstrap()
     log = get_logger("serve")
     watchlist, limits = load_trading_config(config)
-    if not watchlist:
+    scanner_cfg = load_scanner_config(config)
+    if not watchlist and not scanner_cfg.enabled:
         typer.echo(f"watchlist empty — add entries to {config} (see watchlist.example.json).")
         raise typer.Exit(1)
 
     # 멀티 해상도: 한 WS 연결(틱)에서 필요한 모든 해상도의 봉을 동시에 집계한다.
-    resolutions = sorted({tmpl.resolution for tmpl in watchlist.values()}, key=lambda r: r.value)
+    wanted = {tmpl.resolution for tmpl in watchlist.values()}
+    if scanner_cfg.enabled:
+        wanted.add(scanner_cfg.template().resolution)  # 스캐너 합류분의 봉 집계용
+    resolutions = sorted(wanted, key=lambda r: r.value)
     tickers = sorted({key.split("@")[0] for key in watchlist})
 
     creds = s.active_kis()
@@ -106,9 +110,11 @@ def serve(
     from ..infra.notifier.factory import build_notifier
 
     broker = build_broker(s) if live_exec else PaperBrokerAdapter()
+    notifier = build_notifier(s)
     service = build_trading_service(
-        s, watchlist, limits=limits, broker=broker, notifier=build_notifier(s)
+        s, watchlist, limits=limits, broker=broker, notifier=notifier
     )
+    feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
     async def _poll_loop(poller: object) -> None:
         from ..execution.fill_poller import FillPoller
@@ -189,8 +195,141 @@ def serve(
             key.split("@")[0] for key, tmpl in watchlist.items() if tmpl.resolution is resolution
         })
 
+    # -- 장중 종목검색(스캐너): 급등+거래량 급증 종목 자동 합류 ---------------------
+
+    def _refresh_favorites() -> set[str]:
+        """며칠 일봉 스캔(거래량 상승 + 우상향) 후보군 — 완화 문턱으로 우선 합류.
+
+        FDR 다운로드가 느려서(수 분) executor 스레드에서 하루 1회 돈다."""
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        import FinanceDataReader as fdr
+
+        from ..market.scanner import scan_volume_leaders
+        from ..market.types import Bar
+
+        start = (datetime.now(UTC) - timedelta(days=120)).strftime("%Y-%m-%d")
+        candidates: dict[str, tuple[str, list[Bar]]] = {}
+        for market_name in ("KOSPI", "KOSDAQ"):
+            try:
+                listing = fdr.StockListing(market_name)
+            except Exception:
+                log.warning("scanner.listing_failed", market=market_name)
+                continue
+            if "Marcap" in listing.columns:
+                listing = listing.sort_values("Marcap", ascending=False)
+            for _, row in listing.head(scanner_cfg.daily_universe // 2).iterrows():
+                code, name = str(row["Code"]), str(row["Name"])
+                try:
+                    df = fdr.DataReader(code, start)
+                except Exception:
+                    continue
+                bars = []
+                for idx, r in df.iterrows():
+                    if r.isna().any() or r["Volume"] == 0:
+                        continue
+                    c = Decimal(str(r["Close"]))
+                    v = Decimal(str(int(r["Volume"])))
+                    bars.append(
+                        Bar(code, Resolution.D1,
+                            datetime(idx.year, idx.month, idx.day, tzinfo=UTC),
+                            Decimal(str(r["Open"])), Decimal(str(r["High"])),
+                            Decimal(str(r["Low"])), c, v, c * v)
+                    )
+                candidates[code] = (name, bars)
+        leaders = scan_volume_leaders(candidates, top=scanner_cfg.daily_candidates)
+        return {r.ticker for r in leaders}
+
+    async def _scan_loop(auth: KisAuth) -> None:
+        from datetime import date as _date
+        from datetime import datetime, timedelta, timezone
+
+        from ..market.kis_history import KisMinuteHistory, resample
+        from ..market.kis_ranking import KisVolumeRank
+        from ..market.scanner import MomentumPick, pick_momentum
+
+        kst = timezone(timedelta(hours=9))
+        scan_res = scanner_cfg.template().resolution
+        # 순위분석 API는 모의 도메인 미지원 가능 → 라이브 키가 있으면 라이브 도메인으로
+        # 시세만 조회한다 (주문과 무관, 안전).
+        if s.kis.live.configured and s.mode is not Mode.LIVE:
+            rank_creds = s.kis.live
+            rank_base = kis_rest_base(Mode.LIVE)
+            rank_auth = KisAuth(rank_creds, rank_base)
+        else:
+            rank_creds, rank_base, rank_auth = creds, kis_rest_base(s.mode), auth
+        ranking = KisVolumeRank(rank_auth, rank_creds, rank_base)
+        hist = KisMinuteHistory(auth, creds, kis_rest_base(s.mode))
+        favorites: set[str] = set()
+        fav_day: _date | None = None
+        joined_today: dict[_date, int] = {}
+
+        async def _join(pick: MomentumPick, today: _date) -> bool:
+            # 지표 워밍업: 오늘 1분봉을 캐시 없이 받아 스캔 해상도로 리샘플 후 프라임.
+            try:
+                one_min = await hist.fetch_day(pick.ticker, today, cache=False)
+            except Exception:
+                log.exception("scanner.backfill_failed", ticker=pick.ticker)
+                return False
+            service.prime(one_min if scan_res is Resolution.M1 else resample(one_min, scan_res))
+            if not service.add_template(f"{pick.ticker}@scan", scanner_cfg.template()):
+                return False
+            feed = feed_ref["feed"]
+            if feed is not None:
+                await feed.subscribe(pick.ticker)
+            elif pick.ticker not in tickers:
+                tickers.append(pick.ticker)
+            await notifier.notify(
+                "scanner.joined", ticker=pick.ticker, name=pick.name,
+                change_pct=f"{pick.change_pct:.1f}", vol_surge=f"{pick.vol_surge:.0f}",
+                favorite=str(pick.favorite),
+            )
+            log.info("scanner.joined", ticker=pick.ticker, name=pick.name,
+                     change_pct=pick.change_pct, favorite=pick.favorite)
+            return True
+
+        while True:
+            try:
+                now = datetime.now(kst)
+                minute = now.hour * 60 + now.minute
+                in_session = now.weekday() < 5 and (9 * 60 + 5) <= minute <= (14 * 60)
+                if in_session and not service.control.is_stopped:
+                    today = now.date()
+                    if scanner_cfg.daily_candidates and fav_day != today:
+                        fav_day = today
+                        try:
+                            favorites = await asyncio.get_running_loop().run_in_executor(
+                                None, _refresh_favorites
+                            )
+                            log.info("scanner.favorites", count=len(favorites))
+                        except Exception:
+                            log.exception("scanner.favorites_failed")
+                    capacity = scanner_cfg.max_active - joined_today.get(today, 0)
+                    # KIS WS 등록 한도(~41) 보호: 여유 없으면 이번 주기는 건너뜀.
+                    if capacity > 0 and len(tickers) < 40:
+                        picks = pick_momentum(
+                            await ranking.top(),
+                            min_change_pct=scanner_cfg.min_change_pct,
+                            min_vol_surge=scanner_cfg.min_vol_surge,
+                            min_value=scanner_cfg.min_value_traded,
+                            exclude=set(tickers),
+                            favorites=favorites,
+                            favorite_relax=scanner_cfg.favorite_relax,
+                            top=capacity,
+                        )
+                        for pick in picks:
+                            if await _join(pick, today):
+                                joined_today[today] = joined_today.get(today, 0) + 1
+            except Exception:
+                log.exception("scanner.error")
+            await asyncio.sleep(scanner_cfg.interval_seconds)
+
     async def _run() -> None:
         restored = await service.hydrate()
+        # 스캐너로 합류했던(워치리스트 밖) 열린 랏도 재시작 후 시세를 받아야 관리된다.
+        for extra in sorted(service.open_tickers() - set(tickers)):
+            tickers.append(extra)
         if live_exec:
             report = await service.reconcile()
             if not report.in_sync:
@@ -220,6 +359,7 @@ def serve(
         poll_task = (
             asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
         )
+        scan_task = asyncio.create_task(_scan_loop(auth)) if scanner_cfg.enabled else None
         from ..market.bar_builder import BarBuilder
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
@@ -232,6 +372,7 @@ def serve(
                     approval, tickers, resolutions[0], ws_url=kis_ws_url(s.mode),
                     bar_builders=shared_builders, flush_on_close=False,
                 )
+                feed_ref["feed"] = feed  # 스캐너가 현재 연결에 동적 구독할 수 있도록
                 try:
                     await service.run(feed)
                 except Exception:
@@ -246,6 +387,8 @@ def serve(
         finally:
             if poll_task is not None:
                 poll_task.cancel()
+            if scan_task is not None:
+                scan_task.cancel()
 
     asyncio.run(_run())
 

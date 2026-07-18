@@ -1,14 +1,20 @@
-"""거래량 상승 종목 스캐너 — watchlist 후보 발굴.
+"""거래량 상승 종목 스캐너 — watchlist 후보 발굴 + 장중 모멘텀 픽.
 
-거래량이 늘고 있는(최근 5일 평균 vs 이전 20일 평균) + 우상향 구조(종가>MA20>MA60)의
-종목을 점수화한다. 순수 함수(Bar 리스트 입력)라 데이터 소스와 무관하게 테스트 가능;
-CLI(`trader scan`)가 FinanceDataReader로 데이터를 채워 호출한다.
+일봉 파트: 거래량이 늘고 있는(최근 5일 평균 vs 이전 20일 평균) + 우상향 구조
+(종가>MA20>MA60)의 종목을 점수화한다. 순수 함수(Bar 리스트 입력)라 데이터 소스와
+무관하게 테스트 가능; CLI(`trader scan`)가 FinanceDataReader로 데이터를 채워 호출한다.
+
+장중 파트(``pick_momentum``): KIS 거래량순위(RankRow)에서 급등 + 거래량 급증 +
+유동성 조건을 통과한 종목을 고른다 — 실시간 스캐너의 필터 코어(순수 함수).
+며칠짜리 일봉 스캔을 통과한 '후보군(favorites)'은 완화된 문턱을 적용해 우선 합류.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
+from .kis_ranking import RankRow
 from .types import Bar
 
 _RECENT = 5  # 최근 거래량 창
@@ -76,3 +82,51 @@ def scan_volume_leaders(
         results.append(r)
     results.sort(key=lambda r: r.vol_ratio, reverse=True)
     return results[:top]
+
+
+@dataclass(slots=True)
+class MomentumPick:
+    ticker: str
+    name: str
+    change_pct: float
+    vol_surge: float
+    value_traded: float
+    favorite: bool  # 일봉 후보군 출신 (완화 문턱으로 통과)
+
+
+def pick_momentum(
+    rows: Iterable[RankRow],
+    *,
+    min_change_pct: float = 3.0,  # 등락률 하한 (%)
+    min_vol_surge: float = 150.0,  # 거래량증가율 하한 (%, 전일 대비)
+    min_value: float = 5_000_000_000,  # 누적 거래대금 하한 (원)
+    exclude: Collection[str] = (),
+    favorites: Collection[str] = (),
+    favorite_relax: float = 0.7,  # 후보군은 문턱 x0.7
+    top: int = 3,
+) -> list[MomentumPick]:
+    """상승세 + 거래량 급증(인기) 종목을 고른다. favorites 우선, 이후 거래량증가율순."""
+    picks: list[MomentumPick] = []
+    for row in rows:
+        if not row.ticker or row.ticker in exclude:
+            continue
+        fav = row.ticker in favorites
+        relax = favorite_relax if fav else 1.0
+        if row.change_pct < min_change_pct * relax:
+            continue
+        if row.vol_surge < min_vol_surge * relax:
+            continue
+        if row.value_traded < min_value * relax:
+            continue
+        picks.append(
+            MomentumPick(
+                ticker=row.ticker,
+                name=row.name,
+                change_pct=row.change_pct,
+                vol_surge=row.vol_surge,
+                value_traded=row.value_traded,
+                favorite=fav,
+            )
+        )
+    picks.sort(key=lambda p: (not p.favorite, -p.vol_surge))
+    return picks[:top]

@@ -22,8 +22,40 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from ..risk.limits import RiskLimits
 from ..strategy.templates import StrategyTemplate
+
+
+class ScannerConfig(BaseModel):
+    """장중 종목검색(스캐너) 설정 — config JSON의 선택적 ``scanner`` 섹션.
+
+    거래량순위 API를 ``interval_seconds`` 주기로 폴링해 급등+거래량 급증 종목을
+    자동 합류시킨다. ``favorites``(며칠 일봉 스캔 후보군)는 완화된 문턱 적용.
+    """
+
+    enabled: bool = False
+    interval_seconds: float = Field(default=300.0, ge=30.0)  # 장중 스캔 주기
+    max_active: int = Field(default=3, ge=1, le=10)  # 하루 스캐너 합류 종목 상한
+    min_change_pct: float = 3.0  # 등락률 하한 (%)
+    min_vol_surge: float = 150.0  # 거래량증가율 하한 (%)
+    min_value_traded: float = 5_000_000_000  # 누적 거래대금 하한 (원)
+    favorite_relax: float = Field(default=0.7, gt=0, le=1.0)  # 후보군 문턱 완화 배율
+    daily_candidates: int = Field(default=20, ge=0)  # 일봉 스캔 후보군 크기 (0=끔)
+    daily_universe: int = Field(default=200, ge=10)  # 일봉 스캔 대상 시총 상위 N
+    resolution: str = "5m"
+    risk_per_trade: float = Field(default=0.005, gt=0, le=1.0)
+    strategy_id: str = "momo_intraday_v1"
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
+
+    def template(self) -> StrategyTemplate:
+        return StrategyTemplate(
+            strategy_id=self.strategy_id,
+            resolution=self.resolution,  # type: ignore[arg-type]
+            risk_per_trade=self.risk_per_trade,
+            strategy_params=self.strategy_params,
+        )
 
 
 def _dec(value: Any) -> Decimal | None:
@@ -45,3 +77,9 @@ def load_trading_config(path: str | Path) -> tuple[dict[str, StrategyTemplate], 
         max_drawdown_pct=lim.get("max_drawdown_pct"),  # 총 낙폭 브레이크 (예: 0.15)
     )
     return watchlist, limits
+
+
+def load_scanner_config(path: str | Path) -> ScannerConfig:
+    """``scanner`` 섹션 파싱 (없으면 disabled 기본값)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return ScannerConfig(**data.get("scanner", {}))

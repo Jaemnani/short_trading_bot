@@ -57,10 +57,13 @@ class KisMinuteHistory:
         self._timeout = timeout
         self._log = get_logger("kis_history")
 
-    async def fetch_day(self, ticker: str, day: date) -> list[Bar]:
-        """해당 일자의 1분봉 전체 (오름차순). 캐시 우선; 미거래일은 빈 리스트."""
+    async def fetch_day(self, ticker: str, day: date, *, cache: bool = True) -> list[Bar]:
+        """해당 일자의 1분봉 전체 (오름차순). 캐시 우선; 미거래일은 빈 리스트.
+
+        ``cache=False``는 진행 중인 '오늘'을 조회할 때 필수 — 부분 하루를 캐시에
+        쓰면 이후 조회가 영원히 그 시점까지만 보게 된다."""
         cache_file = self._cache / ticker / f"{day:%Y%m%d}.json"
-        if cache_file.exists():
+        if cache and cache_file.exists():
             return self._from_cache(ticker, day, cache_file)
 
         day_str = f"{day:%Y%m%d}"
@@ -91,7 +94,7 @@ class KisMinuteHistory:
             await asyncio.sleep(self._delay)
 
         bars = self.parse_rows(ticker, day, list(rows_by_time.values()))
-        if ok:  # 성공 응답만 캐시 (미거래일 = 빈 리스트도 캐시해 재조회 방지)
+        if ok and cache:  # 성공 응답만 캐시 (미거래일 = 빈 리스트도 캐시해 재조회 방지)
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps(
                 [{"t": r["stck_cntg_hour"], "o": r["stck_oprc"], "h": r["stck_hgpr"],

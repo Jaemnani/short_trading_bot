@@ -212,6 +212,29 @@ class TradingService:
             self._last_price[bar.ticker] = bar.close
         return len(bars)
 
+    def add_template(self, key: str, template: StrategyTemplate) -> bool:
+        """장중 스캐너의 동적 종목 합류: 워치리스트에 템플릿을 추가한다.
+
+        다음 해당-해상도 봉이 오면 process()가 자동으로 랏을 스폰한다. 같은
+        (종목, 해상도)가 이미 있으면 False (중복 운용 방지). WS 구독과 지표
+        워밍업(prime)은 호출자 몫.
+        """
+        ticker = key.split("@")[0]
+        for existing in self._by_ticker.get(ticker, []):
+            if existing.resolution is template.resolution:
+                return False
+        self._watchlist[key] = template
+        self._by_ticker.setdefault(ticker, []).append(template)
+        self._log.info(
+            "watchlist.joined", ticker=ticker, resolution=template.resolution.value,
+            strategy=template.strategy_id,
+        )
+        return True
+
+    def open_tickers(self) -> set[str]:
+        """현재 열린(청산 안 된) 랏들의 티커 — 재시작 시 WS 구독 목록에 포함해야 한다."""
+        return {lot.ticker for lot in self._lots.values() if lot.is_open}
+
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
         return FillPoller(self._broker, self._sf, self._on_fill)

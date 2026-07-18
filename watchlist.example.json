@@ -6,6 +6,20 @@
     "max_order_notional": "5000000",
     "max_ticker_exposure": "10000000"
   },
+  "scanner": {
+    "enabled": false,
+    "interval_seconds": 300,
+    "max_active": 3,
+    "min_change_pct": 3.0,
+    "min_vol_surge": 150.0,
+    "min_value_traded": 5000000000,
+    "daily_candidates": 20,
+    "daily_universe": 200,
+    "resolution": "5m",
+    "risk_per_trade": 0.005,
+    "strategy_id": "momo_intraday_v1",
+    "strategy_params": { "min_rvol": 2.0, "entry_cutoff": "14:00" }
+  },
   "watchlist": {
     "005930": {
       "strategy_id": "pullback_daily_v1",

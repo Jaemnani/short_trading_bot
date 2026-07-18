@@ -53,25 +53,40 @@ class KisWebSocketFeed:
         self._builders = bar_builders or [bar_builder or BarBuilder(resolution)]
         self._flush_on_close = flush_on_close
         self._session_date = session_date
+        self._ws: Any = None  # live connection while streaming (dynamic subscribe)
+
+    async def subscribe(self, ticker: str) -> bool:
+        """스트리밍 중 동적 구독 (장중 스캐너 합류). 티커 리스트를 공유하면 재접속
+        시에도 유지된다. 이미 구독 중이면 False."""
+        if ticker in self._tickers:
+            return False
+        self._tickers.append(ticker)
+        if self._ws is not None:
+            await self._ws.send(self._subscribe_frame(ticker))
+        return True
 
     async def stream(self) -> AsyncIterator[Bar]:
         base_date = self._session_date or datetime.now(KST).date()
-        async with self._connect() as ws:
-            for ticker in self._tickers:
-                await ws.send(self._subscribe_frame(ticker))
-            async for raw in ws:
-                if raw and raw[0] == "{":  # JSON control frame
-                    if "PINGPONG" in raw:
-                        await ws.send(raw)  # echo heartbeat
-                    continue
-                for tick in self.parse_ticks(raw, base_date, tr_id=self._tr_id):
+        try:
+            async with self._connect() as ws:
+                self._ws = ws
+                for ticker in list(self._tickers):
+                    await ws.send(self._subscribe_frame(ticker))
+                async for raw in ws:
+                    if raw and raw[0] == "{":  # JSON control frame
+                        if "PINGPONG" in raw:
+                            await ws.send(raw)  # echo heartbeat
+                        continue
+                    for tick in self.parse_ticks(raw, base_date, tr_id=self._tr_id):
+                        for builder in self._builders:
+                            for bar in builder.on_tick(tick):
+                                yield bar
+                if self._flush_on_close:  # 공유 빌더는 flush 금지 (부분 봉 조기 방출 방지)
                     for builder in self._builders:
-                        for bar in builder.on_tick(tick):
+                        for bar in builder.flush():
                             yield bar
-            if self._flush_on_close:  # 공유 빌더는 flush 금지 (부분 봉 조기 방출 방지)
-                for builder in self._builders:
-                    for bar in builder.flush():
-                        yield bar
+        finally:
+            self._ws = None
 
     @staticmethod
     def parse_ticks(raw: str, base_date: Any, *, tr_id: str = _TR_TRADE) -> list[Tick]:
