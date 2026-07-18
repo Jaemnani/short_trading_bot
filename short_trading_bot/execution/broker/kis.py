@@ -22,7 +22,14 @@ from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
 from ..fees import KRX_FEES, FeeModel
-from ..types import AccountBalance, BalancePosition, Execution, OrderAck, OrderRequest
+from ..types import (
+    AccountBalance,
+    BalancePosition,
+    Execution,
+    OrderAck,
+    OrderRecord,
+    OrderRequest,
+)
 from .base import BrokerAdapter
 from .market_router import MarketRouter
 
@@ -127,6 +134,28 @@ class KisBrokerAdapter(BrokerAdapter):
         return []  # 미체결조회 (inquire-psbl-rvsecncl) wired with the live feed in deployment
 
     async def get_executions(self) -> list[Execution]:
+        resp = await self._daily_ccld("01")  # 01 = 체결만
+        return self._parse_executions(resp)
+
+    async def get_daily_orders(self) -> list[OrderRecord]:
+        resp = await self._daily_ccld("00")  # 00 = 전체 (체결 + 미체결)
+        out: list[OrderRecord] = []
+        for row in resp.get("output1", []):
+            odno = str(row.get("odno", ""))
+            if not odno:
+                continue
+            side = Side.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else Side.BUY
+            out.append(
+                OrderRecord(
+                    broker_order_no=odno,
+                    ticker=str(row.get("pdno", "")),
+                    side=side,
+                    qty=Decimal(str(row.get("ord_qty", "0") or "0")),
+                )
+            )
+        return out
+
+    async def _daily_ccld(self, ccld_dvsn: str) -> dict[str, Any]:
         tr_id = ("V" + _CCLD_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CCLD_TR_LIVE
         headers = await self._headers(tr_id)
         today = datetime.now(UTC).strftime("%Y%m%d")
@@ -138,7 +167,7 @@ class KisBrokerAdapter(BrokerAdapter):
             "SLL_BUY_DVSN_CD": "00",
             "INQR_DVSN": "00",
             "PDNO": "",
-            "CCLD_DVSN": "01",  # 01 = 체결
+            "CCLD_DVSN": ccld_dvsn,
             "ORD_GNO_BRNO": "",
             "ODNO": "",
             "INQR_DVSN_3": "00",
@@ -146,8 +175,7 @@ class KisBrokerAdapter(BrokerAdapter):
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
-        resp = await self._transport("GET", f"{self._base}{_CCLD_PATH}", headers, params)
-        return self._parse_executions(resp)
+        return await self._transport("GET", f"{self._base}{_CCLD_PATH}", headers, params)
 
     def _parse_executions(self, resp: dict[str, Any]) -> list[Execution]:
         out: list[Execution] = []

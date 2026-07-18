@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRequest
+from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRecord, OrderRequest
 
 
 class BrokerAdapter(ABC):
@@ -37,4 +37,10 @@ class BrokerAdapter(ABC):
     async def get_executions(self) -> list[Execution]:
         """Authoritative executed-trade records (체결내역). Default empty; live adapters
         override. The FillPoller polls this and dedups by exec_id — ground-truth fills."""
+        return []
+
+    async def get_daily_orders(self) -> list[OrderRecord]:
+        """Today's broker-side orders, filled or not (주문내역). Default empty; live
+        adapters override. The UnknownOrderResolver matches these against UNKNOWN local
+        orders to recover a lost broker_order_no after a submit timeout."""
         return []

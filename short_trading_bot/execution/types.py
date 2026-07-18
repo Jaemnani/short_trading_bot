@@ -62,6 +62,18 @@ class Fill:
 
 
 @dataclass(slots=True)
+class OrderRecord:
+    """A broker-side order row from 일별주문체결조회 (체결·미체결 전체) — used by the
+    UnknownOrderResolver to backtrack orders whose submit ack timed out. ``qty`` is the
+    ORDERED quantity (not filled)."""
+
+    broker_order_no: str
+    ticker: str
+    side: Side
+    qty: Decimal
+
+
+@dataclass(slots=True)
 class Execution:
     """An authoritative executed-trade record from the broker (체결내역) — ground truth
     for fills, including exact fee/tax. ``qty``, ``fee`` and ``tax`` are CUMULATIVE per

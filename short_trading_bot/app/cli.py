@@ -114,7 +114,13 @@ def serve(
         from ..execution.fill_poller import FillPoller
 
         assert isinstance(poller, FillPoller)
+        # UNKNOWN 주문 복구는 같은 주기로 동행 — UNKNOWN 이 없으면 API 호출 없이 즉시 반환.
+        resolver = service.make_unknown_resolver()
         while True:
+            try:
+                await resolver.poll_once()
+            except Exception:
+                log.exception("unknown_resolve.error")
             try:
                 await poller.poll_once()
             except Exception:

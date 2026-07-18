@@ -34,6 +34,7 @@ from ..execution.fx import FxRates
 from ..execution.order_manager import OrderManager
 from ..execution.reconciler import Reconciler, ReconcileReport
 from ..execution.types import Fill, OrderRequest
+from ..execution.unknown_resolver import UnknownOrderResolver
 from ..infra.logging import get_logger
 from ..infra.notifier.base import InMemoryNotifier, Notifier
 from ..market.feed import Feed
@@ -210,6 +211,10 @@ class TradingService:
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
         return FillPoller(self._broker, self._sf, self._on_fill)
+
+    def make_unknown_resolver(self) -> UnknownOrderResolver:
+        """Recovers submit-timeout UNKNOWN orders via the broker 일별주문내역."""
+        return UnknownOrderResolver(self._broker, self._sf)
 
     async def reconcile(self) -> ReconcileReport:
         """Reconcile local open-position qty against the broker 잔고 (broker = source of truth)."""
