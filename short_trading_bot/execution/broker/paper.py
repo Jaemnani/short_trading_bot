@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from ...domain.enums import Currency, Market, Side
@@ -124,11 +124,17 @@ class PaperBrokerAdapter(BrokerAdapter):
         chunks = max(1, self.config.max_fill_chunks)
         if chunks == 1:
             return [qty]
+        # 정수 수량 주문(KRX 등)은 청크도 정수여야 한다: 소수점 체결은 실제 시장에
+        # 존재하지 않고, 반올림 잔여가 oversell 경고/수량 드리프트를 만든다.
+        even = qty / Decimal(chunks)
+        if qty == qty.to_integral_value():
+            even = even.to_integral_value(rounding=ROUND_DOWN)
         out: list[Decimal] = []
         remaining = qty
         for i in range(chunks):
-            q = remaining if i == chunks - 1 else qty / Decimal(chunks)
-            out.append(q)
+            q = remaining if i == chunks - 1 else even
+            if q > 0:
+                out.append(q)
             remaining -= q
         return out
 

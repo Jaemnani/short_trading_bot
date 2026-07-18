@@ -72,6 +72,20 @@ async def test_partial_fills() -> None:
     assert sum((f.qty for f in fills), Decimal(0)) == Decimal("10")
 
 
+async def test_partial_fill_chunks_are_integral_for_integral_qty() -> None:
+    """정수 수량 주문은 청크도 정수여야 한다 (41668/3 = 13889.33…주 금지)."""
+    fills: list[Fill] = []
+    b = _broker(PaperConfig(max_fill_chunks=3, enforce_funds=False), fills)
+    b.set_price("005930", "70000")
+    await b.submit_order(_req(Side.BUY, "41668"))
+    assert [f.qty for f in fills] == [Decimal("13889"), Decimal("13889"), Decimal("13890")]
+
+    # 청크 수보다 작은 주문은 0-수량 청크 없이 한 번에 체결
+    fills.clear()
+    await b.submit_order(_req(Side.SELL, "2"))
+    assert [f.qty for f in fills] == [Decimal("2")]
+
+
 async def test_insufficient_funds_rejected() -> None:
     fills: list[Fill] = []
     b = _broker(PaperConfig(initial_cash=Decimal("1000")), fills)
