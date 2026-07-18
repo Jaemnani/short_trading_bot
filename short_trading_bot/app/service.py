@@ -119,6 +119,7 @@ class TradingService:
         self._fx_rates = fx_rates or FxRates()
         self._fx_warned: set[Currency] = set()
         self._runtime_synced: dict[str, tuple[str, str, int, str]] = {}  # 마지막 영속 스냅샷
+        self._one_shot: set[tuple[str, str]] = set()  # (ticker, resolution) — 랏 종료 후 재스폰 금지
         self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
         self._daily_date: object | None = None
         self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
@@ -212,12 +213,13 @@ class TradingService:
             self._last_price[bar.ticker] = bar.close
         return len(bars)
 
-    def add_template(self, key: str, template: StrategyTemplate) -> bool:
+    def add_template(self, key: str, template: StrategyTemplate, *, one_shot: bool = False) -> bool:
         """장중 스캐너의 동적 종목 합류: 워치리스트에 템플릿을 추가한다.
 
         다음 해당-해상도 봉이 오면 process()가 자동으로 랏을 스폰한다. 같은
         (종목, 해상도)가 이미 있으면 False (중복 운용 방지). WS 구독과 지표
-        워밍업(prime)은 호출자 몫.
+        워밍업(prime)은 호출자 몫. ``one_shot=True``면 랏이 한 번 종료된 뒤
+        재스폰하지 않고 템플릿을 제거한다 (급등주 재진입 churn 방지).
         """
         ticker = key.split("@")[0]
         for existing in self._by_ticker.get(ticker, []):
@@ -225,11 +227,23 @@ class TradingService:
                 return False
         self._watchlist[key] = template
         self._by_ticker.setdefault(ticker, []).append(template)
+        if one_shot:
+            self._one_shot.add((ticker, template.resolution.value))
         self._log.info(
             "watchlist.joined", ticker=ticker, resolution=template.resolution.value,
-            strategy=template.strategy_id,
+            strategy=template.strategy_id, one_shot=one_shot,
         )
         return True
+
+    def _remove_template(self, ticker: str, template: StrategyTemplate) -> None:
+        templates = self._by_ticker.get(ticker, [])
+        if template in templates:
+            templates.remove(template)
+        for key, tmpl in list(self._watchlist.items()):
+            if key.split("@")[0] == ticker and tmpl is template:
+                del self._watchlist[key]
+        self._one_shot.discard((ticker, template.resolution.value))
+        self._log.info("watchlist.retired", ticker=ticker, resolution=template.resolution.value)
 
     def open_tickers(self) -> set[str]:
         """현재 열린(청산 안 된) 랏들의 티커 — 재시작 시 WS 구독 목록에 포함해야 한다."""
@@ -275,6 +289,15 @@ class TradingService:
             (t for t in self._by_ticker.get(ticker, []) if t.resolution is bar.resolution), None
         )
         lot = self._lots.get(pkey)
+        if (
+            template is not None
+            and lot is not None
+            and lot.is_terminal
+            and (ticker, template.resolution.value) in self._one_shot
+        ):
+            # 스캐너 합류분은 1회전 후 종료: 재스폰이 잔손실 반복(churn)을 만들었다.
+            self._remove_template(ticker, template)
+            template = None
         if template is not None and (lot is None or lot.is_terminal):
             lot = await self._spawn(ticker, template)
         if lot is None:  # 워치리스트 밖 + 복원 lot도 없음

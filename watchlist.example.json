@@ -11,14 +11,17 @@
     "interval_seconds": 300,
     "max_active": 3,
     "min_change_pct": 3.0,
+    "max_change_pct": 15.0,
     "min_vol_surge": 150.0,
     "min_value_traded": 5000000000,
+    "rejoin": false,
+    "record_rankings": true,
     "daily_candidates": 20,
     "daily_universe": 200,
     "resolution": "5m",
     "risk_per_trade": 0.005,
     "strategy_id": "momo_intraday_v1",
-    "strategy_params": { "min_rvol": 2.0, "entry_cutoff": "14:00" }
+    "strategy_params": { "min_rvol": 2.0, "entry_cutoff": "14:00", "vwap_exit_buffer_pct": 0.005 }
   },
   "watchlist": {
     "005930": {

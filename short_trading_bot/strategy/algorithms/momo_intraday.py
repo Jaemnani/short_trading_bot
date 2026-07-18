@@ -51,6 +51,9 @@ class MomoParams(BaseModel):
     min_rvol: float = Field(default=2.0, ge=0)  # 합류 시점에도 거래가 살아있어야 함
     use_vwap_filter: bool = True
     exit_below_vwap: bool = True  # 보유 중 종가<VWAP → 모멘텀 소멸로 청산
+    # VWAP 이탈 판정 버퍼: close < vwap*(1-buffer)여야 청산. 0 = 즉시.
+    # 급등주는 VWAP 주변 출렁임이 커서 버퍼 없이는 조기 청산이 반복된다 (7/13주 시뮬).
+    vwap_exit_buffer_pct: float = Field(default=0.0, ge=0, le=0.05)
     atr_stop_mult: float = Field(default=1.5, gt=0)
     max_entries_per_day: int = Field(default=1, ge=1)
     news_block: float = -0.3
@@ -169,7 +172,11 @@ class MomoIntraday(Strategy):
 
         # 3) 모멘텀 소멸: VWAP 아래로 마감하면 급등 논리가 깨진 것 — 미련 없이 이탈.
         vwap = ctx.ind("vwap")
-        if p.exit_below_vwap and vwap is not None and close < vwap:
+        if (
+            p.exit_below_vwap
+            and vwap is not None
+            and close < vwap * (1 - p.vwap_exit_buffer_pct)
+        ):
             return [Intent(IntentKind.EXIT, Side.SELL, reason="vwap_lost")]
 
         # 4) Chandelier trailing stop (lot-level stop config).

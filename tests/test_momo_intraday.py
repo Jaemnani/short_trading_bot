@@ -126,3 +126,18 @@ def test_registered_in_registry() -> None:
 
     strat = create_strategy("momo_intraday_v1", {"min_rvol": 2.5})
     assert isinstance(strat, MomoIntraday)
+
+
+def test_vwap_exit_buffer_suppresses_shallow_dip() -> None:
+    """버퍼 설정 시 VWAP를 살짝 밑돈 정도로는 청산하지 않는다."""
+    strat = MomoIntraday(MomoParams(vwap_exit_buffer_pct=0.01))
+    held = dict(qty=10, avg=10000, stop=9700, peak=10050, original=10)
+    out = strat.evaluate(
+        _ctx(PositionState.HOLDING, 9900, 11, 0, **held, rvol=3.0, vwap=9950.0, atr_14=200.0)
+    )
+    assert out[0].kind is IntentKind.HOLD  # 9900 > 9950*0.99=9850.5 → 유지
+
+    out = strat.evaluate(
+        _ctx(PositionState.HOLDING, 9800, 11, 0, **held, rvol=3.0, vwap=9950.0, atr_14=200.0)
+    )
+    assert out[0].kind is IntentKind.EXIT and out[0].reason == "vwap_lost"  # 버퍼 초과 이탈

@@ -100,3 +100,11 @@ def test_pick_momentum_excludes_active_and_relaxes_favorites() -> None:
     assert [p.ticker for p in picks] == ["F", "A"] and picks[0].favorite
 
     assert [p.ticker for p in pick_momentum(rows, exclude={"A"}, favorites={"F"})] == ["F"]
+
+
+def test_pick_momentum_max_change_filters_overheated() -> None:
+    from short_trading_bot.market.scanner import pick_momentum
+
+    rows = [_rank("A", change=5.0, surge=500.0), _rank("HOT", change=29.9, surge=900.0)]
+    assert [p.ticker for p in pick_momentum(rows, max_change_pct=15.0)] == ["A"]
+    assert len(pick_momentum(rows, max_change_pct=None)) == 2  # 무제한이면 포함

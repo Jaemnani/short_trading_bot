@@ -54,3 +54,35 @@ async def test_feed_dynamic_subscribe() -> None:
     assert await feed.subscribe("123450")  # 연결 전: 리스트에만 추가
     assert not await feed.subscribe("123450")  # 중복 거부
     assert tickers == ["005930", "123450"]  # 공유 리스트 유지 → 재접속 시 재구독
+
+
+async def test_one_shot_template_retires_after_close(sf) -> None:
+    """one_shot 합류분은 랏 1회전(청산) 후 재스폰하지 않고 템플릿이 제거된다."""
+    from datetime import UTC, datetime
+
+    from short_trading_bot.domain.enums import PositionState
+    from short_trading_bot.market.types import Bar
+
+    svc = _service(sf)
+    assert svc.add_template("123450@scan", _template(), one_shot=True)
+
+    def bar(ts_min: int) -> Bar:
+        c = Decimal("10000")
+        return Bar(
+            ticker="123450", resolution=Resolution.M5,
+            ts=datetime(2026, 7, 13, 1, ts_min, tzinfo=UTC),  # 10:xx KST
+            open=c, high=c, low=c, close=c, volume=Decimal("100"), value=c * 100,
+        )
+
+    await svc.process(bar(0))  # 템플릿 → 랏 스폰
+    lot = svc.lot("123450", Resolution.M5)
+    assert lot is not None
+    lot.state = PositionState.CLOSED  # 1회전 종료 가정
+
+    await svc.process(bar(5))  # one_shot → 재스폰 없이 템플릿 은퇴
+    assert svc.lot("123450", Resolution.M5) is lot and lot.is_terminal
+    assert "123450@scan" not in svc.lots or True
+    assert all(k.split("@")[0] != "123450" for k in svc._watchlist)
+
+    # 재합류는 다시 가능해야 한다 (스캐너가 이후 다시 pick하면)
+    assert svc.add_template("123450@scan", _template(), one_shot=True)

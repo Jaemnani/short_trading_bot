@@ -39,8 +39,11 @@ class ScannerConfig(BaseModel):
     interval_seconds: float = Field(default=300.0, ge=30.0)  # 장중 스캔 주기
     max_active: int = Field(default=3, ge=1, le=10)  # 하루 스캐너 합류 종목 상한
     min_change_pct: float = 3.0  # 등락률 하한 (%)
+    max_change_pct: float | None = 15.0  # 등락률 상한 (%) — 과열 추격 방지, null=무제한
     min_vol_surge: float = 150.0  # 거래량증가율 하한 (%)
     min_value_traded: float = 5_000_000_000  # 누적 거래대금 하한 (원)
+    rejoin: bool = False  # False = 랏 1회전 후 그 종목 재진입 금지 (churn 방지)
+    record_rankings: bool = True  # 순위 응답을 data/rankings/에 저장 (사후 검증용)
     favorite_relax: float = Field(default=0.7, gt=0, le=1.0)  # 후보군 문턱 완화 배율
     daily_candidates: int = Field(default=20, ge=0)  # 일봉 스캔 후보군 크기 (0=끔)
     daily_universe: int = Field(default=200, ge=10)  # 일봉 스캔 대상 시총 상위 N
@@ -83,3 +86,10 @@ def load_scanner_config(path: str | Path) -> ScannerConfig:
     """``scanner`` 섹션 파싱 (없으면 disabled 기본값)."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return ScannerConfig(**data.get("scanner", {}))
+
+
+def load_paper_cash(path: str | Path) -> Decimal | None:
+    """시뮬레이션 실행(기본 serve)의 페이퍼 자본금 — 실제 모의투자 계좌 잔고와
+    맞춰야 사이징·포워드 결과가 실계좌와 일치한다. 없으면 브로커 기본값(1억)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return _dec(data.get("paper_cash"))

@@ -98,6 +98,7 @@ def pick_momentum(
     rows: Iterable[RankRow],
     *,
     min_change_pct: float = 3.0,  # 등락률 하한 (%)
+    max_change_pct: float | None = 15.0,  # 등락률 상한 (%) — 과열 추격 방지, None=무제한
     min_vol_surge: float = 150.0,  # 거래량증가율 하한 (%, 전일 대비)
     min_value: float = 5_000_000_000,  # 누적 거래대금 하한 (원)
     exclude: Collection[str] = (),
@@ -105,7 +106,10 @@ def pick_momentum(
     favorite_relax: float = 0.7,  # 후보군은 문턱 x0.7
     top: int = 3,
 ) -> list[MomentumPick]:
-    """상승세 + 거래량 급증(인기) 종목을 고른다. favorites 우선, 이후 거래량증가율순."""
+    """상승세 + 거래량 급증(인기) 종목을 고른다. favorites 우선, 이후 거래량증가율순.
+
+    ``max_change_pct``: 이미 너무 오른 종목(상한가 추격 등)은 되돌림 리스크가 커서
+    걸러낸다 — 7/13주 시뮬레이션에서 +25~30% 합류 건들이 전부 손실이었다."""
     picks: list[MomentumPick] = []
     for row in rows:
         if not row.ticker or row.ticker in exclude:
@@ -113,6 +117,8 @@ def pick_momentum(
         fav = row.ticker in favorites
         relax = favorite_relax if fav else 1.0
         if row.change_pct < min_change_pct * relax:
+            continue
+        if max_change_pct is not None and row.change_pct > max_change_pct:
             continue
         if row.vol_surge < min_vol_surge * relax:
             continue

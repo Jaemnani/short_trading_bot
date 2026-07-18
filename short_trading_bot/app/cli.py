@@ -7,6 +7,7 @@ orchestrator (feed/indicator/strategy/order/reconciler) lands in later phases.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import typer
 
@@ -85,12 +86,13 @@ def serve(
     from ..infra.kis_auth import KisAuth
     from ..market.kis_ws_feed import KisWebSocketFeed
     from .engine import build_broker, build_trading_service, kis_rest_base, kis_ws_url
-    from .watchlist import load_scanner_config, load_trading_config
+    from .watchlist import load_paper_cash, load_scanner_config, load_trading_config
 
     s = _bootstrap()
     log = get_logger("serve")
     watchlist, limits = load_trading_config(config)
     scanner_cfg = load_scanner_config(config)
+    paper_cash = load_paper_cash(config)
     if not watchlist and not scanner_cfg.enabled:
         typer.echo(f"watchlist empty — add entries to {config} (see watchlist.example.json).")
         raise typer.Exit(1)
@@ -109,7 +111,14 @@ def serve(
 
     from ..infra.notifier.factory import build_notifier
 
-    broker = build_broker(s) if live_exec else PaperBrokerAdapter()
+    if live_exec:
+        broker = build_broker(s)
+    else:
+        from ..execution.broker.paper import PaperConfig
+
+        broker = PaperBrokerAdapter(
+            PaperConfig(initial_cash=paper_cash) if paper_cash else PaperConfig()
+        )
     notifier = build_notifier(s)
     service = build_trading_service(
         s, watchlist, limits=limits, broker=broker, notifier=notifier
@@ -241,6 +250,20 @@ def serve(
         leaders = scan_volume_leaders(candidates, top=scanner_cfg.daily_candidates)
         return {r.ticker for r in leaders}
 
+    def _record_rankings(now: object, rows: list[Any]) -> None:
+        """순위 스냅샷을 JSONL로 축적 — 실데이터 기반 사후 검증/재시뮬레이션의 원천."""
+        import dataclasses
+        import json as _json
+        from pathlib import Path
+
+        out = Path("data/rankings") / f"{now:%Y%m%d}.jsonl"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(
+                {"ts": f"{now:%H:%M:%S}", "rows": [dataclasses.asdict(r) for r in rows]},
+                ensure_ascii=False,
+            ) + "\n")
+
     async def _scan_loop(auth: KisAuth) -> None:
         from datetime import date as _date
         from datetime import datetime, timedelta, timezone
@@ -273,7 +296,9 @@ def serve(
                 log.exception("scanner.backfill_failed", ticker=pick.ticker)
                 return False
             service.prime(one_min if scan_res is Resolution.M1 else resample(one_min, scan_res))
-            if not service.add_template(f"{pick.ticker}@scan", scanner_cfg.template()):
+            if not service.add_template(
+                f"{pick.ticker}@scan", scanner_cfg.template(), one_shot=not scanner_cfg.rejoin
+            ):
                 return False
             feed = feed_ref["feed"]
             if feed is not None:
@@ -308,9 +333,13 @@ def serve(
                     capacity = scanner_cfg.max_active - joined_today.get(today, 0)
                     # KIS WS 등록 한도(~41) 보호: 여유 없으면 이번 주기는 건너뜀.
                     if capacity > 0 and len(tickers) < 40:
+                        rows = await ranking.top()
+                        if scanner_cfg.record_rankings and rows:
+                            _record_rankings(now, rows)  # 사후 검증/재시뮬레이션용 스냅샷
                         picks = pick_momentum(
-                            await ranking.top(),
+                            rows,
                             min_change_pct=scanner_cfg.min_change_pct,
+                            max_change_pct=scanner_cfg.max_change_pct,
                             min_vol_surge=scanner_cfg.min_vol_surge,
                             min_value=scanner_cfg.min_value_traded,
                             exclude=set(tickers),
