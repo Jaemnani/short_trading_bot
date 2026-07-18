@@ -118,6 +118,7 @@ class TradingService:
         self._pending: dict[tuple[str, Side], str] = {}  # in-flight order per (lot, side)
         self._fx_rates = fx_rates or FxRates()
         self._fx_warned: set[Currency] = set()
+        self._runtime_synced: dict[str, tuple[str, str, int, str]] = {}  # 마지막 영속 스냅샷
         self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
         self._daily_date: object | None = None
         self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
@@ -147,10 +148,10 @@ class TradingService:
     async def hydrate(self) -> int:
         """Rebuild in-memory lots from the DB Position projection (restart recovery).
 
-        Restores qty/avg/realized/state. Runtime stop state (initial_stop, peak_price,
-        tp_rungs_taken) is not yet persisted on the projection, so a hydrated lot manages
-        on indicator/trailing exits until those columns are added; reconcile against the
-        broker before resuming trading.
+        Restores qty/avg/realized/state plus the runtime stop state (initial_stop,
+        peak_price, tp_rungs_taken, original_qty) that ``_sync_runtime`` persists, so a
+        restarted lot keeps its stop ladder; reconcile against the broker before
+        resuming trading.
         """
         open_states = [
             PositionState.HOLDING.value,
@@ -179,8 +180,11 @@ class TradingService:
                 qty=row.qty_filled,
                 avg_entry=row.avg_entry_price,
                 realized_pnl=row.realized_pnl,
-                peak_price=row.avg_entry_price,
-                original_qty=row.qty_filled,  # best effort: TP fractions base on current qty
+                initial_stop=row.initial_stop if row.initial_stop > 0 else None,
+                peak_price=row.peak_price if row.peak_price > 0 else row.avg_entry_price,
+                tp_rungs_taken=row.tp_rungs_taken,
+                # 구버전 행(컬럼 default 0)은 현재 보유량으로 폴백.
+                original_qty=row.original_qty if row.original_qty > 0 else row.qty_filled,
             )
             restored += 1
         # Restore duplicate-order locks for orders that may still be live at the broker.
@@ -262,6 +266,7 @@ class TradingService:
         for intent in lot.evaluate(snap, equity, prev=self._prev.get(pkey), news_ewma=news):
             if intent.is_actionable:
                 await self._handle_intent(intent, lot, bar, snapshot)
+        await self._sync_runtime(lot)
         self._prev[pkey] = snap
 
     # -- intent handling -------------------------------------------------
@@ -406,6 +411,7 @@ class TradingService:
             before = lot.realized_pnl
             lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
             self._daily_realized += lot.realized_pnl - before  # 당일 한도 계산용 (비용 포함)
+            await self._sync_runtime(lot)  # 진입 체결로 확정된 initial_stop/original_qty 즉시 영속
             meta.filled_qty += fill.qty
             if meta.filled_qty >= meta.requested_qty:
                 if self._pending.get((lot.lot_id, side)) == fill.client_order_id:
@@ -433,6 +439,26 @@ class TradingService:
                 )
             )
         return lot
+
+    async def _sync_runtime(self, lot: PositionLot) -> None:
+        """Persist the lot's runtime stop state so hydrate() can restore it after a restart."""
+        snapshot = (
+            str(lot.initial_stop),
+            str(lot.peak_price),
+            lot.tp_rungs_taken,
+            str(lot.original_qty),
+        )
+        if self._runtime_synced.get(lot.lot_id) == snapshot:
+            return
+        async with session_scope(self._sf) as session:
+            row = await session.get(Position, lot.lot_id)
+            if row is None:
+                return
+            row.initial_stop = lot.initial_stop if lot.initial_stop is not None else Decimal(0)
+            row.peak_price = lot.peak_price
+            row.tp_rungs_taken = lot.tp_rungs_taken
+            row.original_qty = lot.original_qty
+        self._runtime_synced[lot.lot_id] = snapshot
 
     def _cap_entry_qty(
         self, qty: Decimal, lot: PositionLot, price: Decimal, fx_rate: Decimal

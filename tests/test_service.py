@@ -125,6 +125,22 @@ async def test_service_hydrate_from_db(sf) -> None:
     assert lot.qty == Decimal("10") and lot.avg_entry == Decimal("70000")
 
 
+async def test_runtime_stop_state_survives_restart(sf) -> None:
+    """TP 사다리·초기 손절·피크가 DB에 영속되고 재시작(hydrate) 시 복원되어야 한다."""
+    svc, _broker, _ = _service(sf)
+    await svc.run(ReplayFeed(_uptrend()))
+    lot = svc.lot(TICKER)
+    assert lot.is_open and lot.tp_rungs_taken >= 1  # 상승장이라 TP1은 밟았을 것
+
+    svc2, _broker2, _ = _service(sf)
+    assert await svc2.hydrate() == 1
+    restored = svc2.lot(TICKER)
+    assert restored.tp_rungs_taken == lot.tp_rungs_taken
+    assert restored.initial_stop == lot.initial_stop
+    assert restored.peak_price == lot.peak_price
+    assert restored.original_qty == lot.original_qty
+
+
 async def test_daily_realized_resets_on_new_day(sf) -> None:
     svc, _broker, _ = _service(sf)
     day1 = _bar(100.0, datetime(2026, 1, 5, 10, 0, tzinfo=UTC))

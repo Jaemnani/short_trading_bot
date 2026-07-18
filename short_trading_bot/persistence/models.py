@@ -56,6 +56,13 @@ class Position(Base):
     realized_pnl: Mapped[Decimal] = mapped_column(_Money, default=Decimal(0))
     unrealized_pnl: Mapped[Decimal] = mapped_column(_Money, default=Decimal(0))
 
+    # 런타임 스톱 상태 — 재시작 시 hydrate()가 복원한다. 없으면 복원된 랏이
+    # 초기 손절/트레일링/TP 사다리 진행 상황을 잃고 지표 기반으로만 관리된다.
+    initial_stop: Mapped[Decimal] = mapped_column(_Money, default=Decimal(0))
+    peak_price: Mapped[Decimal] = mapped_column(_Money, default=Decimal(0))
+    tp_rungs_taken: Mapped[int] = mapped_column(Integer, default=0)
+    original_qty: Mapped[Decimal] = mapped_column(_Money, default=Decimal(0))
+
     parent_signal_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     campaign_id: Mapped[str | None] = mapped_column(
         ForeignKey("campaigns.campaign_id"), nullable=True, index=True
