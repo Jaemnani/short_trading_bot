@@ -278,6 +278,24 @@ class TradingService:
             # still go out (RiskManager always allows them, so the notional is unused).
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason="missing_fx_rate")
             return
+        if intent.kind in _ENTRY_KINDS:
+            # 전략 사이징(risk_per_trade)이 max_order_notional을 넘으면 관망 대신 한도에
+            # 맞춰 수량을 축소 진입한다 — 하드 블록이면 한도 < 사이징인 조합은 영원히
+            # 매매가 없어 포워드 테스트가 공전한다.
+            capped = self._cap_entry_qty(qty, lot, bar.close, fx_rate)
+            if capped < qty:
+                if intent.kind is IntentKind.ENTER:
+                    lot.rebase_entry_qty(capped)  # TP 분할 기준도 실제 주문 수량으로
+                await self._notifier.notify(
+                    "intent.qty_capped",
+                    ticker=lot.ticker,
+                    requested=str(qty),
+                    capped=str(capped),
+                    reason="max_order_notional",
+                )
+            qty = capped
+            if qty <= 0:
+                return
         decision = self._risk.check(
             intent_kind=intent.kind,
             ticker=lot.ticker,
@@ -410,6 +428,20 @@ class TradingService:
                 )
             )
         return lot
+
+    def _cap_entry_qty(
+        self, qty: Decimal, lot: PositionLot, price: Decimal, fx_rate: Decimal
+    ) -> Decimal:
+        """Shrink an ENTER/ADD qty so its notional fits max_order_notional (0 if unfit)."""
+        cap = self._risk.limits.max_order_notional
+        if cap is None or price <= 0 or fx_rate <= 0:
+            return qty
+        if price * qty * fx_rate <= cap:
+            return qty
+        capped = cap / (price * fx_rate)
+        if not lot.market.is_overseas:
+            capped = capped.to_integral_value(rounding=ROUND_DOWN)
+        return max(capped, Decimal(0))
 
     def _fx_rate_checked(self, currency: Currency) -> Decimal:
         """KRW rate for valuation; a missing rate is warned once and valued at 0.

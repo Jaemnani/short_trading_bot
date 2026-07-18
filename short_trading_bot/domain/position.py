@@ -151,6 +151,12 @@ class PositionLot:
     def record_tp_rung(self) -> None:
         self.tp_rungs_taken += 1
 
+    def rebase_entry_qty(self, qty: Decimal) -> None:
+        """진입 수량이 리스크 캡으로 축소됐을 때 호출: TP 분할(fraction) 기준을
+        전략이 의도한 수량이 아니라 실제 주문 수량으로 재설정한다. 이걸 빼먹으면
+        원래 의도 수량 기준 fraction이 실제 보유량을 초과해 첫 TP에서 전량 매도된다."""
+        self._pending_original_qty = qty
+
     # -- fills -----------------------------------------------------------
 
     def apply_fill(

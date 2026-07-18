@@ -25,6 +25,10 @@ class RiskManager:
     def control(self) -> ControlSwitch:
         return self._control
 
+    @property
+    def limits(self) -> RiskLimits:
+        return self._limits
+
     def check(
         self,
         *,

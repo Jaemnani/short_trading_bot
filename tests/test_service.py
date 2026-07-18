@@ -82,6 +82,30 @@ async def test_service_pause_blocks_entry(sf) -> None:
     assert any(n.event == "intent.blocked" and n.fields.get("reason") == "paused" for n in notifier.sent)
 
 
+async def test_entry_qty_capped_to_max_order_notional(sf) -> None:
+    """사이징이 한도를 넘으면 관망(블록)이 아니라 한도에 맞춰 축소 진입해야 한다."""
+    cap = Decimal("500000")
+    broker = PaperBrokerAdapter(PaperConfig(initial_cash=Decimal("100000000")))
+    notifier = InMemoryNotifier()
+    svc = TradingService(
+        broker, sf, RiskManager(RiskLimits(max_order_notional=cap)), _watchlist(),
+        notifier=notifier,
+    )
+    await svc.run(ReplayFeed(_uptrend()))
+
+    lot = svc.lot(TICKER)
+    assert lot.is_open and lot.qty > 0  # 캡 적용으로 진입 자체는 성사
+    assert any(n.event == "intent.qty_capped" for n in notifier.sent)
+    assert not any(
+        n.event == "intent.blocked" and n.fields.get("reason") == "order_notional"
+        for n in notifier.sent
+    )
+    async with session_scope(sf) as s:
+        buys = (await s.execute(select(Order).where(Order.side == "BUY"))).scalars().all()
+    assert buys and all(o.qty * o.price <= cap for o in buys)
+    assert all(o.qty == o.qty.to_integral_value() for o in buys)  # KRX 정수 수량
+
+
 async def test_service_hydrate_from_db(sf) -> None:
     params = PositionParams(strategy_id="trend_long_v1")
     async with session_scope(sf) as s:
