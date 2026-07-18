@@ -21,6 +21,7 @@ import httpx
 from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
+from ..fees import KRX_FEES, FeeModel
 from ..types import AccountBalance, BalancePosition, Execution, OrderAck, OrderRequest
 from .base import BrokerAdapter
 from .market_router import MarketRouter
@@ -45,6 +46,7 @@ class KisBrokerAdapter(BrokerAdapter):
         *,
         transport: Transport | None = None,
         timeout: float = 10.0,
+        fees: FeeModel | None = None,
     ) -> None:
         self._auth = auth
         self._creds = creds
@@ -53,6 +55,7 @@ class KisBrokerAdapter(BrokerAdapter):
         self._router = router or MarketRouter()
         self._transport = transport or self._default_transport
         self._timeout = timeout
+        self._fees = fees or KRX_FEES
 
     @property
     def name(self) -> str:
@@ -146,14 +149,17 @@ class KisBrokerAdapter(BrokerAdapter):
         resp = await self._transport("GET", f"{self._base}{_CCLD_PATH}", headers, params)
         return self._parse_executions(resp)
 
-    @staticmethod
-    def _parse_executions(resp: dict[str, Any]) -> list[Execution]:
+    def _parse_executions(self, resp: dict[str, Any]) -> list[Execution]:
         out: list[Execution] = []
         for row in resp.get("output1", []):
             qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
             if qty == 0:
                 continue
             side = Side.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else Side.BUY
+            price = Decimal(str(row.get("avg_prvs", "0") or "0"))
+            # 응답에 수수료·제세금 필드가 없어 요율로 추정한다 (누적 체결금액 기준이라
+            # FillPoller의 누적-델타 회계와 그대로 맞물린다).
+            notional = qty * price
             out.append(
                 Execution(
                     exec_id=str(row.get("odno", "")) + ":" + str(row.get("tot_ccld_qty", "")),
@@ -161,7 +167,9 @@ class KisBrokerAdapter(BrokerAdapter):
                     ticker=str(row.get("pdno", "")),
                     side=side,
                     qty=qty,
-                    price=Decimal(str(row.get("avg_prvs", "0") or "0")),
+                    price=price,
+                    fee=self._fees.fee(notional),
+                    tax=self._fees.tax(side, notional),
                     currency=Currency.KRW,
                 )
             )

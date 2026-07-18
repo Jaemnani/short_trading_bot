@@ -78,6 +78,26 @@ async def test_domestic_balance_parse() -> None:
     assert bal.cash[Currency.KRW] == Decimal("5000000")
 
 
+async def test_domestic_executions_estimate_fee_and_tax() -> None:
+    """체결내역 응답엔 수수료·제세금 필드가 없으므로 요율 추정치가 채워져야 한다."""
+    transport = FakeTransport(
+        {
+            "output1": [
+                {"odno": "1", "pdno": "005930", "sll_buy_dvsn_cd": "02",
+                 "tot_ccld_qty": "10", "avg_prvs": "70000"},
+                {"odno": "2", "pdno": "005930", "sll_buy_dvsn_cd": "01",
+                 "tot_ccld_qty": "10", "avg_prvs": "71000"},
+            ]
+        }
+    )
+    buy, sell = await _adapter(transport).get_executions()
+    notional_buy, notional_sell = Decimal("700000"), Decimal("710000")
+    assert buy.fee == notional_buy * Decimal("1.5") / 10000
+    assert buy.tax == 0  # 매수엔 거래세 없음
+    assert sell.fee == notional_sell * Decimal("1.5") / 10000
+    assert sell.tax == notional_sell * Decimal("20") / 10000  # 매도 거래세 0.20%
+
+
 async def test_domestic_cancel_builds_rvsecncl() -> None:
     transport = FakeTransport({"rt_cd": "0", "msg1": "ok"})
     ack = await _adapter(transport).cancel_order(_buy(), "0000999")

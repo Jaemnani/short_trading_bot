@@ -21,6 +21,7 @@ import httpx
 from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.kis_auth import KisAuth
+from ..fees import OVERSEAS_FEES, FeeModel
 from ..types import AccountBalance, BalancePosition, Execution, OrderAck, OrderRequest
 from .base import BrokerAdapter
 from .market_router import MarketRouter
@@ -47,6 +48,7 @@ class KisOverseasAdapter(BrokerAdapter):
         default_market: Market = Market.NASD,
         transport: Transport | None = None,
         timeout: float = 10.0,
+        fees: FeeModel | None = None,
     ) -> None:
         self._auth = auth
         self._creds = creds
@@ -56,6 +58,7 @@ class KisOverseasAdapter(BrokerAdapter):
         self._default_market = default_market
         self._transport = transport or self._default_transport
         self._timeout = timeout
+        self._fees = fees or OVERSEAS_FEES
 
     @property
     def name(self) -> str:
@@ -153,6 +156,9 @@ class KisOverseasAdapter(BrokerAdapter):
             if qty == 0:
                 continue
             side = Side.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else Side.BUY
+            price = Decimal(str(row.get("ft_ccld_unpr3", "0") or "0"))
+            # 응답에 수수료 필드가 없어 요율로 추정 (누적 기준 — FillPoller 델타 회계와 정합).
+            notional = qty * price
             out.append(
                 Execution(
                     exec_id=str(row.get("odno", "")) + ":" + str(row.get("ft_ccld_qty", "")),
@@ -160,7 +166,9 @@ class KisOverseasAdapter(BrokerAdapter):
                     ticker=str(row.get("ovrs_pdno", "")),
                     side=side,
                     qty=qty,
-                    price=Decimal(str(row.get("ft_ccld_unpr3", "0") or "0")),
+                    price=price,
+                    fee=self._fees.fee(notional),
+                    tax=self._fees.tax(side, notional),
                     currency=self._default_market.currency,
                 )
             )
