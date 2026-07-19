@@ -86,3 +86,12 @@ async def test_one_shot_template_retires_after_close(sf) -> None:
 
     # 재합류는 다시 가능해야 한다 (스캐너가 이후 다시 pick하면)
     assert svc.add_template("123450@scan", _template(), one_shot=True)
+
+
+async def test_scanner_config_chandelier_passthrough(tmp_path) -> None:
+    import json as _json
+
+    p = tmp_path / "wl.json"
+    p.write_text(_json.dumps({"scanner": {"enabled": True, "chandelier_mult": 2.0}}))
+    tmpl = load_scanner_config(p).template()
+    assert tmpl.stop.chandelier_mult == 2.0

@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..domain.params import StopConfig
 from ..risk.limits import RiskLimits
 from ..strategy.templates import StrategyTemplate
 
@@ -49,6 +50,7 @@ class ScannerConfig(BaseModel):
     daily_universe: int = Field(default=200, ge=10)  # 일봉 스캔 대상 시총 상위 N
     resolution: str = "5m"
     risk_per_trade: float = Field(default=0.005, gt=0, le=1.0)
+    chandelier_mult: float = Field(default=3.0, gt=0)  # 트레일링 스톱 배수 (lot-level)
     strategy_id: str = "momo_intraday_v1"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -57,6 +59,7 @@ class ScannerConfig(BaseModel):
             strategy_id=self.strategy_id,
             resolution=self.resolution,  # type: ignore[arg-type]
             risk_per_trade=self.risk_per_trade,
+            stop=StopConfig(chandelier_mult=self.chandelier_mult),
             strategy_params=self.strategy_params,
         )
 
