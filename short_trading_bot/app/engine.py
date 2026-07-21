@@ -66,6 +66,7 @@ def build_trading_service(
     news_provider: Any = None,
     broker: BrokerAdapter | None = None,
     fx_rates: FxRates | None = None,
+    regime: Any = None,
 ) -> TradingService:
     broker = broker or build_broker(settings)
     engine = create_engine(settings.db_url)
@@ -78,6 +79,7 @@ def build_trading_service(
         notifier=notifier,
         news_provider=news_provider,
         fx_rates=fx_rates,
+        regime=regime,
     )
 
 

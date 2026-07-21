@@ -7,6 +7,7 @@ orchestrator (feed/indicator/strategy/order/reconciler) lands in later phases.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from typing import Any
 
 import typer
@@ -120,8 +121,18 @@ def serve(
             PaperConfig(initial_cash=paper_cash) if paper_cash else PaperConfig()
         )
     notifier = build_notifier(s)
+
+    # 시장 레짐 필터: regime_filter가 켜진 템플릿/스캐너가 하나라도 있으면 활성.
+    from ..market.regime import MarketRegime
+
+    regime: MarketRegime | None = None
+    if scanner_cfg.regime_filter or any(t.regime_filter for t in watchlist.values()):
+        regime = MarketRegime()
+        if regime.proxy_ticker not in tickers:
+            tickers.append(regime.proxy_ticker)  # 프록시 시세는 항상 구독
+
     service = build_trading_service(
-        s, watchlist, limits=limits, broker=broker, notifier=notifier
+        s, watchlist, limits=limits, broker=broker, notifier=notifier, regime=regime
     )
     feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
@@ -338,6 +349,12 @@ def serve(
                         except Exception:
                             log.exception("scanner.favorites_failed")
                     capacity = scanner_cfg.max_active - joined_today.get(today, 0)
+                    if (
+                        scanner_cfg.regime_filter
+                        and regime is not None
+                        and not regime.entries_allowed
+                    ):
+                        capacity = 0  # 시장 레짐 나쁨 → 이번 주기 합류 없음 (기존 랏 관리는 계속)
                     # KIS WS 등록 한도(~41) 보호: 여유 없으면 이번 주기는 건너뜀.
                     if capacity > 0 and len(tickers) < 40:
                         rows = await ranking.top()
@@ -360,6 +377,40 @@ def serve(
             except Exception:
                 log.exception("scanner.error")
             await asyncio.sleep(scanner_cfg.interval_seconds)
+
+    def _regime_refresh() -> tuple[bool, Decimal | None]:
+        """전일 코스피 종가 vs 20일선 + 프록시 ETF 전일 종가 (FDR, executor에서 실행)."""
+        import FinanceDataReader as fdr
+
+        kospi = fdr.DataReader("KS11").dropna().tail(40)
+        closes = [float(c) for c in kospi["Close"]]
+        ok = len(closes) >= 20 and closes[-1] > sum(closes[-20:]) / 20
+        proxy = fdr.DataReader(regime.proxy_ticker).dropna().tail(3) if regime else None
+        prev_close = (
+            Decimal(str(float(proxy["Close"].iloc[-1]))) if proxy is not None and len(proxy) else None
+        )
+        return ok, prev_close
+
+    async def _regime_loop() -> None:
+        """하루 한 번(및 시작 시) 일 단위 레짐 갱신. 실패 시 이전 상태 유지."""
+        from datetime import date as _date
+        from datetime import datetime, timedelta, timezone
+
+        kst = timezone(timedelta(hours=9))
+        last: _date | None = None
+        while True:
+            today = datetime.now(kst).date()
+            if today != last:
+                try:
+                    ok, prev_close = await asyncio.get_running_loop().run_in_executor(
+                        None, _regime_refresh
+                    )
+                    regime.set_daily(ok, proxy_prev_close=prev_close)  # type: ignore[union-attr]
+                    last = today
+                    log.info("regime.refreshed", daily_ok=ok)
+                except Exception:
+                    log.exception("regime.refresh_failed")
+            await asyncio.sleep(600)
 
     async def _run() -> None:
         restored = await service.hydrate()
@@ -396,6 +447,7 @@ def serve(
             asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
         )
         scan_task = asyncio.create_task(_scan_loop(auth)) if scanner_cfg.enabled else None
+        regime_task = asyncio.create_task(_regime_loop()) if regime is not None else None
         from ..market.bar_builder import BarBuilder
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
@@ -425,6 +477,8 @@ def serve(
                 poll_task.cancel()
             if scan_task is not None:
                 scan_task.cancel()
+            if regime_task is not None:
+                regime_task.cancel()
 
     asyncio.run(_run())
 

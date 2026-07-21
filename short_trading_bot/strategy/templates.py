@@ -26,4 +26,7 @@ class StrategyTemplate(BaseModel):
         ]
     )
     max_hold_bars: int | None = None
+    # 시장 레짐 필터 적용 여부: True면 시장 상태가 나쁠 때(MarketRegime) 신규 진입 차단.
+    # 자체 레짐 게이트가 있는 전략(눌림목)은 False 유지 — 기존 검증 동작 불변.
+    regime_filter: bool = False
     strategy_params: dict[str, Any] = Field(default_factory=dict)

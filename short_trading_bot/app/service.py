@@ -39,6 +39,7 @@ from ..infra.logging import get_logger
 from ..infra.notifier.base import InMemoryNotifier, Notifier
 from ..market.feed import Feed
 from ..market.indicators import IndicatorEngine
+from ..market.regime import MarketRegime
 from ..market.types import Bar, IndicatorSnapshot
 from ..persistence.db import session_scope
 from ..persistence.models import Order, Position
@@ -89,6 +90,7 @@ class TradingService:
         news_ewma: float | None = None,
         news_provider: Callable[[str], float | None] | None = None,
         fx_rates: FxRates | None = None,
+        regime: MarketRegime | None = None,
     ) -> None:
         self._broker = broker
         self._sf = session_factory
@@ -123,6 +125,12 @@ class TradingService:
         self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
         self._daily_date: object | None = None
         self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
+        self._regime = regime  # 시장 레짐 필터 (None = 미사용)
+        self._regime_gated: set[tuple[str, str]] = {
+            (key.split("@")[0], t.resolution.value)
+            for key, t in watchlist.items()
+            if t.regime_filter
+        }
 
         # Override OrderManager's fill handler with a composed one (persist + lot sync).
         broker.fill_handler = self._on_fill
@@ -229,6 +237,8 @@ class TradingService:
         self._by_ticker.setdefault(ticker, []).append(template)
         if one_shot:
             self._one_shot.add((ticker, template.resolution.value))
+        if template.regime_filter:
+            self._regime_gated.add((ticker, template.resolution.value))
         self._log.info(
             "watchlist.joined", ticker=ticker, resolution=template.resolution.value,
             strategy=template.strategy_id, one_shot=one_shot,
@@ -267,6 +277,8 @@ class TradingService:
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close
+        if self._regime is not None and bar.ticker == self._regime.proxy_ticker:
+            self._regime.on_proxy_bar(bar.ts.date(), bar.close)
         bar_day = bar.ts.date()
         if self._daily_date != bar_day:  # 새 거래일: 일일 실현손익 리셋
             self._daily_date = bar_day
@@ -335,6 +347,16 @@ class TradingService:
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason="missing_fx_rate")
             return
         if intent.kind in _ENTRY_KINDS:
+            # 시장 레짐 필터: 시장 날씨가 나쁜 날은 신규 진입 금지 (청산은 무관).
+            if (
+                self._regime is not None
+                and (lot.ticker, lot.params.resolution.value) in self._regime_gated
+                and not self._regime.entries_allowed
+            ):
+                await self._notifier.notify(
+                    "intent.blocked", ticker=lot.ticker, reason="market_regime"
+                )
+                return
             # 전략 사이징(risk_per_trade)이 max_order_notional을 넘으면 관망 대신 한도에
             # 맞춰 수량을 축소 진입한다 — 하드 블록이면 한도 < 사이징인 조합은 영원히
             # 매매가 없어 포워드 테스트가 공전한다.

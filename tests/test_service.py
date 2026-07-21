@@ -172,3 +172,31 @@ async def test_service_kill_switch_flattens(sf) -> None:
     assert svc.lot(TICKER).state is PositionState.CLOSED
     bal = await broker.get_balance()
     assert all(p.qty == 0 for p in bal.positions)
+
+
+async def test_regime_filter_blocks_gated_entry(sf) -> None:
+    """레짐 나쁨 + regime_filter=True 템플릿 → 신규 진입 차단 (market_regime)."""
+    from short_trading_bot.market.regime import MarketRegime
+
+    broker = PaperBrokerAdapter(PaperConfig(initial_cash=Decimal("100000000")))
+    notifier = InMemoryNotifier()
+    watchlist = _watchlist()
+    watchlist[TICKER] = watchlist[TICKER].model_copy(update={"regime_filter": True})
+    regime = MarketRegime()
+    regime.set_daily(False)  # 전일 코스피 20일선 아래
+    svc = TradingService(
+        broker, sf, RiskManager(RiskLimits()), watchlist, notifier=notifier, regime=regime
+    )
+    await svc.run(ReplayFeed(_uptrend()))
+
+    assert svc.lot(TICKER).state is PositionState.WATCHING  # 진입 없음
+    assert any(
+        n.event == "intent.blocked" and n.fields.get("reason") == "market_regime"
+        for n in notifier.sent
+    )
+
+    # regime_filter=False(기본값)면 같은 조건에서도 정상 진입 — 기존 동작 불변.
+    svc2, _broker2, _ = _service(sf)
+    svc2._regime = regime  # 필터 미지정 템플릿은 게이트 대상 아님
+    await svc2.run(ReplayFeed(_uptrend()))
+    assert svc2.lot(TICKER).is_open
