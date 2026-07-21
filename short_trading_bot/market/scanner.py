@@ -85,6 +85,61 @@ def scan_volume_leaders(
 
 
 @dataclass(slots=True)
+class UniversePick:
+    """눌림목 모델 적합 종목 — 25종목 검증에서 확인된 판별 기준으로 선별."""
+
+    ticker: str
+    name: str
+    close: float
+    atr_pct: float  # ATR(14)/종가 — 변동성 (0.05 초과 = 수직 급등주, 부적합)
+    avg_value: float  # 최근 20일 평균 거래대금
+    ret_6m: float  # 최근 ~6개월(120봉) 수익률 — 랭킹 기준
+
+
+def select_pullback_universe(
+    candidates: dict[str, tuple[str, list[Bar]]],
+    *,
+    min_value: float = 5_000_000_000,  # 유동성 하한 (20일 평균 거래대금)
+    max_atr_pct: float = 0.05,  # 변동성 상한 (두산에너빌 -27% 사례 차단)
+    top: int = 5,
+) -> list[UniversePick]:
+    """눌림목(pullback_daily_v1)에 맞는 종목 선별 — 진짜 장기 상승추세만.
+
+    기준(25종목 검증 근거): 종가 > MA120(장기 추세) + 종가 > MA60, MA20 > MA60
+    (정배열) + ATR% ≤ 상한 + 유동성. 랭킹은 6개월 수익률(추세 강도) 내림차순.
+    """
+    picks: list[UniversePick] = []
+    for ticker, (name, bars) in candidates.items():
+        if len(bars) < 130:
+            continue
+        closes = [float(b.close) for b in bars]
+        close = closes[-1]
+        ma20 = sum(closes[-20:]) / 20
+        ma60 = sum(closes[-60:]) / 60
+        ma120 = sum(closes[-120:]) / 120
+        if not (close > ma60 and ma20 > ma60 and close > ma120):
+            continue
+        trs = [
+            max(float(b.high) - float(b.low),
+                abs(float(b.high) - closes[i - 1]),
+                abs(float(b.low) - closes[i - 1]))
+            for i, b in enumerate(bars[-15:], start=len(bars) - 15)
+        ]
+        atr_pct = (sum(trs) / len(trs)) / close if close > 0 else 1.0
+        if atr_pct > max_atr_pct:
+            continue
+        avg_value = sum(float(b.value) for b in bars[-20:]) / 20
+        if avg_value < min_value:
+            continue
+        picks.append(UniversePick(
+            ticker=ticker, name=name, close=close, atr_pct=round(atr_pct, 4),
+            avg_value=avg_value, ret_6m=close / closes[-120] - 1.0,
+        ))
+    picks.sort(key=lambda p: p.ret_6m, reverse=True)
+    return picks[:top]
+
+
+@dataclass(slots=True)
 class MomentumPick:
     ticker: str
     name: str

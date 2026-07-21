@@ -557,6 +557,95 @@ def scan(
         )
 
 
+@app.command("select-universe")
+def select_universe(
+    top: int = 5,
+    universe: int = 200,
+    write_json: bool = False,
+) -> None:
+    """눌림목 모델 적합 종목 자동 발굴 — 장기 상승추세 + 저변동 + 유동성.
+
+    25종목 검증 기준(종가>MA120·정배열·ATR%≤5%·거래대금≥50억)으로 시총 상위
+    ``universe``개를 걸러 6개월 수익률 상위 ``top``개를 추천한다.
+    ``--write-json``이면 watchlist entries JSON을 출력 (가드 켠 상태).
+    """
+    import json as _json
+    import warnings
+    from datetime import UTC, datetime, timedelta
+
+    warnings.filterwarnings("ignore")
+    try:
+        import FinanceDataReader as fdr
+        import yfinance as yf
+    except ImportError:
+        typer.echo("FinanceDataReader + yfinance가 필요합니다 (.venv/bin/pip install ...)")
+        raise typer.Exit(1) from None
+
+    from ..domain.enums import Resolution
+    from ..market.scanner import select_pullback_universe
+    from ..market.types import Bar
+
+    _bootstrap()
+    listing = fdr.StockListing("KRX")
+    suffix = {"KOSPI": ".KS"}
+    rows = []
+    for _, r in listing.iterrows():
+        m = str(r.get("Market", ""))
+        if m == "KOSPI" or m.startswith("KOSDAQ"):
+            rows.append((str(r["Code"]), str(r["Name"]), suffix.get(m, ".KQ")))
+    if "Marcap" in listing.columns:
+        pass  # StockListing('KRX')는 이미 시총 정렬
+    rows = rows[:universe]
+
+    start = (datetime.now(UTC) - timedelta(days=260)).strftime("%Y-%m-%d")
+    candidates: dict[str, tuple[str, list[Bar]]] = {}
+    batch = 300
+    for i in range(0, len(rows), batch):
+        chunk = rows[i : i + batch]
+        df = yf.download([c + s for c, _, s in chunk], start=start, interval="1d",
+                         group_by="ticker", progress=False, threads=True)
+        for code, name, suf in chunk:
+            try:
+                sub = df[code + suf].dropna(subset=["Close"])
+            except Exception:
+                continue
+            sub = sub[sub["Volume"] > 0]
+            bars = []
+            for idx, r in sub.iterrows():
+                c = Decimal(str(round(float(r["Close"]), 2)))
+                v = Decimal(str(int(r["Volume"])))
+                bars.append(Bar(ticker=code, resolution=Resolution.D1,
+                                ts=datetime(idx.year, idx.month, idx.day, tzinfo=UTC),
+                                open=Decimal(str(round(float(r["Open"]), 2))),
+                                high=Decimal(str(round(float(r["High"]), 2))),
+                                low=Decimal(str(round(float(r["Low"]), 2))),
+                                close=c, volume=v, value=c * v))
+            candidates[code] = (name, bars)
+
+    picks = select_pullback_universe(candidates, top=top)
+    if not picks:
+        typer.echo("적합 종목 없음 (장기 상승추세 + 저변동 + 유동성 기준)")
+        return
+    typer.echo(f"{'코드':<8}{'종목':<14}{'6개월수익':>10}{'ATR%':>7}{'거래대금(억)':>12}")
+    for p in picks:
+        typer.echo(f"{p.ticker:<8}{p.name:<14}{p.ret_6m:>+9.1%}{p.atr_pct:>6.1%}"
+                   f"{p.avg_value / 1e8:>11.0f}")
+    if write_json:
+        entries = {
+            f"{p.ticker}@1D": {
+                "strategy_id": "pullback_daily_v1", "market": "KRX", "resolution": "1D",
+                "risk_per_trade": 0.02,
+                "strategy_params": {
+                    "rsi_min": 35, "rsi_max": 65, "touch_band_pct": 0.02,
+                    "bull_risk_mult": 2.0, "max_adds": 1,
+                    "require_above_sma120": True, "max_atr_pct": 0.05,
+                },
+            }
+            for p in picks
+        }
+        typer.echo(_json.dumps(entries, ensure_ascii=False, indent=2))
+
+
 @app.command()
 def preflight() -> None:
     """Go-live readiness checks (run before flipping STB_MODE=LIVE)."""

@@ -108,3 +108,29 @@ def test_pick_momentum_max_change_filters_overheated() -> None:
     rows = [_rank("A", change=5.0, surge=500.0), _rank("HOT", change=29.9, surge=900.0)]
     assert [p.ticker for p in pick_momentum(rows, max_change_pct=15.0)] == ["A"]
     assert len(pick_momentum(rows, max_change_pct=None)) == 2  # 무제한이면 포함
+
+
+def test_select_pullback_universe_filters_and_ranks() -> None:
+    """장기 상승추세 + 저변동 + 유동성 통과 종목만, 6개월 수익률순."""
+    from short_trading_bot.market.scanner import select_pullback_universe
+
+    def mk(daily_gain: float, vol_range: float = 0.01, volume: float = 1e6) -> list[Bar]:
+        out, price = [], 10000.0
+        for i in range(140):
+            price *= 1 + daily_gain
+            c, v = Decimal(str(round(price, 2))), Decimal(str(volume))
+            out.append(Bar(ticker="T", resolution=Resolution.D1, ts=BASE + timedelta(days=i),
+                           open=c, high=c * Decimal(str(1 + vol_range)),
+                           low=c * Decimal(str(1 - vol_range)), close=c,
+                           volume=v, value=c * v))
+        return out
+
+    cands = {
+        "UP": ("꾸준상승", mk(0.004)),
+        "FLAT": ("횡보", mk(0.0)),                    # 정배열 아님 → 탈락
+        "WILD": ("수직급등", mk(0.006, vol_range=0.06)),  # ATR% 초과 → 탈락
+        "THIN": ("저유동", mk(0.004, volume=10)),      # 거래대금 미달 → 탈락
+        "UP2": ("더상승", mk(0.006)),                  # 1위
+    }
+    picks = select_pullback_universe(cands, top=5)
+    assert [p.ticker for p in picks] == ["UP2", "UP"]
