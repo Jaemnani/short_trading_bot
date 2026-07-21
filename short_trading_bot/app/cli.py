@@ -412,6 +412,34 @@ def serve(
                     log.exception("regime.refresh_failed")
             await asyncio.sleep(600)
 
+    async def _eod_cache_loop(auth: KisAuth) -> None:
+        """매 거래일 15:40 이후 당일 1분봉을 디스크 캐시에 저장 — 검증 데이터 자산화.
+
+        분봉 API 조회 깊이(~1년) 한계 때문에 매일 쌓아둬야 장기 검증이 가능해진다.
+        구독 중 종목(스캐너 합류분 포함) 전부. 이미 캐시된 날은 건너뜀."""
+        from datetime import date as _date
+        from datetime import datetime, timedelta, timezone
+
+        from ..market.kis_history import KisMinuteHistory
+
+        kst = timezone(timedelta(hours=9))
+        hist = KisMinuteHistory(auth, creds, kis_rest_base(s.mode))
+        done: _date | None = None
+        while True:
+            now = datetime.now(kst)
+            if now.weekday() < 5 and now.hour * 60 + now.minute >= 15 * 60 + 40 and done != now.date():
+                targets = sorted(set(tickers) | service.open_tickers())
+                saved = 0
+                for t in targets:
+                    try:
+                        bars = await hist.fetch_day(t, now.date())
+                        saved += 1 if bars else 0
+                    except Exception:
+                        log.warning("eod_cache.failed", ticker=t)
+                done = now.date()
+                log.info("eod_cache.saved", tickers=saved, of=len(targets))
+            await asyncio.sleep(300)
+
     async def _run() -> None:
         restored = await service.hydrate()
         # 스캐너로 합류했던(워치리스트 밖) 열린 랏도 재시작 후 시세를 받아야 관리된다.
@@ -448,6 +476,7 @@ def serve(
         )
         scan_task = asyncio.create_task(_scan_loop(auth)) if scanner_cfg.enabled else None
         regime_task = asyncio.create_task(_regime_loop()) if regime is not None else None
+        eod_task = asyncio.create_task(_eod_cache_loop(auth))
         from ..market.bar_builder import BarBuilder
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
@@ -479,6 +508,7 @@ def serve(
                 scan_task.cancel()
             if regime_task is not None:
                 regime_task.cancel()
+            eod_task.cancel()
 
     asyncio.run(_run())
 
