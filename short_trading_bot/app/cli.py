@@ -314,11 +314,18 @@ def serve(
                      change_pct=pick.change_pct, favorite=pick.favorite)
             return True
 
+        # 합류 마감 = 전략 entry_cutoff (진입 불가능한 늦은 합류가 WS 슬롯만 차지하는 것 방지).
+        try:
+            _h, _m = str(scanner_cfg.strategy_params.get("entry_cutoff", "14:00")).split(":")
+            scan_end = min(int(_h) * 60 + int(_m), 14 * 60)
+        except ValueError:
+            scan_end = 14 * 60
+
         while True:
             try:
                 now = datetime.now(kst)
                 minute = now.hour * 60 + now.minute
-                in_session = now.weekday() < 5 and (9 * 60 + 5) <= minute <= (14 * 60)
+                in_session = now.weekday() < 5 and (9 * 60 + 5) <= minute <= scan_end
                 if in_session and not service.control.is_stopped:
                     today = now.date()
                     if scanner_cfg.daily_candidates and fav_day != today:

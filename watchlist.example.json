@@ -18,10 +18,17 @@
     "record_rankings": true,
     "daily_candidates": 20,
     "daily_universe": 200,
-    "resolution": "5m",
+    "resolution": "1m",
     "risk_per_trade": 0.005,
+    "chandelier_mult": 2.0,
     "strategy_id": "momo_intraday_v1",
-    "strategy_params": { "min_rvol": 2.0, "entry_cutoff": "14:00", "vwap_exit_buffer_pct": 0.005 }
+    "strategy_params": {
+      "min_rvol": 1.5,
+      "entry_cutoff": "12:00",
+      "vwap_exit_buffer_pct": 0.005,
+      "vwap_exit_confirm_bars": 3,
+      "require_breakout": true
+    }
   },
   "watchlist": {
     "005930": {

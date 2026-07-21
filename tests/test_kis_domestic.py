@@ -3,6 +3,7 @@ from typing import Any
 
 from short_trading_bot.domain.enums import Currency, Market, Mode, Side
 from short_trading_bot.execution.broker.kis import KisBrokerAdapter
+from short_trading_bot.execution.fees import KRX_FEES
 from short_trading_bot.execution.types import OrderRequest
 from short_trading_bot.infra.config import KisEnvCreds
 from short_trading_bot.infra.kis_auth import KisAuth
@@ -92,10 +93,10 @@ async def test_domestic_executions_estimate_fee_and_tax() -> None:
     )
     buy, sell = await _adapter(transport).get_executions()
     notional_buy, notional_sell = Decimal("700000"), Decimal("710000")
-    assert buy.fee == notional_buy * Decimal("1.5") / 10000
+    assert buy.fee == notional_buy * KRX_FEES.fee_bps / 10000
     assert buy.tax == 0  # 매수엔 거래세 없음
-    assert sell.fee == notional_sell * Decimal("1.5") / 10000
-    assert sell.tax == notional_sell * Decimal("20") / 10000  # 매도 거래세 0.20%
+    assert sell.fee == notional_sell * KRX_FEES.fee_bps / 10000
+    assert sell.tax == notional_sell * KRX_FEES.sell_tax_bps / 10000  # 매도 거래세 0.20%
 
 
 async def test_domestic_cancel_builds_rvsecncl() -> None:

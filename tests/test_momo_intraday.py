@@ -141,3 +141,53 @@ def test_vwap_exit_buffer_suppresses_shallow_dip() -> None:
         _ctx(PositionState.HOLDING, 9800, 11, 0, **held, rvol=3.0, vwap=9950.0, atr_14=200.0)
     )
     assert out[0].kind is IntentKind.EXIT and out[0].reason == "vwap_lost"  # 버퍼 초과 이탈
+
+
+def test_min_rising_bars_requires_streak() -> None:
+    """min_rising_bars=2: 연속 상승봉 2개가 쌓여야 진입."""
+    strat = MomoIntraday(MomoParams(min_rising_bars=2))
+    # 첫 상승봉 (streak 1) — 아직 부족
+    out = strat.evaluate(_ctx(PositionState.WATCHING, 10000, 10, 30, prev_close=9900, **GOOD))
+    assert out[0].kind is IntentKind.HOLD and out[0].reason == "not_rising_streak"
+    # 두 번째 상승봉 (streak 2) — 진입
+    out = strat.evaluate(_ctx(PositionState.WATCHING, 10100, 10, 31, prev_close=10000, **GOOD))
+    assert out[0].kind is IntentKind.ENTER
+
+
+def test_require_breakout_blocks_inside_bar() -> None:
+    """require_breakout: 직전 봉 고가를 넘지 못하면 합류하지 않는다."""
+    from short_trading_bot.domain.enums import Resolution as _R
+
+    from ._helpers import make_snapshot as _snap
+
+    strat = MomoIntraday(MomoParams(require_breakout=True))
+    ctx = _ctx(PositionState.WATCHING, 10000, 10, 30, prev_close=9900, **GOOD)
+    ctx = StrategyContext(
+        snapshot=ctx.snapshot, state=ctx.state, qty=ctx.qty, avg_entry=ctx.avg_entry,
+        peak_price=ctx.peak_price, bars_held=ctx.bars_held, params=ctx.params,
+        equity=ctx.equity, initial_stop=ctx.initial_stop, original_qty=ctx.original_qty,
+        news_ewma=ctx.news_ewma,
+        prev=_snap(9900, resolution=_R.M5, high=10050.0),  # 고가 10050 > 종가 10000
+    )
+    out = strat.evaluate(ctx)
+    assert out[0].kind is IntentKind.HOLD and out[0].reason == "no_breakout"
+
+
+def test_vwap_exit_confirm_bars_waits_for_streak() -> None:
+    """vwap_exit_confirm_bars=2: 이탈 봉 1개로는 유지, 연속 2개면 청산."""
+    strat = MomoIntraday(MomoParams(vwap_exit_confirm_bars=2))
+    held = dict(qty=10, avg=10000, stop=9600, peak=10050, original=10)
+    out = strat.evaluate(
+        _ctx(PositionState.HOLDING, 9900, 11, 0, **held, rvol=3.0, vwap=9950.0, atr_14=300.0)
+    )
+    assert out[0].kind is IntentKind.HOLD  # 1봉째 이탈 — 대기
+    out = strat.evaluate(
+        _ctx(PositionState.HOLDING, 9900, 11, 1, **held, rvol=3.0, vwap=9950.0, atr_14=300.0)
+    )
+    assert out[0].kind is IntentKind.EXIT and out[0].reason == "vwap_lost"  # 2봉 연속
+    # 회복하면 카운터 리셋
+    strat2 = MomoIntraday(MomoParams(vwap_exit_confirm_bars=2))
+    strat2.evaluate(_ctx(PositionState.HOLDING, 9900, 11, 0, **held, rvol=3.0, vwap=9950.0, atr_14=300.0))
+    strat2.evaluate(_ctx(PositionState.HOLDING, 10000, 11, 1, **held, rvol=3.0, vwap=9950.0, atr_14=300.0))
+    out = strat2.evaluate(_ctx(PositionState.HOLDING, 9900, 11, 2, **held, rvol=3.0, vwap=9950.0, atr_14=300.0))
+    assert out[0].kind is IntentKind.HOLD  # 리셋 후 다시 1봉째

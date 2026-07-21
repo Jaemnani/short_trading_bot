@@ -21,7 +21,7 @@ _BPS = Decimal(10000)
 
 @dataclass(slots=True)
 class CostModel:
-    fee_bps: float = 1.5  # ~0.015% brokerage, each side
+    fee_bps: float = 1.77  # KIS 비대면 온라인 0.0140527% + 유관기관제비용 0.0036396%, each side
     sell_tax_bps: float = 20.0  # 0.20% KRX 증권거래세 (sell only), 2026 KOSPI & KOSDAQ
     slippage_bps: float = 5.0
 

@@ -21,7 +21,7 @@ _BPS = Decimal(10000)
 class FeeModel:
     """Rate-based cost estimate in bps of executed notional."""
 
-    fee_bps: Decimal = Decimal("1.5")  # KIS 온라인 위탁수수료 ~0.015%
+    fee_bps: Decimal = Decimal("1.77")  # KIS 비대면 온라인 0.0140527% + 유관기관제비용 0.0036396%
     sell_tax_bps: Decimal = Decimal("20")  # 증권거래세+농특세 0.20% (2026 KRX, 매도만)
 
     def fee(self, notional: Decimal) -> Decimal:

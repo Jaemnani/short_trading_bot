@@ -54,6 +54,15 @@ class MomoParams(BaseModel):
     # VWAP 이탈 판정 버퍼: close < vwap*(1-buffer)여야 청산. 0 = 즉시.
     # 급등주는 VWAP 주변 출렁임이 커서 버퍼 없이는 조기 청산이 반복된다 (7/13주 시뮬).
     vwap_exit_buffer_pct: float = Field(default=0.0, ge=0, le=0.05)
+    # 진입 시 VWAP 괴리 상한: close > vwap*(1+상한)이면 추격하지 않는다. None=끔.
+    # 6개월 리플레이에서 손실의 대부분이 확장 추격(0~10분 내 손절) — 그 차단 장치.
+    max_vwap_ext_pct: float | None = Field(default=None, ge=0, le=0.10)
+    # 진입 확인용 연속 상승봉 수 (1 = 기존 동작: 직전 봉보다 상승).
+    min_rising_bars: int = Field(default=1, ge=1, le=5)
+    # 진입 시 직전 봉 고가 돌파 요구 (추세 지속의 더 강한 확인). False=기존 동작.
+    require_breakout: bool = False
+    # VWAP 이탈 청산 확인 봉 수 (1 = 기존 동작: 즉시). 1분봉 휩쏘 완화용.
+    vwap_exit_confirm_bars: int = Field(default=1, ge=1, le=5)
     atr_stop_mult: float = Field(default=1.5, gt=0)
     max_entries_per_day: int = Field(default=1, ge=1)
     news_block: float = -0.3
@@ -86,6 +95,8 @@ class MomoIntraday(Strategy):
         super().__init__(params)
         self._day: date | None = None
         self._entries_today = 0
+        self._rising = 0  # 연속 상승봉 수 (min_rising_bars 확인용)
+        self._below_vwap = 0  # VWAP 이탈 연속 봉 수 (vwap_exit_confirm_bars 확인용)
 
     @property
     def warmup_bars(self) -> int:
@@ -95,6 +106,8 @@ class MomoIntraday(Strategy):
         if day != self._day:
             self._day = day
             self._entries_today = 0
+            self._rising = 0
+            self._below_vwap = 0
 
     # -- contract ----------------------------------------------------------
 
@@ -103,6 +116,10 @@ class MomoIntraday(Strategy):
         ts = ctx.snapshot.ts.astimezone(KST)
         self._roll_day(ts.date())
         minute = ts.hour * 60 + ts.minute
+        if ctx.prev is not None and ctx.snapshot.close > ctx.prev.close:
+            self._rising += 1
+        else:
+            self._rising = 0
 
         if ctx.state in (PositionState.HOLDING, PositionState.SCALING):
             return self._manage(ctx, minute, p)
@@ -131,9 +148,21 @@ class MomoIntraday(Strategy):
         if p.use_vwap_filter and vwap is not None and float(close) < vwap:
             return _hold("below_vwap")
 
+        # 확장 추격 금지: VWAP에서 이미 멀어진 가격은 되돌림 여지가 그만큼 크다.
+        if (
+            p.max_vwap_ext_pct is not None
+            and vwap is not None
+            and float(close) > vwap * (1 + p.max_vwap_ext_pct)
+        ):
+            return _hold("overextended")
+
         # 추세 지속 확인: 직전 봉 종가보다 올라야 합류 (하락 전환 봉에서 물리지 않기).
         if ctx.prev is not None and close <= ctx.prev.close:
             return _hold("not_rising")
+        if p.min_rising_bars > 1 and self._rising < p.min_rising_bars:
+            return _hold("not_rising_streak")
+        if p.require_breakout and ctx.prev is not None and close <= ctx.prev.high:
+            return _hold("no_breakout")
 
         atr = ctx.ind("atr_14")
         if atr is None or atr <= 0:
@@ -171,13 +200,18 @@ class MomoIntraday(Strategy):
             return [Intent(IntentKind.EXIT, Side.SELL, reason="hard_stop")]
 
         # 3) 모멘텀 소멸: VWAP 아래로 마감하면 급등 논리가 깨진 것 — 미련 없이 이탈.
+        #    confirm_bars>1이면 연속 이탈 봉이 그만큼 쌓여야 청산 (1분봉 휩쏘 완화).
         vwap = ctx.ind("vwap")
         if (
             p.exit_below_vwap
             and vwap is not None
             and close < vwap * (1 - p.vwap_exit_buffer_pct)
         ):
-            return [Intent(IntentKind.EXIT, Side.SELL, reason="vwap_lost")]
+            self._below_vwap += 1
+            if self._below_vwap >= p.vwap_exit_confirm_bars:
+                return [Intent(IntentKind.EXIT, Side.SELL, reason="vwap_lost")]
+        else:
+            self._below_vwap = 0
 
         # 4) Chandelier trailing stop (lot-level stop config).
         atr = ctx.ind("atr_14")
