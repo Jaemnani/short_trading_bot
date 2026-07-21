@@ -24,6 +24,12 @@ from ..persistence.models import Fill as FillRow
 from .broker.base import BrokerAdapter
 from .types import Fill, OrderAck, OrderRequest
 
+# 이미 종결된 주문 = 취소가 막을 것이 없는 상태 (True 반환).
+_CANCEL_NOOP_STATES = frozenset({
+    OrderState.FILLED.value, OrderState.CANCELLED.value,
+    OrderState.REJECTED.value, OrderState.EXPIRED.value,
+})
+
 
 class OrderManager:
     def __init__(
@@ -107,6 +113,32 @@ class OrderManager:
                 )
             )
         return ack
+
+    async def cancel(self, req: OrderRequest) -> bool:
+        """미체결 주문 취소 — 손절이 기존 익절 주문에 막히지 않게 하는 통로.
+
+        True = 취소 완료(또는 이미 종결이라 막을 게 없음). UNKNOWN 주문은 건드리지
+        않는다(False) — 브로커 상태를 모르는 채 취소하면 이중 매도 위험이 있고,
+        UnknownOrderResolver가 먼저 정체를 밝혀야 한다."""
+        async with session_scope(self._sf) as s:
+            order = await self._find_order(s, req.client_order_id)
+            if order is None:
+                return True
+            if order.state in _CANCEL_NOOP_STATES:
+                return True
+            if order.state == OrderState.UNKNOWN.value:
+                return False
+            broker_no = order.broker_order_no
+        ack = await self._broker.cancel_order(req, broker_no)
+        if ack.accepted:
+            async with session_scope(self._sf) as s:
+                order = await self._find_order(s, req.client_order_id)
+                if order is not None and order.state != OrderState.FILLED.value:
+                    order.state = OrderState.CANCELLED.value
+                    s.add(self._audit(
+                        "order.cancelled", req.lot_id, {"client_order_id": req.client_order_id}
+                    ))
+        return ack.accepted
 
     async def handle_fill(self, fill: Fill) -> None:
         async with session_scope(self._sf) as s:

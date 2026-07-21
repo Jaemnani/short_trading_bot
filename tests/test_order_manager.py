@@ -118,3 +118,57 @@ async def test_rejected_order_recorded(sf) -> None:
         ).scalar_one()
         assert order.state == OrderState.REJECTED.value
     assert await _count(sf, FillRow) == 0
+
+
+class _StubBroker:
+    """접수만 하고 체결은 안 하는 브로커 — 미체결 취소 경로 테스트용."""
+
+    def __init__(self) -> None:
+        self.cancelled: list[str] = []
+        self.fill_handler = None
+
+    async def submit_order(self, req):
+        from short_trading_bot.execution.types import OrderAck
+
+        return OrderAck(client_order_id=req.client_order_id, accepted=True, broker_order_no="B1")
+
+    async def cancel_order(self, req, broker_order_no):
+        from short_trading_bot.execution.types import OrderAck
+
+        self.cancelled.append(req.client_order_id)
+        return OrderAck(client_order_id=req.client_order_id, accepted=True)
+
+
+async def test_cancel_open_order_marks_cancelled(sf) -> None:
+    """미체결(NEW) 주문 취소 → 브로커 취소 호출 + DB CANCELLED."""
+    await _seed_position(sf)
+    broker = _StubBroker()
+    om = OrderManager(broker, sf)
+    await om.submit(_req("c-tp", Side.SELL, "5"))
+
+    assert await om.cancel(_req("c-tp", Side.SELL, "5")) is True
+    assert broker.cancelled == ["c-tp"]
+    async with session_scope(sf) as s:
+        state = (
+            await s.execute(select(Order.state).where(Order.client_order_id == "c-tp"))
+        ).scalar_one()
+    assert state == OrderState.CANCELLED.value
+    # 이미 종결된 주문 재취소 = noop True, 브로커 재호출 없음
+    assert await om.cancel(_req("c-tp", Side.SELL, "5")) is True
+    assert broker.cancelled == ["c-tp"]
+
+
+async def test_cancel_unknown_order_refused(sf) -> None:
+    """UNKNOWN 주문은 취소하지 않는다 (resolver가 먼저 정체를 밝혀야 함)."""
+    await _seed_position(sf)
+    broker = _StubBroker()
+    om = OrderManager(broker, sf)
+    await om.submit(_req("c-u", Side.SELL, "5"))
+    async with session_scope(sf) as s:
+        order = (
+            await s.execute(select(Order).where(Order.client_order_id == "c-u"))
+        ).scalar_one()
+        order.state = OrderState.UNKNOWN.value
+
+    assert await om.cancel(_req("c-u", Side.SELL, "5")) is False
+    assert broker.cancelled == []

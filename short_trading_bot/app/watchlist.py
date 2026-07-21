@@ -45,6 +45,9 @@ class ScannerConfig(BaseModel):
     min_value_traded: float = 5_000_000_000  # 누적 거래대금 하한 (원)
     rejoin: bool = False  # False = 랏 1회전 후 그 종목 재진입 금지 (churn 방지)
     regime_filter: bool = False  # True = 시장 레짐 나쁠 때(코스피 20일선 아래/당일 급락) 합류·진입 중단
+    # DART 위험공시 필터 (기본 꺼짐 — 6.5개월 사후검증: 위험공시 거래 5/174건뿐, 합계 +3.5만이라
+    # 켰다면 오히려 손해. 호재성 거래정지 오탐도 있음. 표본 축적 후 재검증 예정)
+    dart_filter: bool = False
     record_rankings: bool = True  # 순위 응답을 data/rankings/에 저장 (사후 검증용)
     favorite_relax: float = Field(default=0.7, gt=0, le=1.0)  # 후보군 문턱 완화 배율
     daily_candidates: int = Field(default=20, ge=0)  # 일봉 스캔 후보군 크기 (0=끔)

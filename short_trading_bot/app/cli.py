@@ -295,6 +295,11 @@ def serve(
             rank_creds, rank_base, rank_auth = creds, kis_rest_base(s.mode), auth
         ranking = KisVolumeRank(rank_auth, rank_creds, rank_base)
         hist = KisMinuteHistory(auth, creds, kis_rest_base(s.mode))
+        dart_checker = None
+        if scanner_cfg.dart_filter and s.dart_api_key:
+            from ..news.risk import DartRiskChecker
+
+            dart_checker = DartRiskChecker(s.dart_api_key)
         favorites: set[str] = set()
         fav_day: _date | None = None
         joined_today: dict[_date, int] = {}
@@ -372,6 +377,9 @@ def serve(
                             top=capacity,
                         )
                         for pick in picks:
+                            if dart_checker is not None and await dart_checker.is_risky(pick.ticker):
+                                log.info("scanner.dart_blocked", ticker=pick.ticker)
+                                continue
                             if await _join(pick, today):
                                 joined_today[today] = joined_today.get(today, 0) + 1
             except Exception:

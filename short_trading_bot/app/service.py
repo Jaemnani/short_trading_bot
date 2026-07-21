@@ -384,7 +384,11 @@ class TradingService:
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason=decision.reason)
             return
         submitted = await self._submit(
-            lot, intent.side, qty, bar.close, is_add=intent.kind is IntentKind.ADD, reason=intent.reason
+            lot, intent.side, qty, bar.close, is_add=intent.kind is IntentKind.ADD,
+            reason=intent.reason,
+            # EXIT(손절·세션청산·킬스위치)는 걸려 있는 같은 방향 주문(TP 트림 등)을
+            # 취소하고라도 나가야 한다 — 익절 주문이 손절을 막는 사고 방지.
+            replace_pending=intent.kind is IntentKind.EXIT,
         )
         if (
             not submitted
@@ -396,15 +400,31 @@ class TradingService:
             lot.tp_rungs_taken = max(0, lot.tp_rungs_taken - 1)
 
     async def _submit(
-        self, lot: PositionLot, side: Side, qty: Decimal, price: Decimal, *, is_add: bool, reason: str
+        self,
+        lot: PositionLot,
+        side: Side,
+        qty: Decimal,
+        price: Decimal,
+        *,
+        is_add: bool,
+        reason: str,
+        replace_pending: bool = False,
     ) -> bool:
-        """Place one order per (lot, side) at a time; returns True when accepted."""
+        """Place one order per (lot, side) at a time; returns True when accepted.
+
+        ``replace_pending=True``(EXIT 전용): 같은 (lot, side)의 미체결 주문을 브로커에
+        취소 요청하고 성공하면 이어서 제출한다. 취소가 확인되지 않으면 제출하지 않는다
+        (이중 매도 방지) — UNKNOWN 주문은 resolver가 정체를 밝힐 때까지 잠금 유지."""
         if qty <= 0:
             return False
         pending_key = (lot.lot_id, side)
         if pending_key in self._pending and not await self._release_if_terminal(pending_key):
-            self._log.info("order.pending.skip", lot_id=lot.lot_id, side=side.value)
-            return False
+            if not replace_pending:
+                self._log.info("order.pending.skip", lot_id=lot.lot_id, side=side.value)
+                return False
+            if not await self._cancel_pending(pending_key, lot):
+                self._log.warning("order.replace.cancel_failed", lot_id=lot.lot_id)
+                return False
         cid = f"{lot.lot_id}-{uuid4().hex}"
         self._pending[pending_key] = cid
         self._co_map[cid] = _PendingOrder(lot, side, is_add, qty)
@@ -435,6 +455,29 @@ class TradingService:
             reason=reason,
         )
         return ack.accepted
+
+    async def _cancel_pending(self, pending_key: tuple[str, Side], lot: PositionLot) -> bool:
+        """미체결 (lot, side) 주문을 취소하고 락을 푼다. 실패 시 False (락 유지)."""
+        cid = self._pending.get(pending_key)
+        if cid is None:
+            return True
+        po = self._co_map.get(cid)
+        req = OrderRequest(
+            client_order_id=cid,
+            lot_id=lot.lot_id,
+            ticker=lot.ticker,
+            market=lot.market,
+            side=pending_key[1],
+            qty=po.requested_qty if po is not None else Decimal(0),
+            price=Decimal(0),
+            ord_dvsn="00",
+        )
+        if not await self._om.cancel(req):
+            return False
+        self._pending.pop(pending_key, None)
+        self._co_map.pop(cid, None)
+        await self._notifier.notify("order.cancelled", ticker=lot.ticker, reason="replaced_by_exit")
+        return True
 
     async def _release_if_terminal(self, pending_key: tuple[str, Side]) -> bool:
         """Free a pending lock whose order can no longer fill (per the DB order state).
