@@ -623,7 +623,7 @@ def select_universe(
     from ..market.scanner import select_pullback_universe
     from ..market.types import Bar
 
-    _bootstrap()
+    s = _bootstrap()
     listing = fdr.StockListing("KRX")
     suffix = {"KOSPI": ".KS"}
     rows = []
@@ -664,10 +664,27 @@ def select_universe(
     if not picks:
         typer.echo("적합 종목 없음 (장기 상승추세 + 저변동 + 유동성 기준)")
         return
-    typer.echo(f"{'코드':<8}{'종목':<14}{'6개월수익':>10}{'ATR%':>7}{'거래대금(억)':>12}")
+
+    # DART 위험공시 경고 (최근 90일 관리종목·감사의견 등) — 장기 거래정지 꼬리 리스크 경보.
+    warns: dict[str, list[str]] = {}
+    if s.dart_api_key:
+        import asyncio as _asyncio
+
+        from ..news.risk import DartRiskChecker
+
+        async def _check() -> None:
+            checker = DartRiskChecker(s.dart_api_key, lookback_days=90)
+            for p in picks:
+                warns[p.ticker] = await checker.risk_filings(p.ticker)
+
+        _asyncio.run(_check())
+
+    typer.echo(f"{'코드':<8}{'종목':<14}{'6개월수익':>10}{'ATR%':>7}{'거래대금(억)':>12}  공시경고")
     for p in picks:
+        w = warns.get(p.ticker, [])
+        flag = f"⚠️ {w[0][:20]}" if w else "-"
         typer.echo(f"{p.ticker:<8}{p.name:<14}{p.ret_6m:>+9.1%}{p.atr_pct:>6.1%}"
-                   f"{p.avg_value / 1e8:>11.0f}")
+                   f"{p.avg_value / 1e8:>11.0f}  {flag}")
     if write_json:
         entries = {
             f"{p.ticker}@1D": {
