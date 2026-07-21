@@ -158,6 +158,7 @@ class PullbackDaily(Strategy):
         qty = risk_based_qty(
             ctx.equity, risk, entry, stop,
             allow_fractional=ctx.params.market.is_overseas,
+            cost_buffer_pct=ctx.params.sizing_cost_buffer_pct,
         )
         if qty <= 0:
             return _hold("size_zero")

@@ -51,6 +51,7 @@ class ScannerConfig(BaseModel):
     daily_universe: int = Field(default=200, ge=10)  # 일봉 스캔 대상 시총 상위 N
     resolution: str = "5m"
     risk_per_trade: float = Field(default=0.005, gt=0, le=1.0)
+    sizing_cost_buffer_pct: float = Field(default=0.0, ge=0, le=0.02)  # 손절 실손실 예산 보정
     chandelier_mult: float = Field(default=3.0, gt=0)  # 트레일링 스톱 배수 (lot-level)
     strategy_id: str = "momo_intraday_v1"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
@@ -63,6 +64,7 @@ class ScannerConfig(BaseModel):
             stop=StopConfig(chandelier_mult=self.chandelier_mult),
             strategy_params=self.strategy_params,
             regime_filter=self.regime_filter,
+            sizing_cost_buffer_pct=self.sizing_cost_buffer_pct,
         )
 
 

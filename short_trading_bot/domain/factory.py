@@ -29,6 +29,7 @@ class PositionFactory:
             currency=market.currency,
             resolution=template.resolution,
             risk_per_trade=template.risk_per_trade,
+            sizing_cost_buffer_pct=template.sizing_cost_buffer_pct,
             stop=template.stop,
             take_profit=template.take_profit,
             max_hold_bars=template.max_hold_bars,

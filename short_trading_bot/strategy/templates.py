@@ -26,6 +26,8 @@ class StrategyTemplate(BaseModel):
         ]
     )
     max_hold_bars: int | None = None
+    # 사이징 왕복비용 여유 (손절 실손실 예산 보정; PositionParams로 전달). 0=기존 동작.
+    sizing_cost_buffer_pct: float = Field(default=0.0, ge=0, le=0.02)
     # 시장 레짐 필터 적용 여부: True면 시장 상태가 나쁠 때(MarketRegime) 신규 진입 차단.
     # 자체 레짐 게이트가 있는 전략(눌림목)은 False 유지 — 기존 검증 동작 불변.
     regime_filter: bool = False

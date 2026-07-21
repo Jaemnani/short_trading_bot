@@ -41,6 +41,8 @@ class PositionParams(BaseModel):
     resolution: Resolution = Resolution.D1
 
     risk_per_trade: float = Field(default=0.01, gt=0, le=1.0)  # equity fraction risked to stop
+    # 사이징 시 주당 리스크에 얹는 왕복 비용 여유 (손절 실손실이 예산 초과하지 않게). 0=기존.
+    sizing_cost_buffer_pct: float = Field(default=0.0, ge=0, le=0.02)
     stop: StopConfig = Field(default_factory=StopConfig)
     take_profit: list[TakeProfitRung] = Field(
         default_factory=lambda: [

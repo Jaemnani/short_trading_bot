@@ -81,3 +81,17 @@ def test_stops() -> None:
     assert atr_stop(Decimal("110"), 2.0, 2.0) == Decimal("106.0")
     assert chandelier_stop(Decimal("120"), 2.0, 3.0) == Decimal("114.0")
     assert pct_stop(Decimal("100"), 0.05) == Decimal("95.00")
+
+
+def test_risk_based_qty_cost_buffer_shrinks_size() -> None:
+    """비용 버퍼: 주당 리스크에 진입가x버퍼를 얹어 수량이 줄어든다 (0 = 기존 동작)."""
+    from decimal import Decimal
+
+    from short_trading_bot.strategy.sizing import risk_based_qty
+
+    eq, entry, stop = Decimal("10000000"), Decimal("10000"), Decimal("9800")
+    base = risk_based_qty(eq, 0.005, entry, stop)
+    assert base == Decimal("250")  # 50,000 / 200원
+    buffered = risk_based_qty(eq, 0.005, entry, stop, cost_buffer_pct=0.0033)
+    assert buffered == Decimal("214")  # 50,000 / (200 + 33)
+    assert risk_based_qty(eq, 0.005, entry, stop, cost_buffer_pct=0.0) == base

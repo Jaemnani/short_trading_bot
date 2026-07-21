@@ -84,7 +84,8 @@ class TrendLongV1(Strategy):
 
         fractional = ctx.params.market.is_overseas
         base_qty = risk_based_qty(
-            ctx.equity, ctx.params.risk_per_trade, entry, stop, allow_fractional=fractional
+            ctx.equity, ctx.params.risk_per_trade, entry, stop, allow_fractional=fractional,
+            cost_buffer_pct=ctx.params.sizing_cost_buffer_pct
         )
         qty = self._size(base_qty, mom and vol, ctx.news_ewma, allow_fractional=fractional)
         if qty <= 0:
