@@ -298,6 +298,7 @@ class IndicatorEngine:
             "sma_5": sma_last(close, 5),
             "sma_20": sma_last(close, 20),
             "sma_60": sma_last(close, 60),
+            "sma_120": sma_last(close, 120),
             "ema_12": ema_last(close, 12),
             "ema_26": ema_last(close, 26),
             "rsi_14": rsi_wilder(close, 14),

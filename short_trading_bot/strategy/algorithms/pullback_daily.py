@@ -48,6 +48,13 @@ class PullbackParams(BaseModel):
     bull_risk_mult: float = Field(default=1.5, ge=1.0, le=3.0)  # 1.0 = off
     bull_adx_min: float = Field(default=25.0, ge=0, le=100)
 
+    # 장기 추세 확인: 종가 > MA120 요구 (하락장 반짝 반등 = '가짜 상승추세' 차단).
+    # 25종목 검증에서 손실은 전부 장기 하락/횡보 종목의 베어랠리 진입이었다. False=기존 동작.
+    require_above_sma120: bool = False
+    # 변동성 상한: ATR/종가가 이 값 초과 종목은 진입 스킵 (수직 급등주는 눌림이 깊어
+    # 손절이 반복 — 두산에너빌 -27% 사례). None=끔(기존 동작).
+    max_atr_pct: float | None = Field(default=None, gt=0, le=0.20)
+
     # 분할매수(피라미딩): +add_trigger_r 이상 수익 중 새 눌림목 셋업에서만 추가 (승자에만 불타기).
     max_adds: int = Field(default=1, ge=0, le=3)  # 0 = off
     add_fraction: float = Field(default=0.5, gt=0, le=1.0)  # 원 수량 대비 추가 크기
@@ -88,6 +95,14 @@ class PullbackDaily(Strategy):
         low = float(ctx.snapshot.low if ctx.snapshot.low > 0 else ctx.snapshot.close)
         if not (close > sma60 and sma20 > sma60):
             return "no_uptrend"
+        if p.require_above_sma120:
+            sma120 = ctx.ind("sma_120")
+            if sma120 is None or close <= sma120:
+                return "below_long_ma"
+        if p.max_atr_pct is not None:
+            atr = ctx.ind("atr_14")
+            if atr is not None and close > 0 and atr / close > p.max_atr_pct:
+                return "too_volatile"
         if low > sma20 * (1 + p.touch_band_pct):
             return "no_pullback"
         if close < sma20 * (1 - p.max_below_pct):
