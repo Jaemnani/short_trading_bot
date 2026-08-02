@@ -56,6 +56,18 @@
         "bull_risk_mult": 2.0,
         "max_adds": 1
       }
+    },
+    "114800@1D": {
+      "strategy_id": "crash_momentum_v1",
+      "market": "KRX",
+      "resolution": "1D",
+      "risk_per_trade": 0.01,
+      "take_profit": [],
+      "strategy_params": {
+        "trigger_ret_pct": 0.028,
+        "hold_days": 3,
+        "alloc_pct": 0.05
+      }
     }
   }
 }

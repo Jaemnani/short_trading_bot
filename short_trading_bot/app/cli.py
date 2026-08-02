@@ -701,6 +701,116 @@ def select_universe(
         typer.echo(_json.dumps(entries, ensure_ascii=False, indent=2))
 
 
+@app.command("factor-picks")
+def factor_picks(
+    top: int = 10,
+    universe: int = 200,
+    budget: float = 0.0,
+) -> None:
+    """팩터(저PBR+흑자) 분기 리밸런스 종목 추출 — 10년 검증 채택 전략의 실행 도구.
+
+    시총 상위 ``universe``개의 직전 사업연도 재무(DART)를 받아 저PBR + 흑자
+    상위 ``top``개를 동일가중으로 추천한다 (검증: 10년 +353%, 2022 하락장 0%,
+    눌림목과 월상관 -0.01). ``--budget``(원)을 주면 종목별 편입 수량까지 계산.
+
+    운용 규칙: 분기마다 재실행해 목록대로 교체(리밸런스). 슬리브 배분은 자본의
+    20~30% 권장 (MDD 46% 관리). 재무는 Y+1년 7월부터 Y년 것을 쓴다 (선견 차단).
+    """
+    import asyncio as _asyncio
+    from datetime import date as _date
+
+    try:
+        import FinanceDataReader as fdr
+    except ImportError:
+        typer.echo("FinanceDataReader가 필요합니다: .venv/bin/pip install finance-datareader")
+        raise typer.Exit(1) from None
+
+    from ..market.fundamentals import (
+        DartFundamentals,
+        FundamentalRow,
+        applicable_fiscal_year,
+        select_factor_picks,
+    )
+
+    s = _bootstrap()
+    if not s.dart_api_key:
+        typer.echo("DART 키가 필요합니다 — .env.local에 STB_DART_API_KEY를 설정하세요.")
+        raise typer.Exit(1)
+
+    fiscal_year = applicable_fiscal_year(_date.today())
+    listing = fdr.StockListing("KRX")  # 이미 시총 내림차순
+    targets: list[tuple[str, str, Decimal, Decimal]] = []  # code, name, marcap, close
+    for _, r in listing.iterrows():
+        m = str(r.get("Market", ""))
+        if not (m == "KOSPI" or m.startswith("KOSDAQ")):
+            continue
+        try:
+            marcap = Decimal(str(int(r["Marcap"])))
+            close = Decimal(str(float(r["Close"])))
+        except (TypeError, ValueError):
+            continue
+        if marcap <= 0 or close <= 0:
+            continue
+        targets.append((str(r["Code"]), str(r["Name"]), marcap, close))
+        if len(targets) >= universe:
+            break
+
+    typer.echo(f"{fiscal_year}년 사업보고서 기준, 시총 상위 {len(targets)}개 재무 조회 중 …")
+
+    async def _collect() -> list[FundamentalRow]:
+        dart = DartFundamentals(s.dart_api_key)
+        rows: list[FundamentalRow] = []
+        for i, (code, name, marcap, close) in enumerate(targets, start=1):
+            fin = await dart.fetch(code, fiscal_year)
+            if fin is not None:
+                rows.append(FundamentalRow(
+                    ticker=code, name=name, marcap=marcap, close=close,
+                    equity=fin[0], net_income=fin[1], fiscal_year=fiscal_year,
+                ))
+            if i % 50 == 0:
+                typer.echo(f"  … {i}/{len(targets)} (재무 확보 {len(rows)})")
+        return rows
+
+    rows = _asyncio.run(_collect())
+    picks = select_factor_picks(rows, top=top)
+    if not picks:
+        typer.echo("조건(저PBR + 흑자)에 맞는 종목 없음 — DART 응답을 확인하세요.")
+        raise typer.Exit(1)
+
+    # 저PBR엔 부실주 위험이 따르므로 최근 90일 위험공시를 경고로 같이 보여준다.
+    warns: dict[str, list[str]] = {}
+
+    async def _check_warns() -> None:
+        from ..news.risk import DartRiskChecker
+
+        checker = DartRiskChecker(s.dart_api_key, lookback_days=90)
+        for p in picks:
+            warns[p.ticker] = await checker.risk_filings(p.ticker)
+
+    _asyncio.run(_check_warns())
+
+    per_stock = Decimal(str(budget)) * Decimal(str(picks[0].weight)) if budget > 0 else None
+    header = f"{'코드':<8}{'종목':<14}{'PBR':>6}{'순이익(억)':>11}{'시총(조)':>9}{'종가':>10}"
+    if per_stock is not None:
+        header += f"{'편입수량':>9}"
+    typer.echo(header + "  공시경고")
+    for p in picks:
+        w = warns.get(p.ticker, [])
+        flag = f"⚠️ {w[0][:20]}" if w else "-"
+        line = (
+            f"{p.ticker:<8}{p.name:<14}{p.pbr:>6.2f}{float(p.net_income) / 1e8:>11,.0f}"
+            f"{float(p.marcap) / 1e12:>9.2f}{float(p.close):>10,.0f}"
+        )
+        if per_stock is not None:
+            line += f"{int(per_stock / p.close):>9,}"
+        typer.echo(line + f"  {flag}")
+    typer.echo(
+        f"\n동일가중 {len(picks)}종목 (각 {picks[0].weight:.1%})"
+        + (f", 종목당 예산 {float(per_stock):,.0f}원" if per_stock is not None else "")
+        + " — 분기마다 재실행해 목록대로 리밸런스하세요."
+    )
+
+
 @app.command()
 def preflight() -> None:
     """Go-live readiness checks (run before flipping STB_MODE=LIVE)."""
