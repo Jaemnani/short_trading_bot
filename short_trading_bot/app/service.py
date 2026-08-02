@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from datetime import date as _date
 from decimal import ROUND_DOWN, Decimal
 from uuid import uuid4
 
@@ -121,7 +123,9 @@ class TradingService:
         self._fx_rates = fx_rates or FxRates()
         self._fx_warned: set[Currency] = set()
         self._runtime_synced: dict[str, tuple[str, str, int, str]] = {}  # 마지막 영속 스냅샷
-        self._one_shot: set[tuple[str, str]] = set()  # (ticker, resolution) — 랏 종료 후 재스폰 금지
+        # (ticker, resolution) -> 첫 봉 날짜. one-shot(스캐너 합류) 표시 + 랏 종료 후
+        # 재스폰 금지 + 미진입 랏의 당일 만료 판정에 쓴다 (None = 아직 봉 못 봄).
+        self._one_shot: dict[tuple[str, str], _date | None] = {}
         self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
         self._daily_date: object | None = None
         self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
@@ -236,7 +240,7 @@ class TradingService:
         self._watchlist[key] = template
         self._by_ticker.setdefault(ticker, []).append(template)
         if one_shot:
-            self._one_shot.add((ticker, template.resolution.value))
+            self._one_shot[ticker, template.resolution.value] = None
         if template.regime_filter:
             self._regime_gated.add((ticker, template.resolution.value))
         self._log.info(
@@ -252,7 +256,7 @@ class TradingService:
         for key, tmpl in list(self._watchlist.items()):
             if key.split("@")[0] == ticker and tmpl is template:
                 del self._watchlist[key]
-        self._one_shot.discard((ticker, template.resolution.value))
+        self._one_shot.pop((ticker, template.resolution.value), None)
         self._log.info("watchlist.retired", ticker=ticker, resolution=template.resolution.value)
 
     def open_tickers(self) -> set[str]:
@@ -301,6 +305,22 @@ class TradingService:
             (t for t in self._by_ticker.get(ticker, []) if t.resolution is bar.resolution), None
         )
         lot = self._lots.get(pkey)
+        if template is not None and (os_key := (ticker, template.resolution.value)) in self._one_shot:
+            joined_day = self._one_shot[os_key]
+            if joined_day is None:
+                self._one_shot[os_key] = bar_day  # 합류 후 첫 봉 = 합류 거래일
+            elif (
+                lot is not None
+                and lot.state is PositionState.WATCHING
+                and lot.qty == 0
+                and bar_day > joined_day
+            ):
+                # 미진입 스캐너 랏의 당일 만료: 합류 근거(당일 급등+거래폭증)는 다음 날
+                # 유효하지 않다. 검증된 시뮬레이션(당일 one-shot 리플레이)에는 없는
+                # '며칠 뒤 진입'이 라이브에서 실측돼(7/23 합류→7/27 진입) 정렬한다.
+                await self._expire_scan_lot(lot, template)
+                self._prev[pkey] = snap
+                return
         if (
             template is not None
             and lot is not None
@@ -550,6 +570,18 @@ class TradingService:
                 )
             )
         return lot
+
+    async def _expire_scan_lot(self, lot: PositionLot, template: StrategyTemplate) -> None:
+        """미진입 one-shot(스캐너) 랏을 CANCELLED로 은퇴시키고 DB 투영도 종결한다."""
+        lot.transition_to(PositionState.CANCELLED)
+        async with session_scope(self._sf) as session:
+            row = await session.get(Position, lot.lot_id)
+            if row is not None:
+                row.state = lot.state.value
+                row.closed_at = datetime.now(UTC)
+        self._lots.pop(self.lot_key(lot.ticker, lot.params.resolution), None)
+        self._remove_template(lot.ticker, template)
+        self._log.info("scan_lot.expired", ticker=lot.ticker, lot_id=lot.lot_id)
 
     async def _sync_runtime(self, lot: PositionLot) -> None:
         """Persist the lot's runtime stop state so hydrate() can restore it after a restart."""

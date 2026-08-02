@@ -88,6 +88,40 @@ async def test_one_shot_template_retires_after_close(sf) -> None:
     assert svc.add_template("123450@scan", _template(), one_shot=True)
 
 
+async def test_one_shot_unentered_lot_expires_next_day(sf) -> None:
+    """미진입 one-shot 랏은 다음 거래일 첫 봉에서 CANCELLED로 만료된다.
+
+    합류 근거(당일 급등+거래폭증)는 하루살이 — 검증된 시뮬(당일 리플레이)에 없는
+    '며칠 뒤 진입'(실측: 7/23 합류 → 7/27 진입)을 차단한다."""
+    from datetime import UTC, datetime
+
+    from short_trading_bot.market.types import Bar
+
+    svc = _service(sf)
+    assert svc.add_template("123450@scan", _template(), one_shot=True)
+
+    def bar(day: int, ts_min: int) -> Bar:
+        c = Decimal("10000")
+        return Bar(
+            ticker="123450", resolution=Resolution.M5,
+            ts=datetime(2026, 7, day, 1, ts_min, tzinfo=UTC),  # 10:xx KST
+            open=c, high=c, low=c, close=c, volume=Decimal("100"), value=c * 100,
+        )
+
+    await svc.process(bar(13, 0))  # 합류일 첫 봉 → 스폰 + 합류일 기록
+    lot = svc.lot("123450", Resolution.M5)
+    assert lot is not None and lot.qty == 0
+
+    await svc.process(bar(13, 5))  # 같은 날은 계속 관찰
+    assert svc.lot("123450", Resolution.M5) is lot
+
+    await svc.process(bar(14, 0))  # 다음 거래일 → 만료
+    assert lot.is_terminal
+    assert svc.lot("123450", Resolution.M5) is None  # 랏 제거
+    assert all(k.split("@")[0] != "123450" for k in svc._watchlist)  # 템플릿 은퇴
+    assert svc.add_template("123450@scan", _template(), one_shot=True)  # 재합류는 가능
+
+
 async def test_scanner_config_chandelier_passthrough(tmp_path) -> None:
     import json as _json
 
