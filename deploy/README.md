@@ -41,7 +41,25 @@ tmux attach -t stb         # 실시간 화면 보기 (창 전환 Ctrl-b n, 분�
 ./stop_paper.sh            # 중지
 ```
 tmux 세션은 터미널을 닫아도 유지됩니다(재부팅 전까지). 재부팅 후 자동 시작까지
-원하면 아래 launchd를 추가로 등록하세요.
+원하면 **3-A′(tmux 자동 시작)** 를 등록하세요. ⚠️ 3-B(engine/api 직접 실행)를
+tmux 운용과 같이 쓰면 엔진이 두 개 떠서 KIS WS 접속을 서로 뺏는다 — 둘 중 하나만.
+
+## 3-A′. (권장 조합) tmux + 로그인 자동 시작 — 3-A 그대로 쓰면서 재부팅 공백만 방지
+
+재부팅되면 tmux 세션이 사라져 봇이 꺼진 채 방치된다(2026-07-31~08-01 실제 데이터 공백).
+로그인 시 `run_paper.sh`를 자동 실행하는 LaunchAgent로 그 공백을 막는다 —
+운용(보기/중지)은 3-A의 tmux 그대로, 이미 가동 중이면 스크립트 가드가 중복을 거른다.
+
+```bash
+cd ~/workspace/short_trading_bot
+sed "s|__PROJECT__|$(pwd)|g" deploy/com.shorttradingbot.tmux.plist \
+  > ~/Library/LaunchAgents/com.shorttradingbot.tmux.plist
+launchctl load ~/Library/LaunchAgents/com.shorttradingbot.tmux.plist
+```
+
+- FileVault 켠 맥은 재부팅 후 **로그인해야** 시작된다 (자동 로그인 설정 시 무인 부팅도 가능)
+- 크래시 자동 재시작은 안 함 (그게 필요하면 아래 3-B — 단 **3-B와 동시 등록 금지**)
+- 해제: `launchctl unload ~/Library/LaunchAgents/com.shorttradingbot.tmux.plist`
 
 ## 3-B. (선택) launchd 등록 — 부팅 자동 시작 + 크래시 자동 재시작
 

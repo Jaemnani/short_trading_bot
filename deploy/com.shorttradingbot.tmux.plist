@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shorttradingbot.tmux</string>
+
+  <!-- 로그인 시 run_paper.sh 1회 실행 → tmux 세션 'stb'(엔진+API) 자동 가동.
+       run_paper.sh 의 "이미 가동 중" 가드가 이중 가동을 막으므로
+       engine/api 직접 실행 plist(3-B)와 달리 tmux 일상 운용과 충돌하지 않는다.
+       KeepAlive 없음: 크래시 자동 재시작은 안 하고(운용은 tmux 그대로),
+       재부팅 후 자동 시작만 담당한다. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT__/run_paper.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT__</string>
+
+  <!-- launchd 기본 PATH엔 homebrew(tmux)가 없다 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 스크립트가 종료해도 tmux 서버(자식)는 살려둔다 -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT__/logs/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT__/logs/launchd.log</string>
+</dict>
+</plist>
