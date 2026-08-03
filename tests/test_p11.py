@@ -54,6 +54,34 @@ async def test_routing_without_overseas_raises() -> None:
         await router.submit_order(_order(Market.NASD, "AAPL"))
 
 
+async def test_routing_overseas_read_failure_isolated() -> None:
+    """해외 read 실패가 국내 체결 배달을 볼모로 잡지 않는다 (모의 도메인 inquire-ccnl 500 실측).
+
+    연속 3회 실패 후엔 해외 폴링을 쉬고, 해외 주문이 다시 나가면 재개한다."""
+
+    class _BrokenOverseas(PaperBrokerAdapter):
+        calls = 0
+
+        async def get_executions(self):  # type: ignore[override]
+            self.calls += 1
+            raise RuntimeError("VTS 500")
+
+    cfg = PaperConfig(enforce_funds=False)
+    domestic, overseas = PaperBrokerAdapter(cfg), _BrokenOverseas(cfg)
+    router = RoutingBrokerAdapter(domestic, overseas)
+    router.fill_handler = functools.partial(_collect, [])
+    await router.submit_order(_order(Market.KRX, "005930"))  # 국내 체결 1건 생성
+
+    for _ in range(5):  # 해외가 계속 500이어도 국내 체결은 매번 배달
+        execs = await router.get_executions()
+        assert [e.ticker for e in execs] == ["005930"]
+    assert overseas.calls == 3  # 연속 3회 실패 후 해외 폴링 중단
+
+    await router.submit_order(_order(Market.NASD, "AAPL"))  # 해외 주문 → 폴링 재개
+    await router.get_executions()
+    assert overseas.calls == 4
+
+
 # --- KisWebSocketFeed parsing ---
 
 def _frame(ticker: str, hhmmss: str, price: str, volume: str) -> str:

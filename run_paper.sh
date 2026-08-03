@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 모의투자 가동: tmux 세션 'stb' 에 엔진 + 대시보드 API.
+# --live-exec = KIS 모의계좌에 실제 주문 (2026-08-03 전환). 시뮬 체결로 되돌리려면 플래그 제거.
 # 보기: tmux attach -t stb   (창 전환 Ctrl-b n, 분리 Ctrl-b d)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,7 +14,7 @@ fi
 
 mkdir -p logs
 tmux new-session -d -s stb -n engine \
-  "$(pwd)/.venv/bin/trader serve --config watchlist.json 2>&1 | tee -a logs/serve.log"
+  "$(pwd)/.venv/bin/trader serve --config watchlist.json --live-exec 2>&1 | tee -a logs/serve.log"
 tmux new-window -t stb -n api \
   "$(pwd)/.venv/bin/trader api 2>&1 | tee -a logs/api.log"
 
