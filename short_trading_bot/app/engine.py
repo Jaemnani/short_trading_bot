@@ -52,6 +52,11 @@ def build_broker(settings: Settings, *, logger: Any = None) -> BrokerAdapter:
     base = kis_rest_base(settings.mode)
     auth = KisAuth(creds, base)
     domestic = KisBrokerAdapter(auth, creds, base, settings.mode)
+    if not settings.overseas_enabled:
+        # 해외 미사용(기본): 어댑터 자체를 안 만들어 해외 API 호출 0 — 모의 도메인
+        # 해외 TR 간헐 500이 엔진을 죽였던 사고(08-03)의 원천 차단.
+        log.info("broker.domestic_only", overseas="disabled")
+        return RoutingBrokerAdapter(domestic)
     overseas = KisOverseasAdapter(auth, creds, base, settings.mode)
     return RoutingBrokerAdapter(domestic, overseas)
 

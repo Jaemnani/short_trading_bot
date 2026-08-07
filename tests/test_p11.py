@@ -216,3 +216,19 @@ def test_preflight_ready_with_keys(monkeypatch) -> None:
     monkeypatch.setenv("STB_KIS__PAPER__ACCOUNT_NO", "12345678-01")
     checks = preflight(Settings(_env_file=None), limits=RiskLimits(daily_loss_limit=Decimal("500000")))
     assert is_ready(checks)
+
+
+def test_build_broker_domestic_only_by_default(monkeypatch) -> None:
+    """overseas_enabled 기본 False — 해외 어댑터를 만들지 않아 해외 API 호출이 0이다."""
+    from short_trading_bot.infra.config import KisEnvCreds, KisSettings, Settings
+
+    s = Settings(
+        _env_file=None,
+        kis=KisSettings(paper=KisEnvCreds(app_key="k", app_secret="s", account_no="123-01")),
+    )
+    broker = build_broker(s)
+    assert isinstance(broker, RoutingBrokerAdapter)
+    assert broker._overseas is None
+
+    s2 = s.model_copy(update={"overseas_enabled": True})
+    assert build_broker(s2)._overseas is not None

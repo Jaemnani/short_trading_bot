@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     log_format: str = "console"  # "console" | "json"
 
     kis: KisSettings = Field(default_factory=KisSettings)
+    # 해외 거래/조회 사용 여부. False(기본) = 해외 어댑터를 아예 만들지 않아 해외 API를
+    # 한 번도 호출하지 않는다 — 한국 집중 방침 + 모의 도메인 해외 TR 간헐 500이
+    # 엔진을 죽였던 사고(2026-08-03)의 원천 차단. 미국 확장 재개 시 STB_OVERSEAS_ENABLED=true.
+    overseas_enabled: bool = False
     dart_api_key: str = ""
     notifier: NotifierSettings = Field(default_factory=NotifierSettings)
 
