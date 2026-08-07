@@ -31,4 +31,9 @@ def set_control(body: ControlIn, request: Request, _user: str = Depends(require_
         control.resume()
     elif body.action == "stop":  # 긴급중지 (kill switch -> flat-all)
         control.stop(scope=body.scope)
+    if body.action in ("pause", "resume", "stop"):
+        # 엔진은 별도 프로세스 — 파일 브리지로 전달해야 실제로 멈춘다 (엔진이 2초마다 읽음).
+        from ...risk.control_file import write_command
+
+        write_command(body.action, path=get_state(request).control_file)
     return _out(request)

@@ -18,7 +18,14 @@ def _state(tmp_path) -> tuple[ApiState, async_sessionmaker, ControlSwitch]:
     asyncio.run(init_models(engine))
     control = ControlSwitch()
     secret = "test-secret-key-please-ignore-0123456789"  # >=32 bytes
-    return ApiState(control=control, session_factory=sf, jwt_secret=secret), sf, control
+    state = ApiState(
+        control=control, session_factory=sf, jwt_secret=secret,
+        # 브리지 파일은 반드시 tmp로 — 기본 경로를 쓰면 테스트가 실제 가동 중인
+        # 엔진(data/control.json)에 stop 명령을 흘려보낸다.
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "engine_status.json",
+    )
+    return state, sf, control
 
 
 def _token(client: TestClient) -> str:
@@ -89,6 +96,57 @@ def test_positions(tmp_path) -> None:
     assert r.status_code == 200
     assert r.json()[0]["ticker"] == "005930"
     assert Decimal(r.json()[0]["qty_filled"]) == Decimal("10")  # Numeric scale -> "10.00000000"
+
+
+def test_control_post_writes_bridge_file(tmp_path) -> None:
+    """대시보드 제어가 파일 브리지에 기록돼야 별도 프로세스인 엔진에 닿는다."""
+    from short_trading_bot.risk.control_file import read_command
+
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    token = _token(client)
+    client.post("/api/control", json={"action": "pause"}, headers=_auth(token))
+    assert read_command(path=state.control_file) == (1, "pause")
+    client.post("/api/control", json={"action": "stop"}, headers=_auth(token))
+    assert read_command(path=state.control_file) == (2, "stop")  # seq 단조 증가
+
+
+def test_status_alive_and_dead(tmp_path) -> None:
+    """엔진 상태 파일 최신=가동, 오래됨/없음=끊김. 오늘 체결도 함께 반환."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from short_trading_bot.persistence.models import Fill, Order
+
+    state, sf, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    token = _token(client)
+
+    r = client.get("/api/status", headers=_auth(token)).json()  # 파일 없음
+    assert r["engine_alive"] is False and r["engine"] is None
+
+    snap = {"ts": datetime.now(UTC).isoformat(), "control": "RUNNING", "equity": "10000000",
+            "peak_equity": "10000000", "daily_realized": "0", "daily_date": None,
+            "open_lots": [], "watching": []}
+    state.status_file.write_text(_json.dumps(snap))
+
+    async def seed() -> None:
+        async with session_scope(sf) as s:
+            s.add(Position(lot_id="lot1", ticker="005930", state="HOLDING",
+                           strategy_id="momo_intraday_v1"))
+            s.add(Order(order_id="o1", lot_id="lot1", client_order_id="c1", side="BUY",
+                        qty=Decimal("10"), state="FILLED"))
+            s.add(Fill(fill_id="f1", order_id="o1", lot_id="lot1", qty=Decimal("10"),
+                       price=Decimal("70000")))
+
+    asyncio.run(seed())
+    r = client.get("/api/status", headers=_auth(token)).json()
+    assert r["engine_alive"] is True and r["engine"]["equity"] == "10000000"
+    assert r["today_fills"][0]["ticker"] == "005930" and r["today_fills"][0]["side"] == "BUY"
+
+    snap["ts"] = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()  # 60초 전 = 끊김
+    state.status_file.write_text(_json.dumps(snap))
+    assert client.get("/api/status", headers=_auth(token)).json()["engine_alive"] is False
 
 
 def test_ws_pushes_control_state(tmp_path) -> None:

@@ -263,6 +263,48 @@ class TradingService:
         """현재 열린(청산 안 된) 랏들의 티커 — 재시작 시 WS 구독 목록에 포함해야 한다."""
         return {lot.ticker for lot in self._lots.values() if lot.is_open}
 
+    async def status_snapshot(self) -> dict[str, object]:
+        """대시보드용 실시간 현황 — 엔진이 주기적으로 파일에 기록해 API 프로세스가 읽는다.
+
+        equity(브로커 잔고 조회)는 일시 실패해도 나머지 현황은 제공한다 (None 표기)."""
+        equity: Decimal | None
+        try:
+            equity = await self._equity()
+        except Exception:
+            equity = None
+        open_lots: list[dict[str, object]] = []
+        watching: list[dict[str, object]] = []
+        for lot in sorted(self._lots.values(), key=lambda x: (x.ticker, x.params.resolution.value)):
+            last = self._last_price.get(lot.ticker)
+            if lot.qty > 0:
+                open_lots.append({
+                    "ticker": lot.ticker,
+                    "resolution": lot.params.resolution.value,
+                    "strategy": lot.params.strategy_id,
+                    "state": lot.state.value,
+                    "qty": str(lot.qty),
+                    "avg_entry": str(lot.avg_entry),
+                    "last_price": str(last) if last is not None else None,
+                    "unrealized": str((last - lot.avg_entry) * lot.qty) if last is not None else None,
+                    "initial_stop": str(lot.initial_stop) if lot.initial_stop is not None else None,
+                })
+            elif lot.state is PositionState.WATCHING:
+                watching.append({
+                    "ticker": lot.ticker,
+                    "resolution": lot.params.resolution.value,
+                    "strategy": lot.params.strategy_id,
+                })
+        return {
+            "ts": datetime.now(UTC).isoformat(),
+            "control": self.control.state.value,
+            "equity": str(equity) if equity is not None else None,
+            "peak_equity": str(self._peak_equity),
+            "daily_realized": str(self._daily_realized),
+            "daily_date": str(self._daily_date) if self._daily_date is not None else None,
+            "open_lots": open_lots,
+            "watching": watching,
+        }
+
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
         return FillPoller(self._broker, self._sf, self._on_fill)

@@ -1,4 +1,6 @@
-const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://localhost:8000";
+// 기본 = 같은 오리진 (API 서버 :8000이 빌드된 이 페이지를 직접 서빙).
+// vite dev(:5173)에서만 VITE_API_BASE=http://localhost:8000 지정.
+const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
 
 export interface Control {
   state: string;
@@ -59,3 +61,45 @@ export const getStrategies = (t: string) =>
 
 export const getPositions = (t: string) =>
   fetch(`${BASE}/api/positions`, { headers: headers(t) }).then(json<Position[]>);
+
+export interface OpenLot {
+  ticker: string;
+  resolution: string;
+  strategy: string;
+  state: string;
+  qty: string;
+  avg_entry: string;
+  last_price: string | null;
+  unrealized: string | null;
+  initial_stop: string | null;
+}
+
+export interface EngineSnapshot {
+  ts: string;
+  control: string;
+  equity: string | null;
+  peak_equity: string;
+  daily_realized: string;
+  daily_date: string | null;
+  open_lots: OpenLot[];
+  watching: { ticker: string; resolution: string; strategy: string }[];
+}
+
+export interface FillRow {
+  time: string;
+  ticker: string;
+  side: string;
+  qty: string;
+  price: string;
+  fee: string;
+  tax: string;
+}
+
+export interface Status {
+  engine_alive: boolean;
+  engine: EngineSnapshot | null;
+  today_fills: FillRow[];
+}
+
+export const getStatus = (t: string) =>
+  fetch(`${BASE}/api/status`, { headers: headers(t) }).then(json<Status>);

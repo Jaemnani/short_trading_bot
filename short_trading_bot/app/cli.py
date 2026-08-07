@@ -448,6 +448,46 @@ def serve(
                 log.info("eod_cache.saved", tickers=saved, of=len(targets))
             await asyncio.sleep(300)
 
+    async def _status_loop() -> None:
+        """엔진 현황을 5초마다 data/engine_status.json에 기록 — 대시보드의 실시간 소스."""
+        import json as _json
+        from pathlib import Path
+
+        out = Path("data/engine_status.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                snap = await service.status_snapshot()
+                tmp = out.with_suffix(".tmp")
+                tmp.write_text(_json.dumps(snap, ensure_ascii=False))
+                tmp.replace(out)  # 원자적 교체
+            except Exception:
+                log.exception("status_write.error")
+            await asyncio.sleep(5)
+
+    async def _control_loop() -> None:
+        """대시보드 제어 명령(data/control.json)을 2초마다 읽어 엔진에 적용.
+
+        API는 별도 프로세스라 메모리 ControlSwitch가 공유되지 않는다 — 파일이 매개.
+        seq 단조 증가로 같은 명령이 두 번 적용되지 않는다."""
+        from ..risk.control_file import apply_command, read_command
+
+        applied = 0
+        cmd = read_command()
+        if cmd is not None:
+            applied = cmd[0]  # 시작 시점의 잔존 명령은 과거 것 — 새 명령부터 적용
+        while True:
+            try:
+                cmd = read_command()
+                if cmd is not None and cmd[0] > applied:
+                    applied = cmd[0]
+                    apply_command(service.control, cmd[1])
+                    log.info("control_file.applied", action=cmd[1], seq=applied)
+                    await notifier.notify("control", action=cmd[1], source="dashboard")
+            except Exception:
+                log.exception("control_read.error")
+            await asyncio.sleep(2)
+
     async def _run() -> None:
         restored = await service.hydrate()
         # 스캐너로 합류했던(워치리스트 밖) 열린 랏도 재시작 후 시세를 받아야 관리된다.
@@ -485,6 +525,8 @@ def serve(
         scan_task = asyncio.create_task(_scan_loop(auth)) if scanner_cfg.enabled else None
         regime_task = asyncio.create_task(_regime_loop()) if regime is not None else None
         eod_task = asyncio.create_task(_eod_cache_loop(auth))
+        status_task = asyncio.create_task(_status_loop())
+        control_task = asyncio.create_task(_control_loop())
         from ..market.bar_builder import BarBuilder
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
@@ -505,8 +547,13 @@ def serve(
                 if service.control.is_stopped:
                     break
                 if live_exec:  # recover anything missed while disconnected
-                    await service.make_fill_poller().poll_once()
-                    await service.reconcile()
+                    try:
+                        await service.make_fill_poller().poll_once()
+                        await service.reconcile()
+                    except Exception:
+                        # 복구 조회의 일시 실패(REST 5xx 등)로 엔진이 죽으면 안 된다 —
+                        # 2026-08-03 해외 잔고 500이 여기서 미보호로 전파돼 나흘 다운.
+                        log.exception("reconnect_recover.error")
                 log.info("feed.reconnect", delay_seconds=5)
                 await asyncio.sleep(5)
         finally:
@@ -517,8 +564,18 @@ def serve(
             if regime_task is not None:
                 regime_task.cancel()
             eod_task.cancel()
+            status_task.cancel()
+            control_task.cancel()
 
     asyncio.run(_run())
+    if service.control.is_stopped:
+        # 긴급중지로 인한 종료 — 워치독(run_paper.sh --watchdog)이 되살리지 않게
+        # 마커를 남긴다. 재개는 사용자가 ./run_paper.sh (마커 제거) 로만.
+        from pathlib import Path
+
+        Path("data").mkdir(exist_ok=True)
+        Path("data/engine_stopped.marker").write_text("kill-switch")
+        log.info("engine.stop_marker_written")
 
 
 @app.command("api")

@@ -82,6 +82,26 @@ async def test_routing_overseas_read_failure_isolated() -> None:
     assert overseas.calls == 4
 
 
+async def test_routing_overseas_balance_failure_degrades_to_domestic() -> None:
+    """해외 잔고 500이 equity/reconcile를 죽이면 안 된다 (2026-08-03 엔진 나흘 다운 원인).
+
+    실패 시 국내 잔고만으로 강등 — 과소 equity = 보수적 사이징이라 안전한 방향."""
+
+    class _BrokenBalance(PaperBrokerAdapter):
+        async def get_balance(self):  # type: ignore[override]
+            raise RuntimeError("VTS inquire-balance 500")
+
+    cfg = PaperConfig(enforce_funds=False)
+    domestic = PaperBrokerAdapter(cfg)
+    router = RoutingBrokerAdapter(domestic, _BrokenBalance(cfg))
+    router.fill_handler = functools.partial(_collect, [])
+    await router.submit_order(_order(Market.KRX, "005930"))
+
+    merged = await router.get_balance()  # 예외 없이 국내 잔고만
+    assert [p.ticker for p in merged.positions] == ["005930"]
+    assert merged.cash  # 국내 현금은 살아있음
+
+
 # --- KisWebSocketFeed parsing ---
 
 def _frame(ticker: str, hhmmss: str, price: str, volume: str) -> str:

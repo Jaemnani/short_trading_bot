@@ -52,26 +52,33 @@ class RoutingBrokerAdapter(BrokerAdapter):
             raise ValueError("overseas broker not configured")
         return self._overseas
 
-    async def _overseas_read(self, fetch: Callable[[], Awaitable[list[_T]]]) -> list[_T]:
-        """해외 레그 read 집계 — 실패를 격리해 국내(핵심) 체결 배달을 볼모로 잡지 않는다.
+    async def _overseas_call(
+        self, fetch: Callable[[], Awaitable[_T]], default: _T
+    ) -> _T:
+        """해외 레그 조회 격리 — 실패가 국내(핵심) 동작을 볼모로 잡지 않는다.
 
-        모의 도메인은 해외 체결내역 TR(inquire-ccnl)에 500을 반환한다 (2026-08-03 실측) —
-        예외가 전파되면 국내 체결 폴링까지 통째로 죽는다. 연속 실패가 쌓이면 다음 해외
-        주문이 나갈 때까지 해외 폴링을 쉰다 (2초 주기 에러 스팸·무의미 호출 방지).
+        모의 도메인의 해외 TR(inquire-ccnl·inquire-balance)은 간헐 500을 반환한다
+        (2026-08-03 실측 — 잔고 500이 _equity→reconcile로 전파돼 엔진이 죽고 나흘간
+        방치됐다). 실패 시 default로 강등하고, 연속 실패가 쌓이면 다음 해외 주문이
+        나갈 때까지 해외 조회를 쉰다 (주기 호출의 에러 스팸·무의미 호출 방지).
         """
         if self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
-            return []
+            return default
         try:
             result = await fetch()
         except Exception:
             self._overseas_fail += 1
             self._log.warning(
-                "overseas_read.failed", consecutive=self._overseas_fail,
+                "overseas_call.failed", consecutive=self._overseas_fail,
                 suspended=self._overseas_fail >= _OVERSEAS_FAIL_LIMIT,
             )
-            return []
+            return default
         self._overseas_fail = 0
-        return list(result)
+        return result
+
+    async def _overseas_read(self, fetch: Callable[[], Awaitable[list[_T]]]) -> list[_T]:
+        empty: list[_T] = []
+        return list(await self._overseas_call(fetch, empty))
 
     async def submit_order(self, req: OrderRequest) -> OrderAck:
         if req.market.is_overseas:
@@ -86,10 +93,12 @@ class RoutingBrokerAdapter(BrokerAdapter):
         cash = dict(balance.cash)
         positions = list(balance.positions)
         if self._overseas is not None:
-            other = await self._overseas.get_balance()
-            for currency, amount in other.cash.items():
-                cash[currency] = cash.get(currency, Decimal(0)) + amount
-            positions.extend(other.positions)
+            # 해외 잔고 실패 = 국내 잔고만으로 강등 (equity 과소 = 보수적 사이징이라 안전).
+            other = await self._overseas_call(self._overseas.get_balance, None)
+            if other is not None:
+                for currency, amount in other.cash.items():
+                    cash[currency] = cash.get(currency, Decimal(0)) + amount
+                positions.extend(other.positions)
         return AccountBalance(cash=cash, positions=positions)
 
     async def get_open_orders(self) -> list[OrderAck]:

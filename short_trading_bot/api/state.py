@@ -6,11 +6,13 @@ with the running TradingService, so a dashboard pause/kill-switch reaches the li
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..risk.control import ControlSwitch
+from ..risk.control_file import DEFAULT_PATH as CONTROL_FILE_DEFAULT
 
 
 @dataclass
@@ -20,3 +22,6 @@ class ApiState:
     jwt_secret: str
     username: str = "admin"
     password: str = "admin"
+    # 프로세스 간 브리지 파일 — 테스트는 tmp 경로로 주입 (실제 엔진 파일 오염 방지)
+    control_file: Path = field(default_factory=lambda: CONTROL_FILE_DEFAULT)
+    status_file: Path = field(default_factory=lambda: Path("data/engine_status.json"))

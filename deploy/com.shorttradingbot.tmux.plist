@@ -13,6 +13,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__PROJECT__/run_paper.sh</string>
+    <string>--watchdog</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -27,6 +28,11 @@
 
   <key>RunAtLoad</key>
   <true/>
+
+  <!-- 5분마다 워치독 — 엔진/API 창만 죽었을 때 되살린다 (2026-08-03 엔진 크래시
+       나흘 방치 재발 방지). 의도된 중지는 data/engine_stopped.marker 가 막는다. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
 
   <!-- 스크립트가 종료해도 tmux 서버(자식)는 살려둔다 -->
   <key>AbandonProcessGroup</key>
