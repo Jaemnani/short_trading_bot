@@ -137,21 +137,47 @@ def serve(
     feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
     async def _poll_loop(poller: object) -> None:
+        from datetime import datetime
+
         from ..execution.fill_poller import FillPoller
+        from ..execution.poll_gate import KST, PollGate
 
         assert isinstance(poller, FillPoller)
         # UNKNOWN 주문 복구는 같은 주기로 동행 — UNKNOWN 이 없으면 API 호출 없이 즉시 반환.
         resolver = service.make_unknown_resolver()
+        # 장외엔 폴링 자체를 쉼 (VTS 가 장외 체결내역 TR 을 500 으로 거부 — 2026-08-08).
+        # 장중 연속 실패는 지수 백오프로 KIS 해머링 방지. 로직·근거는 poll_gate.py.
+        gate = PollGate(base_seconds=fill_poll_seconds)
+        was_idle = False
         while True:
-            try:
-                await resolver.poll_once()
-            except Exception:
-                log.exception("unknown_resolve.error")
-            try:
-                await poller.poll_once()
-            except Exception:
-                log.exception("fill_poll.error")
-            await asyncio.sleep(fill_poll_seconds)
+            now = datetime.now(KST)
+            if gate.in_session(now):
+                if was_idle:
+                    was_idle = False
+                    log.info("fill_poll.session_start")
+                ok = True
+                try:
+                    await resolver.poll_once()
+                except Exception:
+                    ok = False
+                    log.exception("unknown_resolve.error")
+                try:
+                    await poller.poll_once()
+                except Exception:
+                    ok = False
+                    log.exception("fill_poll.error")
+                gate.record(ok)
+                if not ok and gate.consecutive_failures in (1, 5):
+                    # 백오프 진입/지속을 한눈에 — 매 실패마다가 아니라 이정표만.
+                    log.warning(
+                        "fill_poll.backoff",
+                        failures=gate.consecutive_failures,
+                        delay_seconds=gate.next_delay(now),
+                    )
+            elif not was_idle:
+                was_idle = True
+                log.info("fill_poll.session_idle")
+            await asyncio.sleep(gate.next_delay(datetime.now(KST)))
 
     def _backfill_daily(daily_tickers: list[str]) -> int:
         """일봉 워밍업 백필 (FinanceDataReader, 최근 ~200일)."""
