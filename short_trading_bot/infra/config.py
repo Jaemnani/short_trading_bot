@@ -35,9 +35,12 @@ class KisSettings(BaseModel):
 
 
 class NotifierSettings(BaseModel):
-    discord_webhook_url: str = ""  # Discord 채널 웹후크 URL (권장)
+    discord_webhook_url: str = ""  # Discord 채널 웹후크 URL
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    # 카카오톡 나에게 보내기 (권장 — 모바일 상시 채널). 키 설정 + `trader kakao-auth` 1회.
+    kakao_rest_api_key: str = ""  # developers.kakao.com 앱의 REST API 키
+    kakao_token_path: str = "data/kakao_token.json"
 
 
 class Settings(BaseSettings):

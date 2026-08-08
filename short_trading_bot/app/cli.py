@@ -174,6 +174,11 @@ def serve(
                         failures=gate.consecutive_failures,
                         delay_seconds=gate.next_delay(now),
                     )
+                if not ok and gate.consecutive_failures == 5:
+                    # 장중 5연속 실패 = 체결 감지가 실질 중단 — 사람에게 알린다 (1회성 이정표).
+                    await notifier.notify(
+                        "fill_poll.degraded", 연속실패=5, 조치="KIS 장애 여부 확인 필요"
+                    )
             elif not was_idle:
                 was_idle = True
                 log.info("fill_poll.session_idle")
@@ -472,6 +477,19 @@ def serve(
                         log.warning("eod_cache.failed", ticker=t)
                 done = now.date()
                 log.info("eod_cache.saved", tickers=saved, of=len(targets))
+                try:
+                    # 장 마감 일일 요약 — 매 거래일 1건. 카카오 토큰의 일일 keep-alive 도 겸한다
+                    # (발송 시 만료 임박 토큰이 자동 갱신되므로 리프레시 토큰이 계속 연장됨).
+                    snap = await service.status_snapshot()
+                    lots = snap.get("open_lots")
+                    await notifier.notify(
+                        "daily.summary",
+                        평가금=snap.get("equity"),
+                        당일실현손익=snap.get("daily_realized"),
+                        보유랏=len(lots) if isinstance(lots, list) else 0,
+                    )
+                except Exception:
+                    log.exception("daily_summary.error")
             await asyncio.sleep(300)
 
     async def _status_loop() -> None:
@@ -523,6 +541,9 @@ def serve(
             report = await service.reconcile()
             if not report.in_sync:
                 log.warning("reconcile.drift_on_start", mismatches=len(report.mismatches))
+                await notifier.notify(
+                    "reconcile.drift", 불일치=len(report.mismatches), 시점="엔진 시작"
+                )
         auth = KisAuth(creds, kis_rest_base(s.mode))
         # 지표 워밍업 백필 — 해상도별로. 없으면 저빈도 전략은 수십 거래일간 관망만 한다.
         primed = 0
@@ -544,6 +565,13 @@ def serve(
             resolutions=[r.value for r in resolutions],
             restored=restored,
             execution="live" if live_exec else "simulated",
+        )
+        # 시작 알림 — 워치독이 죽은 엔진을 되살렸을 때도 이 알림으로 "죽었었다"를 알게 된다.
+        await notifier.notify(
+            "engine.start",
+            mode=s.mode.value,
+            체결=("실주문" if live_exec else "시뮬"),
+            복원랏=restored,
         )
         poll_task = (
             asyncio.create_task(_poll_loop(service.make_fill_poller())) if live_exec else None
@@ -909,6 +937,90 @@ def preflight() -> None:
     typer.echo(f"\nready={ready} (mode={s.mode.value})")
     if not ready:
         raise typer.Exit(code=1)
+
+
+@app.command("kakao-auth")
+def kakao_auth(port: int = 8899) -> None:
+    """카카오톡 나에게 보내기 최초 1회 승인 — 브라우저 로그인 → 토큰 저장 → 테스트 발송.
+
+    사전 준비 (developers.kakao.com, 5분):
+    1) 내 애플리케이션 > 앱 만들기 → 앱 설정 > 앱 키에서 REST API 키 복사
+       → .env.local 에 STB_NOTIFIER__KAKAO_REST_API_KEY=<키>
+    2) 제품 설정 > 카카오 로그인 활성화 + Redirect URI 에 http://localhost:8899/kakao 등록
+    3) 카카오 로그인 > 동의항목에서 '카카오톡 메시지 전송(talk_message)' 활성화
+    """
+    import asyncio
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from pathlib import Path
+    from urllib.parse import parse_qs, quote, urlparse
+
+    from ..infra.notifier.kakao import KakaoNotifier, exchange_auth_code
+
+    s = _bootstrap()
+    key = s.notifier.kakao_rest_api_key
+    if not key:
+        typer.echo("STB_NOTIFIER__KAKAO_REST_API_KEY 가 .env.local 에 없습니다 (docstring 참조).")
+        raise typer.Exit(1)
+
+    redirect_uri = f"http://localhost:{port}/kakao"
+    auth_url = (
+        "https://kauth.kakao.com/oauth/authorize"
+        f"?client_id={key}&redirect_uri={quote(redirect_uri, safe='')}"
+        "&response_type=code&scope=talk_message"
+    )
+    typer.echo("브라우저에서 카카오 로그인 후 동의를 눌러주세요. 창이 안 열리면 직접 접속:")
+    typer.echo(f"  {auth_url}")
+    webbrowser.open(auth_url)
+
+    captured: dict[str, str] = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            captured["code"] = qs.get("code", [""])[0]
+            captured["error"] = qs.get("error", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<h3>승인 완료 — 터미널로 돌아가세요.</h3>".encode())
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass  # 기본 stderr 액세스 로그 침묵
+
+    with HTTPServer(("127.0.0.1", port), _Handler) as server:
+        server.timeout = 300
+        server.handle_request()  # 리다이렉트 1회만 받으면 끝
+
+    if captured.get("error") or not captured.get("code"):
+        typer.echo(f"승인 실패: {captured.get('error') or '코드 미수신 (5분 타임아웃)'}")
+        raise typer.Exit(1)
+
+    async def _finish() -> None:
+        token = await exchange_auth_code(key, redirect_uri, captured["code"])
+        token.save(Path(s.notifier.kakao_token_path))
+        notifier = KakaoNotifier(key, s.notifier.kakao_token_path)
+        await notifier.notify("kakao.connected", 설명="이제 봇 알림이 이 채널로 옵니다")
+
+    asyncio.run(_finish())
+    typer.echo(f"토큰 저장 완료: {s.notifier.kakao_token_path}")
+    typer.echo("카카오톡 '나와의 채팅'에 테스트 메시지가 도착했는지 확인하세요.")
+
+
+@app.command("notify-test")
+def notify_test(event: str = "notify.test") -> None:
+    """설정된 알림 스택(콘솔+카카오+디스코드) 전체로 테스트 발송."""
+    import asyncio
+    from datetime import datetime
+
+    from ..infra.notifier.factory import build_notifier
+
+    s = _bootstrap()
+    notifier = build_notifier(s)
+    asyncio.run(
+        notifier.notify(event, 채널점검="OK", 시각=datetime.now().strftime("%m-%d %H:%M"))
+    )
+    typer.echo("발송 시도 완료 — 콘솔 로그와 카카오톡을 확인하세요.")
 
 
 @campaign_app.command("list")
