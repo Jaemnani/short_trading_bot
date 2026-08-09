@@ -40,6 +40,9 @@ class NotifierSettings(BaseModel):
     telegram_chat_id: str = ""
     # 카카오톡 나에게 보내기 (권장 — 모바일 상시 채널). 키 설정 + `trader kakao-auth` 1회.
     kakao_rest_api_key: str = ""  # developers.kakao.com 앱의 REST API 키
+    # 앱의 [보안] > Client Secret 이 '사용함' 이면 필수 — 없으면 토큰 발급/갱신이
+    # KOE010 "Bad client credentials" 로 거부된다. 사용 안 함이면 빈 값 유지.
+    kakao_client_secret: str = ""
     kakao_token_path: str = "data/kakao_token.json"
 
 

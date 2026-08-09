@@ -974,18 +974,32 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
 
     redirect_uri = f"http://localhost:{port}/kakao"
 
+    secret = s.notifier.kakao_client_secret
+
     def _save_and_test(auth_code: str) -> None:
         async def _finish() -> None:
-            token = await exchange_auth_code(key, redirect_uri, auth_code)
+            token = await exchange_auth_code(
+                key, redirect_uri, auth_code, client_secret=secret
+            )
             token.save(Path(s.notifier.kakao_token_path))
-            notifier = KakaoNotifier(key, s.notifier.kakao_token_path)
+            notifier = KakaoNotifier(
+                key, s.notifier.kakao_token_path, client_secret=secret
+            )
             await notifier.notify("kakao.connected", 설명="이제 봇 알림이 이 채널로 옵니다")
 
         try:
             asyncio.run(_finish())
         except Exception as exc:  # 코드 만료/재사용/불일치는 흔한 실사용 실패 — 안내로 받는다
             typer.echo(f"교환 실패: {exc}")
-            typer.echo("인가 코드는 1회용·10분 유효입니다 — 승인 페이지를 다시 열어 새 코드로 재시도하세요.")
+            if "KOE010" in str(exc):
+                typer.echo(
+                    "→ 앱 [보안] 의 Client Secret 이 '사용함' 입니다. 그 값을 .env.local 의 "
+                    "STB_NOTIFIER__KAKAO_CLIENT_SECRET 에 넣거나, 콘솔에서 '사용 안 함' 으로 바꾸세요."
+                )
+            else:
+                typer.echo(
+                    "인가 코드는 1회용·10분 유효입니다 — 승인 페이지를 다시 열어 새 코드로 재시도하세요."
+                )
             raise typer.Exit(1) from exc
         typer.echo(f"토큰 저장 완료: {s.notifier.kakao_token_path}")
         typer.echo("카카오톡 '나와의 채팅'에 테스트 메시지가 도착했는지 확인하세요.")

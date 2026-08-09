@@ -130,6 +130,40 @@ class TestNotify:
         assert len(transport.calls) == 4
 
 
+class TestClientSecret:
+    """앱 [보안] Client Secret 이 '사용함' 이면 발급·갱신 양쪽에 필수 (없으면 KOE010)."""
+
+    async def test_exchange_includes_secret_when_set(self) -> None:
+        transport = FakeTransport(
+            {AUTH_HOST: {"access_token": "a", "refresh_token": "r", "expires_in": 21600}}
+        )
+        await exchange_auth_code(
+            "key", "uri", "CODE", client_secret="s3cret", transport=transport
+        )
+        assert transport.calls[0][2]["client_secret"] == "s3cret"
+
+    async def test_exchange_omits_secret_when_unset(self) -> None:
+        transport = FakeTransport(
+            {AUTH_HOST: {"access_token": "a", "refresh_token": "r", "expires_in": 21600}}
+        )
+        await exchange_auth_code("key", "uri", "CODE", transport=transport)
+        assert "client_secret" not in transport.calls[0][2]
+
+    async def test_refresh_includes_secret_when_set(self, tmp_path: Path) -> None:
+        path = _token_file(tmp_path, expires_in=10, now=1000.0)
+        transport = FakeTransport(
+            {
+                AUTH_HOST: {"access_token": "acc2", "expires_in": 21600},
+                API_HOST: {"result_code": 0},
+            }
+        )
+        n = KakaoNotifier(
+            "key", path, client_secret="s3cret", transport=transport, clock=lambda: 1000.0
+        )
+        await n.notify("x")
+        assert transport.calls[0][2]["client_secret"] == "s3cret"
+
+
 class TestExtractAuthCode:
     """사람이 붙여넣는 형태는 제각각 — 코드만, URL 전체, 따옴표/공백 포함."""
 

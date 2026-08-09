@@ -15,6 +15,7 @@ def build_notifier(settings: Settings) -> Notifier:
             KakaoNotifier(
                 settings.notifier.kakao_rest_api_key,
                 settings.notifier.kakao_token_path,
+                client_secret=settings.notifier.kakao_client_secret,
             )
         )
     if settings.notifier.discord_webhook_url:

@@ -95,7 +95,10 @@ async def http_post_form(
 ) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         resp = await client.post(url, headers=headers, data=data)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # 카카오는 진짜 사유를 본문 JSON(error_code=KOE010 등)에만 담는다 —
+            # raise_for_status 만 쓰면 "401" 만 남아 진단 불가 (2026-08-09 KOE010 사고).
+            raise RuntimeError(f"kakao HTTP {resp.status_code}: {resp.text[:300]}")
         body: dict[str, Any] = resp.json()
         return body
 
@@ -106,6 +109,7 @@ class KakaoNotifier(Notifier):
         rest_api_key: str,
         token_path: str | Path,
         *,
+        client_secret: str = "",
         transport: Transport | None = None,
         timeout: float = 5.0,
         max_per_minute: int = 10,
@@ -113,6 +117,7 @@ class KakaoNotifier(Notifier):
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._key = rest_api_key
+        self._client_secret = client_secret
         self._path = Path(token_path)
         self._transport = transport or self._default_transport
         self._timeout = timeout
@@ -161,15 +166,14 @@ class KakaoNotifier(Notifier):
                 f"kakao token file not found: {self._path} — run `trader kakao-auth` first"
             )
         if self._token.needs_refresh(now):
-            payload = await self._transport(
-                f"{AUTH_HOST}/oauth/token",
-                {},
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": self._key,
-                    "refresh_token": self._token.refresh_token,
-                },
-            )
+            form = {
+                "grant_type": "refresh_token",
+                "client_id": self._key,
+                "refresh_token": self._token.refresh_token,
+            }
+            if self._client_secret:  # 앱 보안 설정이 '사용함' 이면 갱신에도 필수
+                form["client_secret"] = self._client_secret
+            payload = await self._transport(f"{AUTH_HOST}/oauth/token", {}, form)
             self._token = apply_token_response(self._token.refresh_token, payload, now)
             self._token.save(self._path)
             self._log.info("kakao.token_refreshed")
@@ -199,20 +203,24 @@ def extract_auth_code(value: str) -> str:
 
 
 async def exchange_auth_code(
-    rest_api_key: str, redirect_uri: str, code: str, *, transport: Transport | None = None
+    rest_api_key: str,
+    redirect_uri: str,
+    code: str,
+    *,
+    client_secret: str = "",
+    transport: Transport | None = None,
 ) -> KakaoToken:
     """최초 1회: 브라우저 승인으로 받은 인가 코드를 토큰으로 교환 (kakao-auth CLI 용)."""
     send = transport or http_post_form
-    payload = await send(
-        f"{AUTH_HOST}/oauth/token",
-        {},
-        {
-            "grant_type": "authorization_code",
-            "client_id": rest_api_key,
-            "redirect_uri": redirect_uri,
-            "code": code,
-        },
-    )
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": rest_api_key,
+        "redirect_uri": redirect_uri,
+        "code": code,
+    }
+    if client_secret:  # 앱 보안 설정이 '사용함' 이면 없을 때 KOE010
+        form["client_secret"] = client_secret
+    payload = await send(f"{AUTH_HOST}/oauth/token", {}, form)
     if "access_token" not in payload:
         raise RuntimeError(f"kakao auth failed: {payload}")
     return apply_token_response("", payload, time.time())
