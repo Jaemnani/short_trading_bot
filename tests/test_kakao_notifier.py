@@ -12,6 +12,7 @@ from short_trading_bot.infra.notifier.kakao import (
     KakaoToken,
     apply_token_response,
     exchange_auth_code,
+    extract_auth_code,
 )
 
 
@@ -127,6 +128,26 @@ class TestNotify:
         clock["t"] += 61  # 1분 경과 → 윈도 비워짐
         await n.notify("later")
         assert len(transport.calls) == 4
+
+
+class TestExtractAuthCode:
+    """사람이 붙여넣는 형태는 제각각 — 코드만, URL 전체, 따옴표/공백 포함."""
+
+    def test_bare_code_passthrough(self) -> None:
+        assert extract_auth_code("ABC123") == "ABC123"
+
+    def test_full_redirect_url(self) -> None:
+        assert extract_auth_code("http://localhost:8899/kakao?code=ABC123") == "ABC123"
+
+    def test_url_with_extra_params(self) -> None:
+        url = "http://localhost:8899/kakao?code=ABC123&state=x"
+        assert extract_auth_code(url) == "ABC123"
+
+    def test_strips_whitespace_and_quotes(self) -> None:
+        assert extract_auth_code("  'ABC123'  ") == "ABC123"
+
+    def test_query_fragment_only(self) -> None:
+        assert extract_auth_code("?code=ABC123") == "ABC123"
 
 
 class TestAuthCodeExchange:

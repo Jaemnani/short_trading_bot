@@ -181,6 +181,23 @@ class KakaoNotifier(Notifier):
         return await http_post_form(url, headers, data, timeout_seconds=self._timeout)
 
 
+def extract_auth_code(value: str) -> str:
+    """인가 코드 또는 리다이렉트 URL 전체를 받아 코드만 돌려준다.
+
+    승인 후 브라우저 주소창을 통째로 복사하는 게 사람에게 가장 쉬운 동작이라
+    (localhost 수신 서버가 없으면 '연결할 수 없음' 페이지가 뜨지만 URL 에는 code 가 남는다)
+    URL·코드 양쪽을 모두 받는다.
+    """
+    text = value.strip().strip("\"'")
+    if "code=" not in text:
+        return text
+    from urllib.parse import parse_qs, urlparse
+
+    query = urlparse(text).query or text.split("?", 1)[-1]
+    codes = parse_qs(query).get("code")
+    return codes[0] if codes else text
+
+
 async def exchange_auth_code(
     rest_api_key: str, redirect_uri: str, code: str, *, transport: Transport | None = None
 ) -> KakaoToken:

@@ -940,7 +940,7 @@ def preflight() -> None:
 
 
 @app.command("kakao-auth")
-def kakao_auth(port: int = 8899) -> None:
+def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> None:
     """카카오톡 나에게 보내기 최초 1회 승인 — 브라우저 로그인 → 토큰 저장 → 테스트 발송.
 
     사전 준비 (developers.kakao.com, 5분):
@@ -948,14 +948,19 @@ def kakao_auth(port: int = 8899) -> None:
        → .env.local 에 STB_NOTIFIER__KAKAO_REST_API_KEY=<키>
     2) 제품 설정 > 카카오 로그인 활성화 + Redirect URI 에 http://localhost:8899/kakao 등록
     3) 카카오 로그인 > 동의항목에서 '카카오톡 메시지 전송(talk_message)' 활성화
+
+    ``--code``: 브라우저 자동 수신이 안 될 때(원격 셸·방화벽·다른 기기에서 승인 등)
+    리다이렉트된 주소창의 ``?code=...`` 값을 직접 붙여넣는 우회로. 인가 코드는 발급 후
+    10분·1회용이므로 승인 직후 바로 실행할 것.
     """
     import asyncio
+    import time
     import webbrowser
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from pathlib import Path
     from urllib.parse import parse_qs, quote, urlparse
 
-    from ..infra.notifier.kakao import KakaoNotifier, exchange_auth_code
+    from ..infra.notifier.kakao import KakaoNotifier, exchange_auth_code, extract_auth_code
 
     s = _bootstrap()
     key = s.notifier.kakao_rest_api_key
@@ -964,13 +969,36 @@ def kakao_auth(port: int = 8899) -> None:
         raise typer.Exit(1)
 
     redirect_uri = f"http://localhost:{port}/kakao"
+
+    def _save_and_test(auth_code: str) -> None:
+        async def _finish() -> None:
+            token = await exchange_auth_code(key, redirect_uri, auth_code)
+            token.save(Path(s.notifier.kakao_token_path))
+            notifier = KakaoNotifier(key, s.notifier.kakao_token_path)
+            await notifier.notify("kakao.connected", 설명="이제 봇 알림이 이 채널로 옵니다")
+
+        try:
+            asyncio.run(_finish())
+        except Exception as exc:  # 코드 만료/재사용/불일치는 흔한 실사용 실패 — 안내로 받는다
+            typer.echo(f"교환 실패: {exc}")
+            typer.echo("인가 코드는 1회용·10분 유효입니다 — 승인 페이지를 다시 열어 새 코드로 재시도하세요.")
+            raise typer.Exit(1) from exc
+        typer.echo(f"토큰 저장 완료: {s.notifier.kakao_token_path}")
+        typer.echo("카카오톡 '나와의 채팅'에 테스트 메시지가 도착했는지 확인하세요.")
+
+    if code:  # 수동 우회로 — 브라우저 대기 없이 코드만 교환
+        _save_and_test(extract_auth_code(code))
+        return
+
     auth_url = (
         "https://kauth.kakao.com/oauth/authorize"
         f"?client_id={key}&redirect_uri={quote(redirect_uri, safe='')}"
         "&response_type=code&scope=talk_message"
     )
-    typer.echo("브라우저에서 카카오 로그인 후 동의를 눌러주세요. 창이 안 열리면 직접 접속:")
+    typer.echo("브라우저에서 카카오 로그인 후 [동의하고 계속하기]. 창이 안 열리면 직접 접속:")
     typer.echo(f"  {auth_url}")
+    typer.echo(f"(대기 {wait_minutes:g}분. 자동 수신이 안 되면 리다이렉트 주소창의 code= 값으로")
+    typer.echo(" `trader kakao-auth --code <값>` 을 실행하세요.)")
     webbrowser.open(auth_url)
 
     captured: dict[str, str] = {}
@@ -978,33 +1006,35 @@ def kakao_auth(port: int = 8899) -> None:
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             qs = parse_qs(urlparse(self.path).query)
-            captured["code"] = qs.get("code", [""])[0]
-            captured["error"] = qs.get("error", [""])[0]
+            got_code, got_error = qs.get("code", [""])[0], qs.get("error", [""])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write("<h3>승인 완료 — 터미널로 돌아가세요.</h3>".encode())
+            if got_code or got_error:
+                captured["code"], captured["error"] = got_code, got_error
+                body = "<h3>승인 완료 — 터미널로 돌아가세요.</h3>"
+            else:
+                body = "<h3>대기 중…</h3>"  # favicon 등 부수 요청은 소비만 하고 계속 대기
+            self.wfile.write(body.encode())
 
         def log_message(self, format: str, *args: object) -> None:
             pass  # 기본 stderr 액세스 로그 침묵
 
+    deadline = time.monotonic() + wait_minutes * 60
     with HTTPServer(("127.0.0.1", port), _Handler) as server:
-        server.timeout = 300
-        server.handle_request()  # 리다이렉트 1회만 받으면 끝
+        server.timeout = 5.0  # 짧게 끊어 받으며 deadline 을 직접 관리
+        # 콜백 외 부수 요청(favicon 등)이 대기를 소비하지 않도록 코드 수신까지 반복.
+        while not captured and time.monotonic() < deadline:
+            server.handle_request()
 
     if captured.get("error") or not captured.get("code"):
-        typer.echo(f"승인 실패: {captured.get('error') or '코드 미수신 (5분 타임아웃)'}")
+        reason = captured.get("error") or f"코드 미수신 ({wait_minutes:g}분 타임아웃)"
+        typer.echo(f"승인 실패: {reason}")
+        typer.echo("브라우저에서 승인은 됐는데 여기서 못 받았다면 —")
+        typer.echo("  주소창의 code= 값으로 `trader kakao-auth --code <값>` 을 실행하세요.")
         raise typer.Exit(1)
 
-    async def _finish() -> None:
-        token = await exchange_auth_code(key, redirect_uri, captured["code"])
-        token.save(Path(s.notifier.kakao_token_path))
-        notifier = KakaoNotifier(key, s.notifier.kakao_token_path)
-        await notifier.notify("kakao.connected", 설명="이제 봇 알림이 이 채널로 옵니다")
-
-    asyncio.run(_finish())
-    typer.echo(f"토큰 저장 완료: {s.notifier.kakao_token_path}")
-    typer.echo("카카오톡 '나와의 채팅'에 테스트 메시지가 도착했는지 확인하세요.")
+    _save_and_test(captured["code"])
 
 
 @app.command("notify-test")
