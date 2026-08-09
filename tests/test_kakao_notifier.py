@@ -130,6 +130,51 @@ class TestNotify:
         assert len(transport.calls) == 4
 
 
+class TestGrantedScope:
+    """동의항목이 콘솔에서 꺼져 있으면 카카오는 오류 없이 scope 빈 토큰을 준다 —
+    발송 403(-402) 전에 발급 직후 잡아내야 원인이 보인다 (2026-08-09 사고)."""
+
+    async def test_scope_captured_from_exchange(self) -> None:
+        transport = FakeTransport(
+            {
+                AUTH_HOST: {
+                    "access_token": "a",
+                    "refresh_token": "r",
+                    "expires_in": 21600,
+                    "scope": "talk_message profile",
+                }
+            }
+        )
+        token = await exchange_auth_code("key", "uri", "CODE", transport=transport)
+        assert token.has_talk_message
+
+    async def test_missing_scope_detected(self) -> None:
+        transport = FakeTransport(
+            {AUTH_HOST: {"access_token": "a", "refresh_token": "r", "expires_in": 21600}}
+        )
+        token = await exchange_auth_code("key", "uri", "CODE", transport=transport)
+        assert not token.has_talk_message  # scope 없음 = 동의항목 미활성
+
+    def test_scope_survives_refresh_without_scope_field(self) -> None:
+        # 갱신 응답엔 scope 가 통상 없다 — 비우면 이후 진단이 오탐한다.
+        token = apply_token_response(
+            "ref", {"access_token": "a", "expires_in": 21600}, 0.0, prev_scope="talk_message"
+        )
+        assert token.has_talk_message
+
+    def test_scope_persisted(self, tmp_path: Path) -> None:
+        path = tmp_path / "t.json"
+        KakaoToken("a", "r", 1.0, scope="talk_message").save(path)
+        loaded = KakaoToken.load(path)
+        assert loaded is not None and loaded.has_talk_message
+
+    def test_scope_parsing_forms(self) -> None:
+        assert KakaoToken("a", "r", 1.0, scope="talk_message").has_talk_message
+        assert KakaoToken("a", "r", 1.0, scope="profile,talk_message").has_talk_message
+        assert not KakaoToken("a", "r", 1.0, scope="profile").has_talk_message
+        assert not KakaoToken("a", "r", 1.0).has_talk_message
+
+
 class TestClientSecret:
     """앱 [보안] Client Secret 이 '사용함' 이면 발급·갱신 양쪽에 필수 (없으면 KOE010)."""
 

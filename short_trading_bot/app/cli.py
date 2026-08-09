@@ -986,6 +986,15 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
                 key, redirect_uri, auth_code, client_secret=secret
             )
             token.save(Path(s.notifier.kakao_token_path))
+            if not token.has_talk_message:
+                # 콘솔 동의항목이 꺼져 있으면 카카오가 scope 없는 토큰을 조용히 준다 —
+                # 발송 403(-402) 대신 여기서 원인을 짚어준다.
+                raise RuntimeError(
+                    "발급된 토큰에 talk_message 권한이 없습니다 "
+                    f"(부여된 동의항목: {token.scope or '없음'}). "
+                    "제품 설정 > 카카오 로그인 > 동의항목에서 '카카오톡 메시지 전송' 을 "
+                    "'이용 중 동의' 로 켠 뒤 승인을 다시 받아야 합니다."
+                )
             notifier = KakaoNotifier(
                 key, s.notifier.kakao_token_path, client_secret=secret
             )

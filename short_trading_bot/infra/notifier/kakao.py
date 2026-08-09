@@ -44,9 +44,17 @@ class KakaoToken:
     access_token: str
     refresh_token: str
     access_expires_at: float  # epoch seconds
+    # 발급 시 실제로 부여된 동의항목. 콘솔에서 동의항목이 꺼져 있으면 카카오는 인가 코드를
+    # 오류 없이 내주고 scope 만 조용히 비운다 — 발송 단계 403(-402)까지 가서야 드러나므로
+    # 발급 직후 여기서 확인한다 (2026-08-09 사고).
+    scope: str = ""
 
     def needs_refresh(self, now: float) -> bool:
         return now >= self.access_expires_at - _REFRESH_MARGIN_SECONDS
+
+    @property
+    def has_talk_message(self) -> bool:
+        return "talk_message" in self.scope.replace(",", " ").split()
 
     @staticmethod
     def load(path: Path) -> KakaoToken | None:
@@ -56,6 +64,7 @@ class KakaoToken:
                 access_token=str(raw["access_token"]),
                 refresh_token=str(raw["refresh_token"]),
                 access_expires_at=float(raw["access_expires_at"]),
+                scope=str(raw.get("scope", "")),
             )
         except (OSError, KeyError, ValueError):
             return None
@@ -69,6 +78,7 @@ class KakaoToken:
                     "access_token": self.access_token,
                     "refresh_token": self.refresh_token,
                     "access_expires_at": self.access_expires_at,
+                    "scope": self.scope,
                 }
             )
         )
@@ -76,17 +86,19 @@ class KakaoToken:
 
 
 def apply_token_response(
-    prev_refresh_token: str, payload: dict[str, Any], now: float
+    prev_refresh_token: str, payload: dict[str, Any], now: float, *, prev_scope: str = ""
 ) -> KakaoToken:
     """kauth 토큰 응답(최초 발급/갱신 공용)을 KakaoToken 으로.
 
     갱신 응답은 리프레시 토큰 잔여 1개월 미만일 때만 새 refresh_token 을 동봉한다 —
     없으면 기존 것을 유지해야 한다 (없다고 비우면 다음 갱신부터 영구 실패).
+    scope 도 갱신 응답엔 통상 없으므로 같은 규칙으로 이전 값을 보존한다.
     """
     return KakaoToken(
         access_token=str(payload["access_token"]),
         refresh_token=str(payload.get("refresh_token") or prev_refresh_token),
         access_expires_at=now + float(payload["expires_in"]),
+        scope=str(payload.get("scope") or prev_scope),
     )
 
 
@@ -174,7 +186,9 @@ class KakaoNotifier(Notifier):
             if self._client_secret:  # 앱 보안 설정이 '사용함' 이면 갱신에도 필수
                 form["client_secret"] = self._client_secret
             payload = await self._transport(f"{AUTH_HOST}/oauth/token", {}, form)
-            self._token = apply_token_response(self._token.refresh_token, payload, now)
+            self._token = apply_token_response(
+                self._token.refresh_token, payload, now, prev_scope=self._token.scope
+            )
             self._token.save(self._path)
             self._log.info("kakao.token_refreshed")
         return self._token
