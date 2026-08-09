@@ -950,8 +950,12 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
        ※ 2026 콘솔 개편으로 위치가 '제품 설정 > 카카오 로그인' 에서 여기로 이동했다.
          미등록 시 승인 페이지가 KOE006 (앱 관리자 설정 오류) 로 막힌다.
        ※ 키를 복사한 그 앱에 등록해야 한다 — 다른 앱에 등록하면 계속 KOE006.
-    3) 제품 설정 > 카카오 로그인 활성화 ON
-    4) 카카오 로그인 > 동의항목에서 '카카오톡 메시지 전송(talk_message)' 활성화
+    3) 같은 REST API 키 상세의 [클라이언트 시크릿] 값을
+       → .env.local 에 STB_NOTIFIER__KAKAO_CLIENT_SECRET=<값>
+       ※ 신규 REST API 키는 이 기능이 기본 활성화 상태로 발급된다. 빠뜨리면 토큰 교환이
+         KOE010 (Bad client credentials) 로 거부된다. 개편 콘솔에 별도 [보안] 메뉴는 없다.
+    4) 제품 설정 > 카카오 로그인 활성화 ON
+    5) 카카오 로그인 > 동의항목에서 '카카오톡 메시지 전송(talk_message)' 활성화
 
     ``--code``: 브라우저 자동 수신이 안 될 때(원격 셸·방화벽·다른 기기에서 승인 등)
     리다이렉트된 주소창의 ``?code=...`` 값을 직접 붙여넣는 우회로. 인가 코드는 발급 후
@@ -993,8 +997,10 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
             typer.echo(f"교환 실패: {exc}")
             if "KOE010" in str(exc):
                 typer.echo(
-                    "→ 앱 [보안] 의 Client Secret 이 '사용함' 입니다. 그 값을 .env.local 의 "
-                    "STB_NOTIFIER__KAKAO_CLIENT_SECRET 에 넣거나, 콘솔에서 '사용 안 함' 으로 바꾸세요."
+                    "→ 클라이언트 시크릿 누락/불일치입니다. [앱] > [플랫폼 키] > [REST API 키] 상세의 "
+                    "[클라이언트 시크릿] 값을 .env.local 의 "
+                    "STB_NOTIFIER__KAKAO_CLIENT_SECRET 에 넣으세요 "
+                    "(신규 REST API 키는 이 기능이 기본 활성화라 대개 필수)."
                 )
             else:
                 typer.echo(
