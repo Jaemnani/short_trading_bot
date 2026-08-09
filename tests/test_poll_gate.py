@@ -51,6 +51,29 @@ class TestSessionWindow:
         assert gate.in_session(datetime(2026, 8, 7, 0, 0, tzinfo=UTC))  # 금 09:00 KST
 
 
+class TestHolidays:
+    """공휴일 평일은 장이 열리지 않는다 — 표에 있으면 쉬고, 없는 연도는 평일 취급(백오프가 완화)."""
+
+    def test_known_holiday_weekday_is_idle(self) -> None:
+        gate = PollGate()
+        assert not gate.in_session(_kst(2026, 10, 9, 10, 0))  # 한글날 (금)
+        assert not gate.in_session(_kst(2026, 5, 5, 10, 0))  # 어린이날 (화)
+
+    def test_day_before_and_after_holiday_is_session(self) -> None:
+        gate = PollGate()
+        assert gate.in_session(_kst(2026, 10, 8, 10, 0))  # 목
+        assert gate.in_session(_kst(2026, 10, 12, 10, 0))  # 월
+
+    def test_holiday_outside_window_still_idle(self) -> None:
+        gate = PollGate()
+        assert not gate.in_session(_kst(2026, 10, 9, 3, 0))
+
+    def test_unknown_year_degrades_to_weekday(self) -> None:
+        # 표를 갱신 안 한 미래 연도는 평일로 취급 — 안전한 열화(백오프가 60s 로 누름).
+        gate = PollGate()
+        assert gate.in_session(_kst(2030, 1, 1, 10, 0))  # 화요일
+
+
 class TestBackoff:
     def test_no_failures_uses_base(self) -> None:
         gate = PollGate(base_seconds=2.0)

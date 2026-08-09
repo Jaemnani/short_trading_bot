@@ -167,6 +167,7 @@ def serve(
                     ok = False
                     log.exception("fill_poll.error")
                 gate.record(ok)
+                service.health.on_poll(ok, now)
                 if not ok and gate.consecutive_failures in (1, 5):
                     # 백오프 진입/지속을 한눈에 — 매 실패마다가 아니라 이정표만.
                     log.warning(
@@ -492,6 +493,37 @@ def serve(
                     log.exception("daily_summary.error")
             await asyncio.sleep(300)
 
+    async def _feed_watchdog() -> None:
+        """장중 시세 무소식 감시 — 엔진이 살아서 '관망만' 하는 조용한 고장을 잡는다.
+
+        WS 가 끊기면 재접속 루프가 돌지만, 접속은 됐는데 데이터가 안 오는 경우
+        (구독 실패·서버측 무응답)는 어디에도 안 잡힌다. 화면·알림 모두 정상으로 보인다."""
+        from datetime import datetime
+
+        from ..execution.poll_gate import KST
+
+        alerted = False
+        while True:
+            await asyncio.sleep(60)
+            now = datetime.now(KST)
+            try:
+                ok = service.health.feed_ok(now)
+                if not ok and not alerted:
+                    alerted = True
+                    stale = service.health.feed_stale_seconds(now)
+                    log.warning("feed.stale", stale_seconds=stale)
+                    await notifier.notify(
+                        "feed.stale",
+                        무소식=(f"{stale / 60:.0f}분" if stale is not None else "봉 없음"),
+                        조치="시세 연결 확인 필요",
+                    )
+                elif ok and alerted:
+                    alerted = False  # 회복 시 다음 이상을 다시 알릴 수 있게
+                    log.info("feed.recovered")
+                    await notifier.notify("feed.recovered", 상태="시세 수신 정상화")
+            except Exception:
+                log.exception("feed_watchdog.error")
+
     async def _status_loop() -> None:
         """엔진 현황을 5초마다 data/engine_status.json에 기록 — 대시보드의 실시간 소스."""
         import json as _json
@@ -581,6 +613,7 @@ def serve(
         eod_task = asyncio.create_task(_eod_cache_loop(auth))
         status_task = asyncio.create_task(_status_loop())
         control_task = asyncio.create_task(_control_loop())
+        feed_watch_task = asyncio.create_task(_feed_watchdog())
         from ..market.bar_builder import BarBuilder
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
@@ -608,6 +641,7 @@ def serve(
                         # 복구 조회의 일시 실패(REST 5xx 등)로 엔진이 죽으면 안 된다 —
                         # 2026-08-03 해외 잔고 500이 여기서 미보호로 전파돼 나흘 다운.
                         log.exception("reconnect_recover.error")
+                service.health.on_feed_connect()
                 log.info("feed.reconnect", delay_seconds=5)
                 await asyncio.sleep(5)
         finally:
@@ -620,6 +654,7 @@ def serve(
             eod_task.cancel()
             status_task.cancel()
             control_task.cancel()
+            feed_watch_task.cancel()
 
     asyncio.run(_run())
     if service.control.is_stopped:

@@ -74,6 +74,18 @@ export interface OpenLot {
   initial_stop: string | null;
 }
 
+export interface Health {
+  in_session: boolean;
+  feed_ok: boolean;
+  last_bar_at: string | null;
+  last_bar_ticker: string | null;
+  feed_stale_seconds: number | null;
+  bars_received: number;
+  feed_connects: number;
+  last_poll_ok_at: string | null;
+  poll_failures: number;
+}
+
 export interface EngineSnapshot {
   ts: string;
   control: string;
@@ -83,6 +95,7 @@ export interface EngineSnapshot {
   daily_date: string | null;
   open_lots: OpenLot[];
   watching: { ticker: string; resolution: string; strategy: string }[];
+  health?: Health; // 구버전 엔진 스냅샷 호환 (없을 수 있음)
 }
 
 export interface FillRow {

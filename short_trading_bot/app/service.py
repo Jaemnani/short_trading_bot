@@ -49,6 +49,7 @@ from ..risk.limits import RiskSnapshot
 from ..risk.manager import RiskManager
 from ..strategy.registry import create_strategy
 from ..strategy.templates import StrategyTemplate
+from .health import EngineHealth
 
 _ENTRY_KINDS = (IntentKind.ENTER, IntentKind.ADD)
 
@@ -118,6 +119,8 @@ class TradingService:
         self._lots: dict[str, PositionLot] = {}
         self._prev: dict[str, IndicatorSnapshot] = {}
         self._last_price: dict[str, Decimal] = {}
+        # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
+        self.health = EngineHealth()
         self._co_map: dict[str, _PendingOrder] = {}
         self._pending: dict[tuple[str, Side], str] = {}  # in-flight order per (lot, side)
         self._fx_rates = fx_rates or FxRates()
@@ -303,6 +306,7 @@ class TradingService:
             "daily_date": str(self._daily_date) if self._daily_date is not None else None,
             "open_lots": open_lots,
             "watching": watching,
+            "health": self.health.snapshot(datetime.now(UTC)),
         }
 
     def make_fill_poller(self) -> FillPoller:
@@ -323,6 +327,7 @@ class TradingService:
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close
+        self.health.on_bar(bar.ticker, datetime.now(UTC))
         if self._regime is not None and bar.ticker == self._regime.proxy_ticker:
             self._regime.on_proxy_bar(bar.ts.date(), bar.close)
         bar_day = bar.ts.date()
