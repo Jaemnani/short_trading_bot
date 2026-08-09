@@ -1054,7 +1054,15 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
             pass  # 기본 stderr 액세스 로그 침묵
 
     deadline = time.monotonic() + wait_minutes * 60
-    with HTTPServer(("127.0.0.1", port), _Handler) as server:
+    try:
+        server_ctx = HTTPServer(("127.0.0.1", port), _Handler)
+    except OSError as exc:  # 다른 프로세스가 그 포트를 쓰는 중 (직접 띄운 http.server 등)
+        typer.echo(f"포트 {port} 를 열 수 없습니다: {exc}")
+        typer.echo(f"  이미 무언가 {port} 를 쓰고 있습니다 — 그 프로세스를 끄거나,")
+        typer.echo("  승인 후 주소창의 code= 값으로 `trader kakao-auth --code <값>` 을 쓰세요")
+        typer.echo("  (리다이렉트 URI 가 그 포트로 등록돼 있으므로 포트 변경은 재등록이 필요).")
+        raise typer.Exit(1) from exc
+    with server_ctx as server:
         server.timeout = 5.0  # 짧게 끊어 받으며 deadline 을 직접 관리
         # 콜백 외 부수 요청(favicon 등)이 대기를 소비하지 않도록 코드 수신까지 반복.
         while not captured and time.monotonic() < deadline:
