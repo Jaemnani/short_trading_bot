@@ -82,6 +82,7 @@ export interface Health {
   feed_stale_seconds: number | null;
   bars_received: number;
   feed_connects: number;
+  process_errors: number;
   last_poll_ok_at: string | null;
   poll_failures: number;
 }

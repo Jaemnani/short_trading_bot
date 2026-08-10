@@ -224,7 +224,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             <div style={{ minWidth: 150 }}>
               <div style={{ opacity: 0.7 }}>누적 수신 봉</div>
               <div style={{ fontWeight: 600 }}>{health.bars_received.toLocaleString()}</div>
-              <div style={{ opacity: 0.6, fontSize: 12 }}>재접속 {health.feed_connects}회</div>
+              <div style={{ opacity: 0.6, fontSize: 12 }}>
+                재접속 {health.feed_connects}회
+                {health.process_errors > 0 && ` · 처리실패 ${health.process_errors}`}
+              </div>
             </div>
           </div>
         </div>

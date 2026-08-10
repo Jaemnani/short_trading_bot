@@ -16,10 +16,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-import httpx
-
 from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
+from ...infra.http import shared_client
 from ...infra.kis_auth import KisAuth
 from ..fees import KRX_FEES, FeeModel
 from ..types import (
@@ -260,11 +259,13 @@ class KisBrokerAdapter(BrokerAdapter):
     async def _default_transport(
         self, method: str, url: str, headers: dict[str, str], payload: dict[str, Any]
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            if method == "GET":
-                resp = await client.get(url, headers=headers, params=payload)
-            else:
-                resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-            return data
+        # 공용 클라이언트 (커넥션·DNS 재사용). 호출마다 새로 만들면 하루 수만 번의 DNS
+        # 조회로 리졸버가 실패하고, 그 예외가 시세 연결까지 끊는다 — infra/http.py 참조.
+        client = shared_client(self._timeout)
+        if method == "GET":
+            resp = await client.get(url, headers=headers, params=payload, timeout=self._timeout)
+        else:
+            resp = await client.post(url, headers=headers, json=payload, timeout=self._timeout)
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data

@@ -339,7 +339,15 @@ class TradingService:
 
     async def run(self, feed: Feed) -> None:
         async for bar in feed.stream():
-            await self.process(bar)
+            try:
+                await self.process(bar)
+            except Exception:
+                # 봉 1개의 처리 실패(대개 REST 일시 장애)가 시세 연결을 끊으면 안 된다.
+                # 끊기면 재접속 5초 동안 **모든 종목**의 관리가 멈추고, 그 사이 손절·익절
+                # 신호도 놓친다 — 국소 실패가 전면 중단으로 증폭되는 구조였다.
+                # 2026-08-10 실측: 재접속 219회 중 194회가 이 경로(DNS/REST 오류)였다.
+                self.health.on_process_error()
+                self._log.exception("process.error", ticker=bar.ticker)
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close

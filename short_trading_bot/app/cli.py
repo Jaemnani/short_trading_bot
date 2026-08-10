@@ -664,6 +664,9 @@ def serve(
             status_task.cancel()
             control_task.cancel()
             feed_watch_task.cancel()
+            from ..infra.http import close_shared_client
+
+            await close_shared_client()
 
     asyncio.run(_run())
     if service.control.is_stopped:

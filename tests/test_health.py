@@ -74,6 +74,17 @@ class TestPollHealth:
         assert h.last_poll_ok_at is None
 
 
+class TestProcessErrors:
+    """봉 처리 실패는 시세 연결을 끊지 않고 격리하되, 조용히 삼키지 않고 누적 노출한다."""
+
+    def test_counter_accumulates_and_surfaces(self) -> None:
+        h = EngineHealth()
+        assert h.snapshot(_kst(10, 0))["process_errors"] == 0
+        h.on_process_error()
+        h.on_process_error()
+        assert h.snapshot(_kst(10, 0))["process_errors"] == 2
+
+
 class TestSnapshot:
     def test_snapshot_shape_and_values(self) -> None:
         h = EngineHealth()

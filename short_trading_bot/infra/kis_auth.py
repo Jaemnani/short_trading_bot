@@ -12,9 +12,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-import httpx
-
 from .config import KisEnvCreds
+from .http import shared_client
 
 TokenFetcher = Callable[[], Awaitable[tuple[str, int]]]  # -> (access_token, expires_in_seconds)
 ApprovalFetcher = Callable[[], Awaitable[str]]
@@ -73,29 +72,30 @@ class KisAuth:
     # -- default network fetchers ---------------------------------------
 
     async def _default_token_fetch(self) -> tuple[str, int]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._base_url}/oauth2/tokenP",
-                json={
-                    "grant_type": "client_credentials",
-                    "appkey": self._creds.app_key,
-                    "appsecret": self._creds.app_secret,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["access_token"], int(data.get("expires_in", 86400))
+        # 공용 클라이언트 — 호출당 DNS/TLS 재수립 방지 (infra/http.py 참조).
+        resp = await shared_client(self._timeout).post(
+            f"{self._base_url}/oauth2/tokenP",
+            json={
+                "grant_type": "client_credentials",
+                "appkey": self._creds.app_key,
+                "appsecret": self._creds.app_secret,
+            },
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["access_token"], int(data.get("expires_in", 86400))
 
     async def _default_approval_fetch(self) -> str:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._base_url}/oauth2/Approval",
-                json={
-                    "grant_type": "client_credentials",
-                    "appkey": self._creds.app_key,
-                    "secretkey": self._creds.app_secret,  # NOTE: 'secretkey', not 'appsecret'
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return str(data["approval_key"])
+        resp = await shared_client(self._timeout).post(
+            f"{self._base_url}/oauth2/Approval",
+            json={
+                "grant_type": "client_credentials",
+                "appkey": self._creds.app_key,
+                "secretkey": self._creds.app_secret,  # NOTE: 'secretkey', not 'appsecret'
+            },
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return str(data["approval_key"])

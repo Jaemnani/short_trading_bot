@@ -34,6 +34,7 @@ class EngineHealth:
     last_poll_ok_at: datetime | None = None
     poll_failures: int = 0
     feed_connects: int = 0  # WS 재접속 횟수 (많으면 회선 불안정)
+    process_errors: int = 0  # 봉 처리 실패 누적 (격리되지만 쌓이면 원인 조사 필요)
     _gate: PollGate = field(default_factory=PollGate)
 
     def on_bar(self, ticker: str, now: datetime) -> None:
@@ -50,6 +51,10 @@ class EngineHealth:
 
     def on_feed_connect(self) -> None:
         self.feed_connects += 1
+
+    def on_process_error(self) -> None:
+        """봉 처리 실패 — 시세 연결은 유지하고 여기 누적해 가시화한다 (조용히 삼키지 않음)."""
+        self.process_errors += 1
 
     def in_session(self, now: datetime) -> bool:
         return self._gate.in_session(now)
@@ -80,6 +85,7 @@ class EngineHealth:
             "feed_stale_seconds": round(stale, 1) if stale is not None else None,
             "bars_received": self.bars_received,
             "feed_connects": self.feed_connects,
+            "process_errors": self.process_errors,
             "last_poll_ok_at": (
                 self.last_poll_ok_at.isoformat() if self.last_poll_ok_at else None
             ),

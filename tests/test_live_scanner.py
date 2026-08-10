@@ -30,6 +30,52 @@ async def test_add_template_spawns_on_next_bar(sf) -> None:
     assert svc.add_template("123450@scan1d", _template("1D"))  # 다른 해상도는 허용
 
 
+class TestFeedIsolation:
+    """봉 처리 실패가 시세 스트림을 끊으면 안 된다.
+
+    2026-08-10 실측: 재접속 219회 중 194회가 REST 오류(DNS 실패 등)가 process() 를 타고
+    올라와 WS 연결을 무너뜨린 것. 끊기면 재접속 5초 동안 전 종목의 손절·익절 관리가 멈춘다."""
+
+    async def test_process_failure_does_not_stop_stream(self, sf) -> None:
+        from datetime import UTC, datetime
+
+        from short_trading_bot.market.types import Bar
+
+        svc = _service(sf)
+        c = Decimal("10000")
+        bars = [
+            Bar(
+                ticker="123450", resolution=Resolution.M5,
+                ts=datetime(2026, 7, 13, 1, m, tzinfo=UTC),
+                open=c, high=c, low=c, close=c, volume=Decimal("100"), value=c * 100,
+            )
+            for m in (0, 5, 10)
+        ]
+
+        seen: list[int] = []
+        calls = {"n": 0}
+        original = svc.process
+
+        async def flaky(bar: Bar) -> None:
+            calls["n"] += 1
+            if calls["n"] == 2:  # 두 번째 봉만 REST 장애로 실패한다고 가정
+                raise ConnectionError("DNS 실패 흉내")
+            await original(bar)
+            seen.append(calls["n"])
+
+        svc.process = flaky  # type: ignore[method-assign]
+
+        class _Feed:
+            async def stream(self):  # type: ignore[no-untyped-def]
+                for b in bars:
+                    yield b
+
+        await svc.run(_Feed())  # 예외가 새어 나오면 여기서 터진다
+        assert calls["n"] == 3  # 실패 후에도 세 번째 봉까지 계속 처리
+        assert seen == [1, 3]
+        assert svc.health.process_errors == 1  # 조용히 삼키지 않고 계수
+
+
 class TestTrackedTickers:
     """재접속 구독 목록의 근거. 2026-08-10 사고: 스캐너 합류분이 정적 리스트에 없어
     첫 재접속(합류 6분 뒤)에 시세를 잃고 6시간 반 깜깜이 → 진입 불가."""
