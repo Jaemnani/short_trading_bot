@@ -136,6 +136,14 @@ def serve(
     )
     feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
+    def _subscriptions() -> list[str]:
+        """지금 시세가 필요한 종목 전부 — 매 (재)접속마다 새로 계산한다.
+
+        tickers(설정 워치리스트 + 레짐 프록시) + service 가 추적 중인 종목(스캐너 합류·보유).
+        정적 리스트만 쓰면 합류분이 재접속에서 유실되고, 합류분을 리스트에 쌓기만 하면
+        만료분이 안 빠져 구독 한도를 채운다 — 파생이 양쪽을 동시에 푼다."""
+        return sorted(set(tickers) | service.tracked_tickers())
+
     async def _poll_loop(poller: object) -> None:
         from datetime import datetime
 
@@ -348,11 +356,11 @@ def serve(
                 f"{pick.ticker}@scan", scanner_cfg.template(), one_shot=not scanner_cfg.rejoin
             ):
                 return False
+            # 현재 연결에는 즉시 구독. 재접속 후에는 _subscriptions() 가 service 상태에서
+            # 다시 파생시키므로 별도 목록 관리가 필요 없다 (합류분 유실·누적 둘 다 방지).
             feed = feed_ref["feed"]
             if feed is not None:
                 await feed.subscribe(pick.ticker)
-            elif pick.ticker not in tickers:
-                tickers.append(pick.ticker)
             await notifier.notify(
                 "scanner.joined", ticker=pick.ticker, name=pick.name,
                 change_pct=f"{pick.change_pct:.1f}", vol_surge=f"{pick.vol_surge:.0f}",
@@ -393,7 +401,8 @@ def serve(
                     ):
                         capacity = 0  # 시장 레짐 나쁨 → 이번 주기 합류 없음 (기존 랏 관리는 계속)
                     # KIS WS 등록 한도(~41) 보호: 여유 없으면 이번 주기는 건너뜀.
-                    if capacity > 0 and len(tickers) < 40:
+                    # 합류분까지 세는 실제 구독 수로 판정 (tickers 만 세면 과소계상 → 한도 초과).
+                    if capacity > 0 and len(_subscriptions()) < 40:
                         rows = await ranking.top()
                         if scanner_cfg.record_rankings and rows:
                             _record_rankings(now, rows)  # 사후 검증/재시뮬레이션용 스냅샷
@@ -566,9 +575,8 @@ def serve(
 
     async def _run() -> None:
         restored = await service.hydrate()
-        # 스캐너로 합류했던(워치리스트 밖) 열린 랏도 재시작 후 시세를 받아야 관리된다.
-        for extra in sorted(service.open_tickers() - set(tickers)):
-            tickers.append(extra)
+        # 스캐너로 합류했던(워치리스트 밖) 열린 랏의 시세는 _subscriptions() 가 파생시킨다 —
+        # 여기서 tickers 에 영구 추가하면 랏 청산 후에도 구독이 남아 한도를 잠식한다.
         if live_exec:
             report = await service.reconcile()
             if not report.in_sync:
@@ -592,7 +600,7 @@ def serve(
         log.info(
             "engine.start",
             mode=s.mode.value,
-            tickers=len(tickers),
+            tickers=len(_subscriptions()),
             entries=len(watchlist),
             resolutions=[r.value for r in resolutions],
             restored=restored,
@@ -622,8 +630,9 @@ def serve(
             # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
             while not service.control.is_stopped:
                 approval = await auth.approval_key()
+                subs = _subscriptions()  # 재접속마다 최신 목록 (합류분 포함·만료분 제외)
                 feed = KisWebSocketFeed(
-                    approval, tickers, resolutions[0], ws_url=kis_ws_url(s.mode),
+                    approval, subs, resolutions[0], ws_url=kis_ws_url(s.mode),
                     bar_builders=shared_builders, flush_on_close=False,
                 )
                 feed_ref["feed"] = feed  # 스캐너가 현재 연결에 동적 구독할 수 있도록

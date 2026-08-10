@@ -266,6 +266,22 @@ class TradingService:
         """현재 열린(청산 안 된) 랏들의 티커 — 재시작 시 WS 구독 목록에 포함해야 한다."""
         return {lot.ticker for lot in self._lots.values() if lot.is_open}
 
+    def tracked_tickers(self) -> set[str]:
+        """전략이 붙어 있거나 랏이 살아 있는 모든 티커 = WS 구독 대상.
+
+        WS 재접속은 매번 새 연결이라 구독을 다시 걸어야 하는데, 그 목록을 정적 리스트로
+        들고 있으면 스캐너로 합류한 종목이 재접속 순간 시세를 잃는다 (2026-08-10 실사고:
+        유니켐 09:06 합류 → 09:12 재접속에서 유실 → 6시간 반 깜깜이 → 진입 불가).
+        반대로 합류분을 리스트에 계속 쌓기만 하면 만료된 종목이 안 빠져 구독 한도(~41)를
+        채운다. 그래서 '지금 실제로 필요한 목록' 을 서비스 상태에서 매번 파생시킨다.
+
+        **보유(open)가 아니라 살아 있는 랏 전부**를 넣는다. 관망(WATCHING) 랏이야말로
+        진입 판단에 봉이 필요하고, 시세가 끊기면 당일 만료 판정(`_expire_scan_lot`)조차
+        봉이 없어 못 돌아 랏이 영구히 남는 악순환이 생긴다 (실측: 관망 12 중 6이 미구독
+        상태로 잔존). 구독이 붙으면 만료가 정상 작동해 스스로 정리된다."""
+        lot_tickers = {lot.ticker for lot in self._lots.values()}
+        return {ticker for ticker, tmpls in self._by_ticker.items() if tmpls} | lot_tickers
+
     async def status_snapshot(self) -> dict[str, object]:
         """대시보드용 실시간 현황 — 엔진이 주기적으로 파일에 기록해 API 프로세스가 읽는다.
 

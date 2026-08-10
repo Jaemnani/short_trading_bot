@@ -30,6 +30,64 @@ async def test_add_template_spawns_on_next_bar(sf) -> None:
     assert svc.add_template("123450@scan1d", _template("1D"))  # 다른 해상도는 허용
 
 
+class TestTrackedTickers:
+    """재접속 구독 목록의 근거. 2026-08-10 사고: 스캐너 합류분이 정적 리스트에 없어
+    첫 재접속(합류 6분 뒤)에 시세를 잃고 6시간 반 깜깜이 → 진입 불가."""
+
+    async def test_scanner_joined_ticker_is_tracked(self, sf) -> None:
+        svc = _service(sf)
+        assert "123450" not in svc.tracked_tickers()
+        svc.add_template("123450@scan", _template())
+        # 재접속 시 이 목록으로 구독을 다시 걸어야 시세가 유지된다.
+        assert "123450" in svc.tracked_tickers()
+
+    async def test_watchlist_tickers_are_tracked(self, sf) -> None:
+        svc = _service(sf)
+        svc.add_template("005930@1", _template())
+        svc.add_template("000660@1", _template("1D"))
+        assert {"005930", "000660"} <= svc.tracked_tickers()
+
+    async def test_multiple_resolutions_same_ticker_appear_once(self, sf) -> None:
+        svc = _service(sf)
+        svc.add_template("123450@a", _template("5m"))
+        svc.add_template("123450@b", _template("1D"))
+        assert [t for t in svc.tracked_tickers() if t == "123450"] == ["123450"]
+
+    async def test_watching_lot_is_tracked_not_just_open(self, sf) -> None:
+        """관망(미진입) 랏도 구독 대상 — 진입 판단에 봉이 필요하고, 봉이 없으면
+        당일 만료 판정조차 못 돌아 랏이 영구히 남는다 (2026-08-10 실측: 관망 12 중 6 미구독)."""
+        from datetime import UTC, datetime
+
+        from short_trading_bot.market.types import Bar
+
+        svc = _service(sf)
+        assert svc.add_template("123450@scan", _template())
+        c = Decimal("10000")
+        await svc.process(
+            Bar(
+                ticker="123450", resolution=Resolution.M5,
+                ts=datetime(2026, 7, 13, 1, 0, tzinfo=UTC),
+                open=c, high=c, low=c, close=c, volume=Decimal("100"), value=c * 100,
+            )
+        )  # 관망 랏 스폰 (보유 아님)
+        assert "123450" not in svc.open_tickers()  # 아직 미진입
+        assert "123450" in svc.tracked_tickers()  # 그래도 시세는 받아야 한다
+
+        # 템플릿이 은퇴해도 랏이 살아 있으면 계속 구독 (만료 판정에 봉이 필요).
+        svc._remove_template("123450", svc._by_ticker["123450"][0])
+        assert "123450" in svc.tracked_tickers()
+
+    async def test_retired_template_drops_out(self, sf) -> None:
+        """만료(one-shot 당일 종료)된 합류분은 목록에서 빠져야 한다 —
+        안 빠지면 날마다 쌓여 WS 구독 한도(~41)를 채우고 신규 합류가 조용히 멈춘다."""
+        svc = _service(sf)
+        tmpl = _template()
+        svc.add_template("123450@scan", tmpl)
+        assert "123450" in svc.tracked_tickers()
+        svc._remove_template("123450", tmpl)  # _expire_scan_lot 이 타는 경로
+        assert "123450" not in svc.tracked_tickers()
+
+
 async def test_scanner_config_from_json(tmp_path) -> None:
     p = tmp_path / "wl.json"
     p.write_text(json.dumps({
