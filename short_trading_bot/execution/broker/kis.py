@@ -34,6 +34,19 @@ from .market_router import MarketRouter
 
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
 
+
+class KisApiError(RuntimeError):
+    """KIS REST 실패 — 상태코드와 본문(msg_cd/msg1)을 보존한다.
+
+    본문이 없으면 '왜 500 인가'(초당 한도 초과 / TR 미지원 / 서버 장애)를 구분할 수 없다."""
+
+    def __init__(self, status: int, url: str, body: str) -> None:
+        self.status = status
+        self.url = url
+        self.body = body
+        path = url.split("/uapi")[-1].split("?")[0]
+        super().__init__(f"KIS HTTP {status} {path}: {body}")
+
 _ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 _CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -266,6 +279,10 @@ class KisBrokerAdapter(BrokerAdapter):
             resp = await client.get(url, headers=headers, params=payload, timeout=self._timeout)
         else:
             resp = await client.post(url, headers=headers, json=payload, timeout=self._timeout)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # KIS 는 실패 사유를 본문(msg_cd/msg1)에만 담는다. raise_for_status 만 쓰면
+            # 로그에 "500" 만 남아 원인(초당 한도 초과인지 서버 장애인지)을 알 수 없다 —
+            # 2026-08-10 장중 체결조회 356회 실패의 사유를 끝내 못 밝힌 이유.
+            raise KisApiError(resp.status_code, url, resp.text[:300])
         data: dict[str, Any] = resp.json()
         return data

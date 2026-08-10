@@ -15,6 +15,7 @@ This matters because KIS allows a single concurrent WS connection per appkey.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -52,6 +53,10 @@ from ..strategy.templates import StrategyTemplate
 from .health import EngineHealth
 
 _ENTRY_KINDS = (IntentKind.ENTER, IntentKind.ADD)
+
+# 대시보드 스냅샷은 5초마다 쓰이지만 잔고 REST 조회는 그보다 훨씬 느리게 해도 된다.
+# 24시간 5초 주기 = 하루 ~17,000회로 KIS 초당 한도를 갉아먹어 체결 조회를 밀어낸다.
+EQUITY_TTL_SECONDS = 30.0
 
 # An order in one of these states can no longer fill; its (lot, side) lock is releasable.
 _TERMINAL_ORDER_STATES = frozenset(
@@ -121,6 +126,8 @@ class TradingService:
         self._last_price: dict[str, Decimal] = {}
         # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
         self.health = EngineHealth()
+        self._equity_cache: Decimal | None = None
+        self._equity_at = 0.0  # monotonic
         self._co_map: dict[str, _PendingOrder] = {}
         self._pending: dict[tuple[str, Side], str] = {}  # in-flight order per (lot, side)
         self._fx_rates = fx_rates or FxRates()
@@ -285,12 +292,12 @@ class TradingService:
     async def status_snapshot(self) -> dict[str, object]:
         """대시보드용 실시간 현황 — 엔진이 주기적으로 파일에 기록해 API 프로세스가 읽는다.
 
-        equity(브로커 잔고 조회)는 일시 실패해도 나머지 현황은 제공한다 (None 표기)."""
-        equity: Decimal | None
-        try:
-            equity = await self._equity()
-        except Exception:
-            equity = None
+        equity(브로커 잔고 조회)는 일시 실패해도 나머지 현황은 제공한다 (None 표기).
+
+        잔고는 캐시한다: 스냅샷은 5초마다 쓰이지만 잔고 조회는 REST 왕복이라 하루 약
+        17,000회가 되고(24시간), KIS 초당 한도를 갉아먹어 체결 조회 같은 필수 호출의
+        실패율을 올린다. 평가금은 보유 랏 시가평가가 대부분이라 30초 캐시로 충분하다."""
+        equity = await self._cached_equity()
         open_lots: list[dict[str, object]] = []
         watching: list[dict[str, object]] = []
         for lot in sorted(self._lots.values(), key=lambda x: (x.ticker, x.params.resolution.value)):
@@ -700,6 +707,20 @@ class TradingService:
             self._fx_warned.add(currency)
             self._log.warning("fx.missing_rate", currency=currency.value)
         return rate
+
+    async def _cached_equity(self) -> Decimal | None:
+        """평가금 — 최대 EQUITY_TTL_SECONDS 동안 캐시. 실패 시 직전 값을 유지한다.
+
+        조회 실패마다 화면이 '—' 로 깜빡이면 오히려 이상해 보인다. 값이 아주 없을 때만 None."""
+        now = time.monotonic()
+        if self._equity_cache is not None and now - self._equity_at < EQUITY_TTL_SECONDS:
+            return self._equity_cache
+        try:
+            self._equity_cache = await self._equity()
+            self._equity_at = now
+        except Exception:
+            self._log.warning("equity.refresh_failed")  # 직전 값 유지 (있으면)
+        return self._equity_cache
 
     async def _equity(self) -> Decimal:
         balance = await self._broker.get_balance()
