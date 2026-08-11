@@ -36,6 +36,7 @@ from ..execution.fill_poller import FillPoller
 from ..execution.fx import FxRates
 from ..execution.order_manager import OrderManager
 from ..execution.reconciler import Reconciler, ReconcileReport
+from ..execution.tick_size import round_to_tick
 from ..execution.types import Fill, OrderRequest
 from ..execution.unknown_resolver import UnknownOrderResolver
 from ..infra.logging import get_logger
@@ -444,6 +445,9 @@ class TradingService:
             # still go out (RiskManager always allows them, so the notional is unused).
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason="missing_fx_rate")
             return
+        # 주문 가격은 **사이징 전에** 호가단위로 정렬한다. 정렬을 주문 직전에 하면
+        # 매수 올림 때문에 qty x price 가 max_order_notional 을 넘어 한도가 깨진다.
+        order_px = bar.close if lot.market.is_overseas else round_to_tick(bar.close, intent.side)
         if intent.kind in _ENTRY_KINDS:
             # 시장 레짐 필터: 시장 날씨가 나쁜 날은 신규 진입 금지 (청산은 무관).
             if (
@@ -458,7 +462,7 @@ class TradingService:
             # 전략 사이징(risk_per_trade)이 max_order_notional을 넘으면 관망 대신 한도에
             # 맞춰 수량을 축소 진입한다 — 하드 블록이면 한도 < 사이징인 조합은 영원히
             # 매매가 없어 포워드 테스트가 공전한다.
-            capped = self._cap_entry_qty(qty, lot, bar.close, fx_rate)
+            capped = self._cap_entry_qty(qty, lot, order_px, fx_rate)
             if capped < qty:
                 if intent.kind is IntentKind.ENTER:
                     lot.rebase_entry_qty(capped)  # TP 분할 기준도 실제 주문 수량으로
@@ -475,14 +479,14 @@ class TradingService:
         decision = self._risk.check(
             intent_kind=intent.kind,
             ticker=lot.ticker,
-            order_notional=bar.close * qty * fx_rate,
+            order_notional=order_px * qty * fx_rate,
             snapshot=snapshot,
         )
         if not decision.allowed:
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason=decision.reason)
             return
         submitted = await self._submit(
-            lot, intent.side, qty, bar.close, is_add=intent.kind is IntentKind.ADD,
+            lot, intent.side, qty, order_px, is_add=intent.kind is IntentKind.ADD,
             reason=intent.reason,
             # EXIT(손절·세션청산·킬스위치)는 걸려 있는 같은 방향 주문(TP 트림 등)을
             # 취소하고라도 나가야 한다 — 익절 주문이 손절을 막는 사고 방지.
@@ -533,7 +537,9 @@ class TradingService:
             market=lot.market,
             side=side,
             qty=qty,
-            price=price,  # marketable limit at last price
+            # marketable limit at last price. 호가단위로 정렬한다 — 시세를 못 받아
+            # 평단가(소수점)로 폴백하면 "호가단위 오류" 로 거부돼 손절이 막힌다.
+            price=round_to_tick(price, side) if not lot.market.is_overseas else price,
             ord_dvsn="00",
         )
         try:

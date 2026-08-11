@@ -118,8 +118,12 @@ def serve(
     # 초과하면 500(EGW00201) + Connection: close → DNS 폭주 → 시세 연결 붕괴 (2026-08-11).
     configure_shared_limiter(*((1.5, 2.0) if s.mode is Mode.PAPER else (12.0, 15.0)))
 
+    # 프로세스 전체가 KisAuth 하나를 공유한다 — KIS 는 토큰 발급 빈도를 제한해서,
+    # 인스턴스를 여럿 만들면 재시작을 반복할 때 403 tokenP 로 막힌다 (2026-08-11).
+    auth = KisAuth(creds, kis_rest_base(s.mode))
+
     if live_exec:
-        broker = build_broker(s)
+        broker = build_broker(s, auth=auth)
     else:
         from ..execution.broker.paper import PaperConfig
 
@@ -590,7 +594,7 @@ def serve(
                 await notifier.notify(
                     "reconcile.drift", 불일치=len(report.mismatches), 시점="엔진 시작"
                 )
-        auth = KisAuth(creds, kis_rest_base(s.mode))
+        # auth 는 위에서 만든 공용 인스턴스를 그대로 쓴다 (토큰 발급 빈도 제한 때문).
         # 지표 워밍업 백필 — 해상도별로. 없으면 저빈도 전략은 수십 거래일간 관망만 한다.
         primed = 0
         for res in resolutions:
@@ -990,6 +994,160 @@ def preflight() -> None:
     typer.echo(f"\nready={ready} (mode={s.mode.value})")
     if not ready:
         raise typer.Exit(code=1)
+
+
+@app.command("selfcheck")
+def selfcheck(ticker: str = "122630", skip_orders: bool = False) -> None:
+    """라이브 기본기능 점검 — 인증·시세·잔고·체결내역·매수·매도·취소가 실제로 되는지.
+
+    주문은 **체결 불가 지정가 1주**로 넣고 즉시 취소한다 (비파괴). 잔고·포지션 불변.
+    장 시작 전/후 아무 때나 실행 가능하며, 거부 사유가 '잔고/수량 부족'이면 통과로 본다
+    (API 계약은 정상이라는 뜻). '전문 형식 오류'만 실패로 잡는다.
+
+    2026-08-11: 매도가 8일간 100% 거부되던 것을 손절 신호가 뜬 뒤에야 발견 —
+    그 재발을 막기 위한 상시 점검 도구.
+    """
+    import asyncio
+    from decimal import Decimal
+
+    from ..domain.enums import Mode, Side
+    from ..infra.kis_auth import KisAuth
+    from ..infra.rate_limit import configure_shared_limiter
+    from .engine import build_broker, kis_rest_base
+    from .selfcheck import CheckResult, _order_roundtrip
+
+    s = _bootstrap()
+    creds = s.active_kis()
+    if not creds.configured:
+        typer.echo("KIS 키가 없습니다 (.env.local 의 STB_KIS__*).")
+        raise typer.Exit(1)
+    # 점검은 느려도 되고, 대개 **봇이 돌고 있는 중**에 실행된다. KIS 한도는 계좌 단위라
+    # 두 프로세스의 호출이 합산되므로, 점검은 봇 몫을 침범하지 않게 절반 속도로 돈다.
+    configure_shared_limiter(*((0.7, 1.0) if s.mode is Mode.PAPER else (5.0, 5.0)))
+
+    async def _run() -> list[CheckResult]:
+        from ..infra.http import close_shared_client
+        from ..market.kis_history import KisMinuteHistory
+        from ..market.kis_ranking import KisVolumeRank
+
+        out: list[CheckResult] = []
+        base = kis_rest_base(s.mode)
+        auth = KisAuth(creds, base)
+        broker = build_broker(s, auth=auth)  # 토큰 공유 (발급 빈도 제한 회피)
+
+        async def check(name: str, coro: Any) -> Any:
+            try:
+                return await coro
+            except Exception as exc:
+                text = str(exc)[:160]
+                if "403" in text and "tokenP" in text:
+                    # KIS 는 토큰 발급 자체에 빈도 제한이 있다 — 연달아 점검하면 걸린다.
+                    text = "403 토큰 발급 한도 — 1분 후 재시도 (키 문제 아님)"
+                out.append(CheckResult(name, False, text))
+                return None
+
+        # 1) 인증
+        token = await check("인증 (access token)", auth.access_token())
+        if token:
+            out.append(CheckResult("인증 (access token)", True, f"발급됨 ({len(token)}자)"))
+        approval = await check("인증 (WS approval key)", auth.approval_key())
+        if approval:
+            out.append(CheckResult("인증 (WS approval key)", True, "발급됨"))
+
+        # 2) 잔고 조회
+        balance = await check("잔고 조회", broker.get_balance())
+        if balance is not None:
+            cash = sum(balance.cash.values())
+            out.append(
+                CheckResult("잔고 조회", True, f"현금 {cash:,.0f} / 보유 {len(balance.positions)}종목")
+            )
+
+        # 3) 체결내역 조회 (FillPoller 의 근거)
+        execs = await check("체결내역 조회", broker.get_executions())
+        if execs is not None:
+            out.append(CheckResult("체결내역 조회", True, f"{len(execs)}건"))
+
+        # 4) 주문내역 조회 (UNKNOWN 복구의 근거)
+        orders = await check("주문내역 조회", broker.get_daily_orders())
+        if orders is not None:
+            out.append(CheckResult("주문내역 조회", True, f"{len(orders)}건"))
+
+        # 5) 분봉 조회 (지표 워밍업의 근거)
+        from datetime import datetime
+
+        from ..execution.poll_gate import KST
+
+        hist = KisMinuteHistory(auth, creds, base)
+        bars = await check(
+            "분봉 조회", hist.fetch_day(ticker, datetime.now(KST).date(), cache=False)
+        )
+        if bars is not None:
+            out.append(CheckResult("분봉 조회", bool(bars), f"{len(bars)}봉"))
+
+        # 6) 순위 조회 (스캐너의 근거) — 모의 도메인은 순위 TR 을 지원하지 않아 500 이다.
+        #    봇(serve)과 동일하게, 실전 키가 있으면 실전 도메인으로 조회한다 (시세만, 안전).
+        if s.kis.live.configured and s.mode is not Mode.LIVE:
+            rk_creds, rk_base = s.kis.live, kis_rest_base(Mode.LIVE)
+            rk_auth = KisAuth(rk_creds, rk_base)
+        else:
+            rk_creds, rk_base, rk_auth = creds, base, auth
+        rows = await check("순위 조회 (스캐너)", KisVolumeRank(rk_auth, rk_creds, rk_base).top())
+        if rows is not None:
+            out.append(CheckResult("순위 조회 (스캐너)", bool(rows), f"{len(rows)}종목"))
+
+        # 7) 현재가 — 주문 가격 산정의 기준
+        last: Decimal | None = None
+        if bars:
+            last = bars[-1].close
+            out.append(CheckResult("현재가 확보", True, f"{ticker} {last:,.0f}"))
+        else:
+            out.append(CheckResult("현재가 확보", False, "분봉이 없어 주문 테스트 불가"))
+
+        # 8) 매수/매도 주문 + 취소 (체결 불가 지정가 1주 → 즉시 취소)
+        if skip_orders:
+            out.append(CheckResult("주문 경로", True, "건너뜀 (--skip-orders)"))
+        elif last is not None:
+            from ..execution.tick_size import round_to_tick
+
+            for side, mult, label in (
+                (Side.BUY, Decimal("0.90"), "매수 주문 + 취소"),
+                (Side.SELL, Decimal("1.10"), "매도 주문 + 취소"),
+            ):
+                try:
+                    # 호가단위로 정렬하지 않으면 "호가단위 오류" 로 거부돼 정작 검증하려는
+                    # 전문 형식 문제를 못 본다.
+                    ok, detail = await _order_roundtrip(
+                        broker, ticker, side, round_to_tick(last * mult, side)
+                    )
+                except Exception as exc:  # 점검 도구가 트레이스백으로 죽으면 안 된다
+                    ok, detail = False, str(exc)[:160]
+                out.append(CheckResult(label, ok, detail))
+        else:
+            out.append(CheckResult("주문 경로", False, "현재가를 못 구해 검증 불가"))
+
+        # 9) 환전 — KIS 는 on-demand 환전 REST API 가 없다 (통합증거금 자동환전)
+        out.append(
+            CheckResult(
+                "환전",
+                True,
+                "N/A — KIS 에 on-demand 환전 API 없음 (통합증거금 자동환전). 해외거래 "
+                + ("사용" if s.overseas_enabled else "미사용이라 무관"),
+            )
+        )
+        await close_shared_client()
+        return out
+
+    results = asyncio.run(_run())
+    typer.echo(f"\n라이브 기본기능 점검 (mode={s.mode.value}, 종목={ticker})")
+    typer.echo("-" * 72)
+    for r in results:
+        typer.echo(f"[{r.mark}] {r.name:<22} {r.detail}")
+    failed = [r for r in results if not r.ok]
+    typer.echo("-" * 72)
+    typer.echo(f"{len(results) - len(failed)}/{len(results)} 통과")
+    if failed:
+        typer.echo("실패: " + ", ".join(r.name for r in failed))
+        raise typer.Exit(1)
 
 
 @app.command("kakao-auth")

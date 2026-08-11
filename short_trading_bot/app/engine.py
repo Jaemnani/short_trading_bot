@@ -43,14 +43,19 @@ def kis_ws_url(mode: Mode) -> str:
     return "ws://ops.koreainvestment.com:21000" if mode is Mode.LIVE else "ws://ops.koreainvestment.com:31000"
 
 
-def build_broker(settings: Settings, *, logger: Any = None) -> BrokerAdapter:
+def build_broker(
+    settings: Settings, *, logger: Any = None, auth: KisAuth | None = None
+) -> BrokerAdapter:
+    """``auth`` 를 넘기면 토큰을 공유한다 — KIS 는 **토큰 발급 자체에 빈도 제한**이 있어
+    (한도 초과 시 403 tokenP), 프로세스 안에서 KisAuth 를 여러 개 만들면 재시작을 반복할 때
+    발급이 막힌다 (2026-08-11 실측). 호출자는 가능하면 하나를 만들어 공유할 것."""
     log = logger or get_logger("engine")
     creds = settings.active_kis()
     if not creds.configured:
         log.warning("broker.paper_fallback", reason="KIS credentials not configured")
         return PaperBrokerAdapter()
     base = kis_rest_base(settings.mode)
-    auth = KisAuth(creds, base)
+    auth = auth or KisAuth(creds, base)
     domestic = KisBrokerAdapter(auth, creds, base, settings.mode)
     if not settings.overseas_enabled:
         # 해외 미사용(기본): 어댑터 자체를 안 만들어 해외 API 호출 0 — 모의 도메인
