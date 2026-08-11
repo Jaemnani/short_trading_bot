@@ -48,6 +48,7 @@ class KisApiError(RuntimeError):
         path = url.split("/uapi")[-1].split("?")[0]
         super().__init__(f"KIS HTTP {status} {path}: {body}")
 
+
 _ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 _CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -76,10 +77,6 @@ class KisBrokerAdapter(BrokerAdapter):
         self._transport = transport or self._default_transport
         self._timeout = timeout
         self._fees = fees or KRX_FEES
-        # KIS 공식 한도: 모의 초당 2건 / 실전 20건. 한도에 딱 맞추면 서버측 계측 오차로
-        # 다시 초과하므로 보수적으로 잡는다 (2026-08-11 EGW00201 사고).
-        self._rate_limit = 1.5 if mode is Mode.PAPER else 12.0
-        self._rate_burst = 2.0 if mode is Mode.PAPER else 15.0
 
     @property
     def name(self) -> str:
@@ -289,7 +286,7 @@ class KisBrokerAdapter(BrokerAdapter):
     ) -> dict[str, Any]:
         # 초당 한도 게이트 — 넘기면 KIS 가 500(EGW00201) + Connection: close 로 응답해
         # 커넥션 풀이 깨지고 DNS 폭주 → 시세 연결까지 무너진다 (infra/rate_limit.py).
-        await shared_limiter(self._rate_limit, self._rate_burst).acquire()
+        await shared_limiter().acquire()
         # 공용 클라이언트 (커넥션·DNS 재사용). 호출마다 새로 만들면 하루 수만 번의 DNS
         # 조회로 리졸버가 실패하고, 그 예외가 시세 연결까지 끊는다 — infra/http.py 참조.
         client = shared_client(self._timeout)

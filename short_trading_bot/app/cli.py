@@ -111,6 +111,12 @@ def serve(
         raise typer.Exit(1)
 
     from ..infra.notifier.factory import build_notifier
+    from ..infra.rate_limit import configure_shared_limiter
+
+    # KIS 초당 한도(계좌 단위·전 엔드포인트 합산): 모의 2건 / 실전 20건.
+    # 한도에 딱 맞추면 서버측 계측 오차로 다시 초과하므로 보수적으로 잡는다.
+    # 초과하면 500(EGW00201) + Connection: close → DNS 폭주 → 시세 연결 붕괴 (2026-08-11).
+    configure_shared_limiter(*((1.5, 2.0) if s.mode is Mode.PAPER else (12.0, 15.0)))
 
     if live_exec:
         broker = build_broker(s)

@@ -15,10 +15,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from ..infra.config import KisEnvCreds
+from ..infra.http import shared_client
 from ..infra.kis_auth import KisAuth
+from ..infra.rate_limit import shared_limiter
 
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -105,11 +105,15 @@ class KisVolumeRank:
     async def _default_transport(
         self, method: str, url: str, headers: dict[str, str], payload: dict[str, Any]
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get(url, headers=headers, params=payload)
-            resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-            return data
+        # KIS 초당 한도는 계좌 단위로 **모든 엔드포인트 합산**이라 순위 조회도 같은 버킷을
+        # 통과해야 한다. 브로커만 제한하면 여기서 새어 체결 조회가 EGW00201 로 밀려난다.
+        await shared_limiter().acquire()
+        resp = await shared_client(self._timeout).get(
+            url, headers=headers, params=payload, timeout=self._timeout
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data
 
 
 def _f(value: Any) -> float:

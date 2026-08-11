@@ -24,8 +24,10 @@ import httpx
 
 from ..domain.enums import Resolution
 from ..infra.config import KisEnvCreds
+from ..infra.http import shared_client
 from ..infra.kis_auth import KisAuth
 from ..infra.logging import get_logger
+from ..infra.rate_limit import shared_limiter
 from .types import Bar
 
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -175,19 +177,26 @@ class KisMinuteHistory:
         self, method: str, url: str, headers: dict[str, str], params: dict[str, Any]
     ) -> dict[str, Any]:
         # 모의(vps) 시세 서버는 간헐적 HTTP 5xx를 반환한다(실측) — 백오프 재시도.
+        # 시작 시 워밍업 백필이 수십 건을 연속 호출하는 최대 버스트 지점이라, 초당 한도
+        # 게이트를 반드시 통과시킨다 (넘기면 계좌 전체가 EGW00201 로 막힌다).
         last_exc: Exception | None = None
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            for attempt in range(4):
-                try:
-                    resp = await client.get(url, headers=headers, params=params)
-                    if resp.status_code >= 500:
-                        raise httpx.HTTPStatusError("server error", request=resp.request, response=resp)
-                    resp.raise_for_status()
-                    data: dict[str, Any] = resp.json()
-                    return data
-                except (httpx.HTTPStatusError, httpx.TransportError) as exc:
-                    last_exc = exc
-                    await asyncio.sleep(0.8 * (attempt + 1))
+        client = shared_client(self._timeout)
+        for attempt in range(4):
+            try:
+                await shared_limiter().acquire()
+                resp = await client.get(
+                    url, headers=headers, params=params, timeout=self._timeout
+                )
+                if resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        "server error", request=resp.request, response=resp
+                    )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                last_exc = exc
+                await asyncio.sleep(0.8 * (attempt + 1))
         assert last_exc is not None
         raise last_exc
 

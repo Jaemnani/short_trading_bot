@@ -10,6 +10,7 @@ import time
 
 from short_trading_bot.infra.rate_limit import (
     RateLimiter,
+    configure_shared_limiter,
     reset_shared_limiter,
     shared_limiter,
 )
@@ -63,7 +64,26 @@ async def test_waits_are_counted() -> None:
 
 async def test_shared_limiter_is_single_bucket() -> None:
     reset_shared_limiter()
-    a = shared_limiter(5.0, 5.0)
-    b = shared_limiter(5.0, 5.0)
+    a = shared_limiter()
+    b = shared_limiter()
     assert a is b  # 모든 KIS 호출이 같은 버킷을 통과해야 한다
+    reset_shared_limiter()
+
+
+async def test_configure_applies_to_existing_bucket() -> None:
+    """첫 호출자가 속도를 정하면 시작 시 백필이 먼저 만들어 실전 속도가 안 먹는다 —
+    설정은 언제 호출해도 이미 만든 버킷에 반영돼야 한다."""
+    reset_shared_limiter()
+    lim = shared_limiter()
+    configure_shared_limiter(12.0, 15.0)
+    assert (lim.rate, lim.burst) == (12.0, 15.0)
+    configure_shared_limiter(1.5, 2.0)  # 기본값 복구 (다른 테스트 오염 방지)
+    reset_shared_limiter()
+
+
+async def test_configure_applies_to_new_bucket() -> None:
+    reset_shared_limiter()
+    configure_shared_limiter(9.0, 9.0)
+    assert shared_limiter().rate == 9.0
+    configure_shared_limiter(1.5, 2.0)
     reset_shared_limiter()

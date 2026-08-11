@@ -56,14 +56,29 @@ class RateLimiter:
 
 
 _limiters: dict[object, RateLimiter] = {}
+# 프로세스 전체 설정. 첫 호출자가 속도를 정하게 두면(초기 구현) 시작 시 백필이 먼저
+# 만들어 실전 전환 후에도 모의용 저속이 굳는다 — 시작 시 한 번 명시 설정한다.
+_config: tuple[float, float] = (1.5, 2.0)
 
 
-def shared_limiter(rate: float = 1.5, burst: float = 2.0) -> RateLimiter:
-    """이벤트 루프별 공용 제한기 — 모든 KIS 호출이 같은 버킷을 통과해야 의미가 있다."""
+def configure_shared_limiter(rate: float, burst: float) -> None:
+    """실행 모드가 정해진 시점(serve 시작)에 한 번 호출. 이미 만든 버킷에도 반영한다."""
+    global _config
+    _config = (rate, burst)
+    for limiter in _limiters.values():
+        limiter.rate, limiter.burst = rate, burst
+
+
+def shared_limiter() -> RateLimiter:
+    """이벤트 루프별 공용 제한기 — 모든 KIS 호출이 같은 버킷을 통과해야 의미가 있다.
+
+    KIS 초당 한도는 **계좌 단위로 전 엔드포인트 합산**이라, 한 곳이라도 버킷 밖에서
+    호출하면 그만큼 다른 호출이 EGW00201 로 밀려난다 (2026-08-11 실측).
+    """
     loop = asyncio.get_running_loop()
     limiter = _limiters.get(loop)
     if limiter is None:
-        limiter = RateLimiter(rate=rate, burst=burst)
+        limiter = RateLimiter(rate=_config[0], burst=_config[1])
         _limiters[loop] = limiter
     return limiter
 
