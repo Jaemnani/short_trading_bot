@@ -52,9 +52,11 @@ def test_cndt_pric_always_present() -> None:
         assert _adapter().build_order_body(_req(side))["CNDT_PRIC"] == ""
 
 
-def test_sll_type_only_marks_sell() -> None:
-    assert _adapter().build_order_body(_req(Side.SELL))["SLL_TYPE"] == "01"
-    assert _adapter().build_order_body(_req(Side.BUY))["SLL_TYPE"] == ""
+def test_sll_type_is_blank_even_for_sell() -> None:
+    """공식 매도 예시(chk_order_cash.py)가 sll_type 을 넘기지 않아 ""로 나간다.
+    "01"(일반매도)을 넣으면 IGW00007 로 거부된다 — 실주문 매도 100% 실패의 원인."""
+    for side in (Side.BUY, Side.SELL):
+        assert _adapter().build_order_body(_req(side))["SLL_TYPE"] == ""
 
 
 def test_values_are_strings() -> None:

@@ -243,8 +243,11 @@ class KisBrokerAdapter(BrokerAdapter):
             "ORD_QTY": str(req.qty),
             "ORD_UNPR": str(req.price),  # "0" for market
             "EXCG_ID_DVSN_CD": "KRX",  # next-gen routing: KRX | NXT | SOR
-            "SLL_TYPE": "01" if req.side is Side.SELL else "",  # 01=일반매도, 매수는 공란
-            "CNDT_PRIC": "",  # 조건가격 (일반주문은 공란) — 누락 시 IGW00007
+            # ⚠️ 일반 매도도 공란이다. "01"(일반매도)을 넣으면 IGW00007 로 거부된다 —
+            # 공식 매도 예시(chk_order_cash.py)가 sll_type 을 넘기지 않아 ""로 나간다.
+            # 2026-08-11: "01" 로 보내던 동안 실주문 매도가 100% 실패했다.
+            "SLL_TYPE": "",
+            "CNDT_PRIC": "",  # 조건가격 (일반주문은 공란)
         }
 
     @staticmethod
