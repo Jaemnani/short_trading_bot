@@ -155,3 +155,34 @@ def test_ws_pushes_control_state(tmp_path) -> None:
     with client.websocket_connect("/ws") as conn:
         msg = conn.receive_json()
         assert msg["type"] == "control" and msg["state"] == "RUNNING"
+
+
+def test_dashboard_index_is_not_cached(tmp_path) -> None:
+    """index.html 캐시로 인한 '대시보드 빈 화면' 방지 (2026-08-11).
+
+    index.html 은 이름이 고정이라 캐시되면 재빌드 후 사라진 자산 해시를 참조해 404 →
+    화면이 통째로 비고, 사용자에겐 '8000 포트가 안 열린다'로 보인다."""
+    from pathlib import Path
+
+    if not Path("frontend/dist/index.html").is_file():
+        return  # dist 미빌드 환경에서는 검증 대상 없음
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    assert "no-cache" in client.get("/").headers.get("cache-control", "")
+
+
+def test_dashboard_hashed_assets_are_immutable(tmp_path) -> None:
+    """해시 자산은 내용이 바뀌면 이름도 바뀌므로 영구 캐시가 안전하다."""
+    from pathlib import Path
+
+    assets = Path("frontend/dist/assets")
+    if not assets.is_dir():
+        return
+    name = next((p.name for p in assets.iterdir()), None)
+    if name is None:
+        return
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    resp = client.get(f"/assets/{name}")
+    assert resp.status_code == 200
+    assert "immutable" in resp.headers.get("cache-control", "")
