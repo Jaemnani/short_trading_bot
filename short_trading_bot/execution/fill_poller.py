@@ -14,6 +14,7 @@ Pair with the Reconciler (broker 잔고 = source of truth) as a second safety ne
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -25,7 +26,12 @@ from ..persistence.db import session_scope
 from ..persistence.models import Fill as FillRow
 from ..persistence.models import Order
 from .broker.base import BrokerAdapter
+from .order_manager import created_today_kst
 from .types import Fill, FillHandler
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
 
 class FillPoller:
@@ -92,13 +98,25 @@ class FillPoller:
     ) -> tuple[str, Decimal, Decimal, Decimal, Decimal] | None:
         """Map an order to already applied cumulative execution totals."""
         async with session_scope(self._sf) as session:
-            order = (
-                await session.execute(
-                    select(Order).where(Order.broker_order_no == broker_order_no)
-                )
-            ).scalar_one_or_none()
-            if order is None:
+            # KIS 주문번호는 거래일 단위 — 과거 날짜 주문과 번호가 겹칠 수 있다. 체결내역은
+            # 오늘자만 조회하므로 오늘 생성된 주문으로 한정한다 (전 기간 scalar_one_or_none 은
+            # 번호가 겹치는 날 MultipleResultsFound 로 폴링 전체를 멈추거나 과거 랏에 붙인다 #15).
+            candidates = [
+                o
+                for o in (
+                    await session.execute(
+                        select(Order).where(Order.broker_order_no == broker_order_no)
+                    )
+                ).scalars().all()
+                if created_today_kst(o.created_at)
+            ]
+            if not candidates:
                 return None
+            if len(candidates) > 1:
+                self._log.warning(
+                    "fill_poll.duplicate_order_no", broker_order_no=broker_order_no, n=len(candidates)
+                )
+            order = max(candidates, key=lambda o: _aware(o.created_at))
             rows = (
                 await session.execute(
                     select(FillRow.qty, FillRow.price, FillRow.fee, FillRow.tax).where(

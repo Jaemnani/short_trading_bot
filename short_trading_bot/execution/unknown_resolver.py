@@ -30,6 +30,7 @@ from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
 from .broker.base import BrokerAdapter
+from .order_manager import created_today_kst
 
 
 class UnknownOrderResolver:
@@ -52,13 +53,18 @@ class UnknownOrderResolver:
             unknowns = await self._load_unknowns(session)
             if not unknowns:
                 return 0
+            # '이미 연결된 번호'는 오늘 주문만 — 주문번호는 거래일 단위라 과거 번호까지 넣으면
+            # 오늘 실제 접수된 주문이 후보에서 빠져 만료 → 재주문(이중 주문)된다 (#15).
             linked = {
-                no
-                for no in (
+                row.broker_order_no
+                for row in (
                     await session.execute(
-                        select(Order.broker_order_no).where(Order.broker_order_no.is_not(None))
+                        select(Order.broker_order_no, Order.created_at).where(
+                            Order.broker_order_no.is_not(None)
+                        )
                     )
-                ).scalars()
+                ).all()
+                if created_today_kst(row.created_at)
             }
         records = await self._broker.get_daily_orders()
 

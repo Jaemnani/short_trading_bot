@@ -182,6 +182,10 @@ class TradingService:
         restarted lot keeps its stop ladder; reconcile against the broker before
         resuming trading.
         """
+        # 브로커 호출 도중 죽은 흔적(PENDING_NEW)은 UNKNOWN 으로 넘겨 resolver 가 밝히게 하고,
+        # 전 거래일 주문은 만료 — 둘 다 안 하면 해당 (lot, side) 잠금이 영구히 남는다 (#6).
+        await self._om.orphan_pending_to_unknown()
+        await self._om.expire_stale()
         open_states = [
             PositionState.HOLDING.value,
             PositionState.SCALING.value,
@@ -358,6 +362,10 @@ class TradingService:
             "watching": watching,
             "health": self.health.snapshot(datetime.now(UTC)),
         }
+
+    async def expire_stale_orders(self) -> int:
+        """거래일이 바뀌면 호출 — 전일 미체결 주문을 만료시켜 잠금이 풀리게 한다 (#6)."""
+        return await self._om.expire_stale()
 
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler."""
@@ -576,6 +584,10 @@ class TradingService:
         except Exception:
             # Keep UNKNOWN broker outcomes locked: resubmitting could duplicate a live order.
             self._log.exception("order.submit.unknown", client_order_id=cid)
+            # UNKNOWN 동안 이 (lot, side) 는 취소·재주문이 막힌다 — 매도면 손절이 멈춘 것.
+            await self._notifier.notify(
+                "order.unknown", ticker=lot.ticker, side=side.value, qty=str(qty), reason=reason
+            )
             raise
         if not ack.accepted:
             self._pending.pop(pending_key, None)

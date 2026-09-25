@@ -173,6 +173,11 @@ def serve(
                 if was_idle:
                     was_idle = False
                     log.info("fill_poll.session_start")
+                    try:
+                        # 새 거래일: 전일 미체결(장 마감으로 소멸) 주문을 만료 → 잠금 해제 (#6)
+                        await service.expire_stale_orders()
+                    except Exception:
+                        log.exception("order.expire_stale.error")
                 ok = True
                 try:
                     await resolver.poll_once()
