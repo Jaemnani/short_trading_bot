@@ -726,6 +726,11 @@ def serve(
 
         Path("data").mkdir(exist_ok=True)
         Path("data/engine_stopped.marker").write_text("kill-switch")
+        # 청산 완료 후 정상 종료 — 긴급중지 '진행 중' 표시는 역할을 다했다. 남겨 두면 다음 수동
+        # `trader serve` 가 STOPPED 로 떠서 곧바로 종료하고, 대시보드 resume 도 닿을 엔진이 없다.
+        from ..risk.control_file import KILL_SWITCH_PATH
+
+        KILL_SWITCH_PATH.unlink(missing_ok=True)
         log.info("engine.stop_marker_written")
 
 

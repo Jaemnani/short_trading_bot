@@ -150,3 +150,15 @@ def test_live_exec_refused_when_preflight_fails(live_env, monkeypatch) -> None:
     result = CliRunner().invoke(app, ["serve", "--config", "watchlist.example.json", "--live-exec"])
     assert result.exit_code == 1
     assert "preflight" in result.output and "api_credentials_secure" in result.output
+
+
+async def test_peak_not_persisted_for_simulated_paper_broker(sf) -> None:
+    """시뮬 현금은 재시작마다 초기화 — 이전 최고 평가금을 복원하면 가짜 낙폭 브레이크가 걸린다."""
+    from short_trading_bot.execution.broker.paper import PaperBrokerAdapter
+
+    s1 = TradingService(PaperBrokerAdapter(), sf, RiskManager(RiskLimits()), {})
+    s1._peak_equity = Decimal("999999999")
+    await s1._persist_peak()
+    s2 = TradingService(PaperBrokerAdapter(), sf, RiskManager(RiskLimits()), {})
+    await s2.hydrate()
+    assert s2._peak_equity == Decimal(0)

@@ -304,6 +304,10 @@ class TradingService:
             book[fill.lot_id] = (qty, avg)
         self._daily_date = today
         self._daily_realized = realized
+        # 시뮬 체결(PaperBroker)은 현금이 프로세스 메모리에만 있어 재시작마다 초기 자금으로
+        # 돌아간다 — 이전 실행의 최고 평가금과 비교하면 가짜 낙폭이 된다. 실브로커만 복원.
+        if self._broker.name == "paper":
+            peak_row = None
         if isinstance(peak_row, dict) and peak_row.get("peak"):
             self._peak_equity = self._peak_persisted = Decimal(str(peak_row["peak"]))
         if realized or self._peak_equity:
@@ -312,6 +316,8 @@ class TradingService:
             )
 
     async def _persist_peak(self) -> None:
+        if self._broker.name == "paper":
+            return  # 시뮬 현금은 재시작 시 초기화 — 영속해도 의미가 없다 (_restore_risk_state)
         if self._peak_equity <= 0 or self._peak_equity < self._peak_persisted * _PEAK_PERSIST_STEP:
             return
         async with session_scope(self._sf) as session:
