@@ -162,3 +162,19 @@ async def test_peak_not_persisted_for_simulated_paper_broker(sf) -> None:
     s2 = TradingService(PaperBrokerAdapter(), sf, RiskManager(RiskLimits()), {})
     await s2.hydrate()
     assert s2._peak_equity == Decimal(0)
+
+
+async def test_risk_snapshot_counts_slot_collision_holdings(sf) -> None:
+    """슬롯 밖 보유(재오픈 고아)도 포지션 수·종목 노출 한도에 들어간다."""
+    svc = _svc(sf)
+    old = await svc._spawn("035420", _TMPL)
+    await svc._submit(old, Side.BUY, Decimal(3), Decimal(10000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(old.lot_id, Side.BUY)], Decimal(3), Decimal(10000)))
+    new = await svc._spawn("035420", _TMPL)  # 같은 슬롯을 새 랏이 차지 — old 는 슬롯 밖
+    await svc._submit(new, Side.BUY, Decimal(2), Decimal(10000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(new.lot_id, Side.BUY)], Decimal(2), Decimal(10000)))
+    svc._last_price["035420"] = Decimal(10000)
+
+    snap = svc._risk_snapshot(Decimal(10**8))
+    assert snap.open_positions == 2
+    assert snap.ticker_exposure["035420"] == Decimal(50000)

@@ -501,3 +501,56 @@ async def test_incomplete_overseas_poll_keeps_only_overseas_barriers(sf) -> None
     assert svc._refresh_before_sell == {us.lot_id}
     assert svc._unconfirmed_buy_cancels == {us.lot_id}
     assert await svc._refresh_fills(us) is False
+
+
+async def test_startup_barrier_kept_when_overseas_leg_unconfirmed(sf) -> None:
+    """재시작 후 해외 조회 실패 → 종결된 해외 매수의 미반영 체결을 배제할 수 없으니 flat 보류.
+    국내 랏 매도는 계속 허용."""
+    from short_trading_bot.execution.broker.routing import RoutingBrokerAdapter
+
+    class _OverseasDown(RestingBroker):
+        async def get_executions(self) -> list[Any]:
+            raise RuntimeError("overseas 500")
+
+    s1, _, _ = _svc(sf)
+    kr = await s1._spawn("005930", _TMPL)
+    await s1._submit(kr, Side.BUY, Decimal(5), Decimal(9000), is_add=False, reason="enter")
+    await s1._on_fill(Fill(s1._pending[(kr.lot_id, Side.BUY)], Decimal(5), Decimal(9000)))
+
+    domestic = RestingBroker()
+    svc = TradingService(RoutingBrokerAdapter(domestic, _OverseasDown()), sf, RiskManager(RiskLimits()), {})
+    await svc.hydrate()
+    assert svc._startup_refresh_pending and not svc.is_flat()
+    held = svc.lot("005930")
+    assert held is not None
+    assert await svc._submit(held, Side.SELL, held.qty, Decimal(9000), is_add=False, reason="kill_switch")
+
+
+async def test_confirmed_refresh_retries_suspended_overseas_reads(sf) -> None:
+    """해외 조회가 연속 실패로 쉬고 있어도, 확인이 필요한 반영은 다시 시도해 복구되면 장벽 해제."""
+    from short_trading_bot.execution.broker.routing import RoutingBrokerAdapter
+
+    class _Flaky(RestingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = True
+            self.calls = 0
+
+        async def get_executions(self) -> list[Any]:
+            self.calls += 1
+            if self.down:
+                raise RuntimeError("overseas 500")
+            return []
+
+    overseas = _Flaky()
+    routing = RoutingBrokerAdapter(RestingBroker(), overseas)
+    for _ in range(4):
+        await routing.get_executions()
+    assert overseas.calls == 3  # 3연속 실패 후 조회 중단
+
+    svc = TradingService(routing, sf, RiskManager(RiskLimits()), {})
+    svc._startup_refresh_pending = True
+    overseas.down = False  # 브로커 복구
+    await svc._refresh_fills()
+    assert overseas.calls == 4 and routing.executions_complete
+    assert svc._startup_refresh_pending is False

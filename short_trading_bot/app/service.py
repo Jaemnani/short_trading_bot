@@ -783,6 +783,12 @@ class TradingService:
     async def _refresh_fills(self, lot: PositionLot | None = None) -> bool:
         """체결내역을 한 번 반영한다. 한 번의 폴링이 모든 랏을 갱신하므로 성공하면 모든
         '재반영 필요' 표시를 지운다."""
+        # 반영 '확인'이 필요한 호출이다 — 라우팅 어댑터가 연속 실패로 해외 조회를 쉬고 있으면
+        # 이번엔 다시 시도하게 한다. 안 그러면 장벽(매도 보류)과 조회 중단(해외 주문이 나가야
+        # 풀림)이 서로를 기다려 해외 손절·청산이 영구히 막힌다.
+        resume = getattr(self._broker, "resume_overseas_reads", None)
+        if callable(resume):
+            resume()
         try:
             await self.make_fill_poller().poll_once()
         except Exception:
@@ -797,12 +803,10 @@ class TradingService:
             overseas = {lot.lot_id for lot in self._tracked_lots() if lot.market.is_overseas}
             self._refresh_before_sell &= overseas
             self._unconfirmed_buy_cancels &= overseas
-            if self._startup_refresh_pending and not any(
-                lot.market.is_overseas and (lot.qty > 0 or (lot.lot_id, Side.BUY) in self._pending)
-                for lot in self._tracked_lots()
-            ):
-                self._startup_refresh_pending = False
-            return lot is None or lot.lot_id not in overseas
+            # 재시작 장벽은 유지한다: 재시작 전에 취소된(이미 종결된) 해외 매수의 미반영 체결은
+            # 보유·걸린 주문 어디에도 흔적이 없어 랏 단위로 가려낼 수 없다. 국내 랏의 매도는
+            # 아래 반환값으로 계속 허용되고, flat 판정만 해외 반영 확인까지 보류된다.
+            return lot is not None and lot.lot_id not in overseas
         self._refresh_before_sell.clear()
         self._unconfirmed_buy_cancels.clear()
         self._startup_refresh_pending = False
@@ -1145,7 +1149,8 @@ class TradingService:
         return equity
 
     def _risk_snapshot(self, equity: Decimal) -> RiskSnapshot:
-        open_lots = [lot for lot in self._lots.values() if lot.is_open]
+        # 슬롯 밖 보유(재오픈 고아 등)도 실제 보유다 — 한도 계산에서 빼면 초과 진입이 난다.
+        open_lots = [lot for lot in self._tracked_lots() if lot.is_open]
         exposure: dict[str, Decimal] = {}
         for lot in open_lots:
             price = self._last_price.get(lot.ticker, lot.avg_entry)

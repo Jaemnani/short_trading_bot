@@ -76,6 +76,14 @@ class RoutingBrokerAdapter(BrokerAdapter):
         self._overseas_fail = 0
         return result
 
+    def resume_overseas_reads(self) -> None:
+        """연속 실패로 쉬고 있는 해외 조회를 다음 호출에 한 번 다시 시도하게 한다.
+
+        체결 반영 '확인'이 필요한 호출자(취소 뒤 장벽)용. 쉬는 상태를 그대로 두면 장벽이
+        해외 매도를 막고, 조회는 해외 주문이 나가야 재개돼 서로를 영원히 기다린다."""
+        if self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
+            self._overseas_fail = _OVERSEAS_FAIL_LIMIT - 1  # 한 번 시도, 또 실패하면 다시 쉼
+
     async def _overseas_read(self, fetch: Callable[[], Awaitable[list[_T]]]) -> list[_T]:
         empty: list[_T] = []
         return list(await self._overseas_call(fetch, empty))
