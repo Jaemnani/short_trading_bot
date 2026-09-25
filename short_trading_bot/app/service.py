@@ -46,6 +46,7 @@ from ..market.indicators import IndicatorEngine
 from ..market.regime import MarketRegime
 from ..market.types import Bar, IndicatorSnapshot
 from ..persistence.db import session_scope
+from ..persistence.models import Fill as FillRow
 from ..persistence.models import Order, Position
 from ..risk.limits import RiskSnapshot
 from ..risk.manager import RiskManager
@@ -85,6 +86,7 @@ class _PendingOrder:
     is_add: bool
     requested_qty: Decimal
     filled_qty: Decimal = Decimal(0)
+    price: Decimal = Decimal(0)  # 주문 지정가 (킬스위치 재가격 판단용)
 
 
 class TradingService:
@@ -123,6 +125,9 @@ class TradingService:
         self._log = get_logger("service")
 
         self._lots: dict[str, PositionLot] = {}
+        # lot_id -> 랏 (종료·교체된 랏 포함). 재시작/취소 뒤 도착한 체결을 올바른 메모리 랏에
+        # 반영하려면 키(종목@해상도) 슬롯이 새 랏으로 바뀐 뒤에도 원래 랏을 찾아야 한다.
+        self._lots_by_id: dict[str, PositionLot] = {}
         self._prev: dict[str, IndicatorSnapshot] = {}
         self._last_price: dict[str, Decimal] = {}
         # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
@@ -204,12 +209,26 @@ class TradingService:
                 qty=row.qty_filled,
                 avg_entry=row.avg_entry_price,
                 realized_pnl=row.realized_pnl,
-                initial_stop=row.initial_stop if row.initial_stop > 0 else None,
+                # WATCHING 행의 initial_stop 은 '진입 대기 중 손절가' (아래에서 pending 으로 복원).
+                initial_stop=(
+                    row.initial_stop
+                    if row.initial_stop > 0 and row.state != PositionState.WATCHING.value
+                    else None
+                ),
                 peak_price=row.peak_price if row.peak_price > 0 else row.avg_entry_price,
                 tp_rungs_taken=row.tp_rungs_taken,
                 # 구버전 행(컬럼 default 0)은 현재 보유량으로 폴백.
                 original_qty=row.original_qty if row.original_qty > 0 else row.qty_filled,
             )
+            lot = self._lots[key]
+            if lot.state is PositionState.WATCHING:
+                # 진입 주문이 걸린 채 재시작: 체결 시 적용할 손절가·의도 수량을 되살린다
+                # (없으면 재시작 뒤 체결된 보유분이 전략 손절가 없이 관리된다).
+                lot.restore_pending_entry(
+                    row.initial_stop if row.initial_stop > 0 else None,
+                    row.original_qty if row.original_qty > 0 else None,
+                )
+            self._lots_by_id[row.lot_id] = lot
             restored += 1
         # Restore duplicate-order locks for orders that may still be live at the broker.
         # client_order_id is a fresh uuid per submit, so without this a restart would
@@ -218,10 +237,17 @@ class TradingService:
             open_orders = (
                 await session.execute(select(Order).where(Order.state.in_(_OPEN_ORDER_STATES)))
             ).scalars().all()
-        lot_ids = {lot.lot_id for lot in self._lots.values()}
-        for order in open_orders:
-            if order.lot_id in lot_ids:
+            for order in open_orders:
+                owner = self._lots_by_id.get(order.lot_id)
+                if owner is None:
+                    continue
                 self._pending[(order.lot_id, Side(order.side))] = order.client_order_id
+                # 체결 → 메모리 랏 반영에 필요한 메타도 복원한다. 잠금만 복원하면 재시작 뒤
+                # 도착한 체결이 DB 에만 반영되고 메모리 랏은 WATCHING/0 으로 남아 같은 종목을
+                # 또 사고, 이미 산 주식은 손절 대상에서 빠진다 (#3).
+                self._co_map[order.client_order_id] = await self._meta_from_order(
+                    session, order, owner
+                )
         return restored
 
     def prime(self, bars: list[Bar]) -> int:
@@ -485,6 +511,8 @@ class TradingService:
         if not decision.allowed:
             await self._notifier.notify("intent.blocked", ticker=lot.ticker, reason=decision.reason)
             return
+        if intent.kind is IntentKind.EXIT:
+            await self._cancel_open_buy(lot, reason="exit_cancels_entry")
         submitted = await self._submit(
             lot, intent.side, qty, order_px, is_add=intent.kind is IntentKind.ADD,
             reason=intent.reason,
@@ -528,8 +556,11 @@ class TradingService:
                 self._log.warning("order.replace.cancel_failed", lot_id=lot.lot_id)
                 return False
         cid = f"{lot.lot_id}-{uuid4().hex}"
+        # marketable limit at last price. 호가단위로 정렬한다 — 시세를 못 받아
+        # 평단가(소수점)로 폴백하면 "호가단위 오류" 로 거부돼 손절이 막힌다.
+        limit_px = round_to_tick(price, side) if not lot.market.is_overseas else price
         self._pending[pending_key] = cid
-        self._co_map[cid] = _PendingOrder(lot, side, is_add, qty)
+        self._co_map[cid] = _PendingOrder(lot, side, is_add, qty, price=limit_px)
         req = OrderRequest(
             client_order_id=cid,
             lot_id=lot.lot_id,
@@ -537,9 +568,7 @@ class TradingService:
             market=lot.market,
             side=side,
             qty=qty,
-            # marketable limit at last price. 호가단위로 정렬한다 — 시세를 못 받아
-            # 평단가(소수점)로 폴백하면 "호가단위 오류" 로 거부돼 손절이 막힌다.
-            price=round_to_tick(price, side) if not lot.market.is_overseas else price,
+            price=limit_px,
             ord_dvsn="00",
         )
         try:
@@ -560,8 +589,13 @@ class TradingService:
         )
         return ack.accepted
 
-    async def _cancel_pending(self, pending_key: tuple[str, Side], lot: PositionLot) -> bool:
-        """미체결 (lot, side) 주문을 취소하고 락을 푼다. 실패 시 False (락 유지)."""
+    async def _cancel_pending(
+        self, pending_key: tuple[str, Side], lot: PositionLot, *, reason: str = "replaced_by_exit"
+    ) -> bool:
+        """미체결 (lot, side) 주문을 취소하고 락을 푼다. 실패 시 False (락 유지).
+
+        메타(_co_map)는 지우지만, 취소 직전에 체결된 분량이 나중에 폴링으로 와도
+        ``_on_fill`` 이 DB 의 주문 행으로 메타를 복원해 메모리 랏에 반영한다 (#4)."""
         cid = self._pending.get(pending_key)
         if cid is None:
             return True
@@ -580,8 +614,20 @@ class TradingService:
             return False
         self._pending.pop(pending_key, None)
         self._co_map.pop(cid, None)
-        await self._notifier.notify("order.cancelled", ticker=lot.ticker, reason="replaced_by_exit")
+        await self._notifier.notify("order.cancelled", ticker=lot.ticker, reason=reason)
         return True
+
+    async def _cancel_open_buy(self, lot: PositionLot, *, reason: str) -> None:
+        """청산(EXIT·킬스위치) 전에 같은 랏의 매수 미체결을 취소한다 (#5).
+
+        남겨 두면 청산으로 CLOSED 가 된 뒤 매수 잔량이 체결돼 관리 밖 주식이 생긴다.
+        취소가 확인되지 않아도(UNKNOWN 등) 매도는 막지 않는다 — 보유분 청산이 우선이고,
+        늦게 온 매수 체결은 ``_on_fill`` 이 랏을 다시 열어 관리한다."""
+        key = (lot.lot_id, Side.BUY)
+        if key not in self._pending or await self._release_if_terminal(key):
+            return
+        if not await self._cancel_pending(key, lot, reason=reason):
+            self._log.warning("order.exit.buy_cancel_failed", lot_id=lot.lot_id)
 
     async def _release_if_terminal(self, pending_key: tuple[str, Side]) -> bool:
         """Free a pending lock whose order can no longer fill (per the DB order state).
@@ -599,7 +645,10 @@ class TradingService:
                 await session.execute(select(Order.state).where(Order.client_order_id == cid))
             ).scalar_one_or_none()
         if state is None or state in _TERMINAL_ORDER_STATES:
-            self._pending.pop(pending_key, None)
+            # await 사이에 다른 코루틴이 새 주문으로 잠금을 바꿨을 수 있다 — 내가 본 주문일
+            # 때만 푼다 (새 주문의 잠금을 지우면 중복 주문이 나간다).
+            if self._pending.get(pending_key) == cid:
+                self._pending.pop(pending_key, None)
             self._co_map.pop(cid, None)
             return True
         return False
@@ -607,10 +656,22 @@ class TradingService:
     async def _flat_all(self) -> None:
         submitted = False
         for lot in list(self._lots.values()):
-            if lot.is_open:
-                price = self._last_price.get(lot.ticker, lot.avg_entry)
-                ok = await self._submit(lot, Side.SELL, lot.qty, price, is_add=False, reason="kill_switch")
-                submitted = submitted or ok
+            # 진입 대기 중인 매수도 취소 — 긴급중지 뒤에 새 보유가 생기면 안 된다.
+            await self._cancel_open_buy(lot, reason="kill_switch")
+            if not lot.is_open:
+                continue
+            price = self._last_price.get(lot.ticker, lot.avg_entry)
+            limit_px = round_to_tick(price, Side.SELL) if not lot.market.is_overseas else price
+            working = self._co_map.get(self._pending.get((lot.lot_id, Side.SELL), ""))
+            if working is not None and working.price == limit_px and working.requested_qty >= lot.qty:
+                continue  # 같은 가격의 청산 주문이 이미 걸려 있음 — 매 봉 취소/재주문 방지
+            # 걸린 매도(익절 등)나 시세가 바뀐 청산 주문은 취소 후 현재가로 다시 낸다.
+            # 급락 중 지정가 청산이 미체결로 남는 것을 막는 재가격(re-price) 경로다.
+            ok = await self._submit(
+                lot, Side.SELL, lot.qty, price, is_add=False, reason="kill_switch",
+                replace_pending=True,
+            )
+            submitted = submitted or ok
         # flat_all re-runs every bar until all lots are flat; only notify when this pass
         # actually placed an order (otherwise the notifier is spammed once per bar).
         if submitted:
@@ -621,23 +682,114 @@ class TradingService:
     async def _on_fill(self, fill: Fill) -> None:
         await self._om.handle_fill(fill)  # DB: order/fill/position projection + audit
         meta = self._co_map.get(fill.client_order_id)
-        if meta is not None:
-            lot, side, is_add = meta.lot, meta.side, meta.is_add
-            before = lot.realized_pnl
-            lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
-            self._daily_realized += lot.realized_pnl - before  # 당일 한도 계산용 (비용 포함)
-            await self._sync_runtime(lot)  # 진입 체결로 확정된 initial_stop/original_qty 즉시 영속
-            meta.filled_qty += fill.qty
-            if meta.filled_qty >= meta.requested_qty:
-                if self._pending.get((lot.lot_id, side)) == fill.client_order_id:
-                    self._pending.pop((lot.lot_id, side), None)
-                self._co_map.pop(fill.client_order_id, None)
+        if meta is None:
+            # 재시작 전에 낸 주문, 또는 취소 직전에 체결된 분량 — 메모리 메타가 없어도 DB 의
+            # 주문 행으로 랏을 찾아 반영해야 메모리 랏(전략·손절의 기준)이 실제 보유와 맞는다.
+            meta = await self._recover_meta(fill)
+            if meta is None:
+                return
+        lot, side, is_add = meta.lot, meta.side, meta.is_add
+        was_closed = lot.state is PositionState.CLOSED
+        before = lot.realized_pnl
+        lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
+        self._daily_realized += lot.realized_pnl - before  # 당일 한도 계산용 (비용 포함)
+        if was_closed and lot.is_open:
+            await self._adopt_reopened(lot)
+        await self._sync_runtime(lot)  # 진입 체결로 확정된 initial_stop/original_qty 즉시 영속
+        meta.filled_qty += fill.qty
+        if meta.filled_qty >= meta.requested_qty:
+            if self._pending.get((lot.lot_id, side)) == fill.client_order_id:
+                self._pending.pop((lot.lot_id, side), None)
+            self._co_map.pop(fill.client_order_id, None)
+
+    async def _recover_meta(self, fill: Fill) -> _PendingOrder | None:
+        async with session_scope(self._sf) as session:
+            order = (
+                await session.execute(
+                    select(Order).where(Order.client_order_id == fill.client_order_id)
+                )
+            ).scalar_one_or_none()
+            if order is None:
+                return None  # OrderManager 가 이미 fill.unknown_order 로 경고
+            lot = self._lots_by_id.get(order.lot_id)
+            if lot is None:
+                # 메모리에 없는 랏(재시작 전 CLOSED 등). DB 투영은 반영됐고(재오픈 포함),
+                # 다음 hydrate 가 복원한다 — 지금은 사람에게 알린다.
+                self._log.warning(
+                    "fill.lot_not_in_memory", lot_id=order.lot_id, client_order_id=fill.client_order_id
+                )
+                await self._notifier.notify(
+                    "fill.unmanaged", lot_id=order.lot_id, qty=str(fill.qty), 조치="엔진 재시작으로 복원"
+                )
+                return None
+            meta = await self._meta_from_order(session, order, lot)
+        meta.filled_qty -= fill.qty  # handle_fill 이 이번 체결을 이미 DB 에 기록했다
+        if order.state not in _TERMINAL_ORDER_STATES or order.state == OrderState.FILLED.value:
+            self._co_map[fill.client_order_id] = meta  # 이어지는 부분체결도 같은 메타로
+        self._log.info("fill.meta_recovered", client_order_id=fill.client_order_id, lot_id=lot.lot_id)
+        return meta
+
+    @staticmethod
+    async def _meta_from_order(session: AsyncSession, order: Order, lot: PositionLot) -> _PendingOrder:
+        """DB 주문 행 → 체결 반영용 메타. is_add 는 '이 랏의 첫 매수 주문이 아니면 추가매수'."""
+        side = Side(order.side)
+        filled = sum(
+            (
+                await session.execute(select(FillRow.qty).where(FillRow.order_id == order.order_id))
+            ).scalars().all(),
+            Decimal(0),
+        )
+        is_add = False
+        if side is Side.BUY:
+            first_buy = (
+                await session.execute(
+                    select(Order.client_order_id)
+                    .where(Order.lot_id == order.lot_id, Order.side == Side.BUY.value)
+                    .order_by(Order.created_at, Order.order_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            is_add = first_buy is not None and first_buy != order.client_order_id
+        return _PendingOrder(lot, side, is_add, order.qty, filled_qty=filled, price=order.price)
+
+    async def _adopt_reopened(self, lot: PositionLot) -> None:
+        """CLOSED 뒤 매수 체결로 다시 열린 랏을 관리 슬롯에 되돌린다 (#5)."""
+        key = self.lot_key(lot.ticker, lot.params.resolution)
+        current = self._lots.get(key)
+        if current is not None and current is not lot:
+            idle = (
+                current.state is PositionState.WATCHING
+                and current.qty == 0
+                and (current.lot_id, Side.BUY) not in self._pending
+            )
+            if not idle:
+                # 슬롯의 새 랏도 보유 중 — 둘 다 관리할 수 없다. 사람이 정리해야 한다.
+                self._log.error("fill.orphan_unmanaged", lot_id=lot.lot_id, ticker=lot.ticker)
+                await self._notifier.notify(
+                    "fill.orphan_unmanaged", ticker=lot.ticker, qty=str(lot.qty), 조치="수동 청산 필요"
+                )
+                return
+            await self._retire_idle_lot(current)
+        self._lots[key] = lot
+        self._log.warning("fill.orphan_reopened", lot_id=lot.lot_id, ticker=lot.ticker, qty=str(lot.qty))
+        await self._notifier.notify(
+            "fill.orphan_reopened", ticker=lot.ticker, qty=str(lot.qty), 사유="청산 뒤 매수 잔량 체결"
+        )
+
+    async def _retire_idle_lot(self, lot: PositionLot) -> None:
+        lot.transition_to(PositionState.CANCELLED)
+        async with session_scope(self._sf) as session:
+            row = await session.get(Position, lot.lot_id)
+            if row is not None:
+                row.state = lot.state.value
+                row.closed_at = datetime.now(UTC)
 
     # -- helpers ---------------------------------------------------------
 
     async def _spawn(self, ticker: str, template: StrategyTemplate) -> PositionLot:
         lot = PositionFactory.create(Signal(ticker=ticker, market=template.market), template)
         self._lots[self.lot_key(ticker, template.resolution)] = lot
+        self._lots_by_id[lot.lot_id] = lot
         async with session_scope(self._sf) as session:
             session.add(
                 Position(
@@ -669,11 +821,18 @@ class TradingService:
 
     async def _sync_runtime(self, lot: PositionLot) -> None:
         """Persist the lot's runtime stop state so hydrate() can restore it after a restart."""
+        # 체결 전(WATCHING)에는 진입 주문의 손절가·의도 수량을 같은 컬럼에 영속한다 —
+        # 체결 전 재시작해도 hydrate() 가 되살려 체결 시 손절가가 적용되게 (#3).
+        stop = lot.initial_stop
+        original_qty = lot.original_qty
+        if lot.state is PositionState.WATCHING:
+            stop = lot.pending_stop
+            original_qty = lot.pending_original_qty or Decimal(0)
         snapshot = (
-            str(lot.initial_stop),
+            str(stop),
             str(lot.peak_price),
             lot.tp_rungs_taken,
-            str(lot.original_qty),
+            str(original_qty),
         )
         if self._runtime_synced.get(lot.lot_id) == snapshot:
             return
@@ -681,10 +840,10 @@ class TradingService:
             row = await session.get(Position, lot.lot_id)
             if row is None:
                 return
-            row.initial_stop = lot.initial_stop if lot.initial_stop is not None else Decimal(0)
+            row.initial_stop = stop if stop is not None else Decimal(0)
             row.peak_price = lot.peak_price
             row.tp_rungs_taken = lot.tp_rungs_taken
-            row.original_qty = lot.original_qty
+            row.original_qty = original_qty
         self._runtime_synced[lot.lot_id] = snapshot
 
     def _cap_entry_qty(

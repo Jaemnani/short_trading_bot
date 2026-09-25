@@ -30,6 +30,11 @@ _CANCEL_NOOP_STATES = frozenset({
     OrderState.REJECTED.value, OrderState.EXPIRED.value,
 })
 
+# 체결 없이 끝난 것으로 확정된 상태 — 늦게 온 체결이 이 상태를 되돌리면 안 된다.
+_TERMINAL_NO_FILL_STATES = frozenset({
+    OrderState.CANCELLED.value, OrderState.REJECTED.value, OrderState.EXPIRED.value,
+})
+
 
 class OrderManager:
     def __init__(
@@ -163,11 +168,19 @@ class OrderManager:
             )
 
             total_filled = await self._total_filled(s, order.order_id) + fill.qty
-            order.state = (
-                OrderState.FILLED.value
-                if total_filled >= order.qty
-                else OrderState.PARTIALLY_FILLED.value
-            )
+            if order.state in _TERMINAL_NO_FILL_STATES:
+                # 취소/만료/거부 확정 뒤 도착한 체결(취소 직전 체결분 등). 체결 자체는 사실이므로
+                # 체결 행과 포지션 투영에는 반영하되, 주문 상태는 되살리지 않는다 — 되살리면
+                # 이미 끝난 주문이 '열린 주문'으로 보여 (lot, side) 잠금이 다시 걸린다.
+                self._log.warning(
+                    "fill.after_terminal", client_order_id=fill.client_order_id, state=order.state
+                )
+            else:
+                order.state = (
+                    OrderState.FILLED.value
+                    if total_filled >= order.qty
+                    else OrderState.PARTIALLY_FILLED.value
+                )
 
             await self._apply_to_position(s, order, fill)
             s.add(
@@ -215,8 +228,12 @@ class OrderManager:
             pos.qty_filled = new_qty
             # Only the WATCHING->HOLDING edge belongs here; richer states (SCALING,
             # EXITING) are owned by the domain lot — stomping them to HOLDING would
-            # corrupt what hydrate() restores after a restart.
-            if pos.state == PositionState.WATCHING.value:
+            # corrupt what hydrate() restores after a restart. CLOSED + 매수 체결 = 청산 뒤
+            # 도착한 매수 잔량: 다시 열어야 hydrate() 가 복원하고 손절이 관리한다.
+            if pos.state in (PositionState.WATCHING.value, PositionState.CLOSED.value):
+                if pos.state == PositionState.CLOSED.value:
+                    self._log.warning("fill.reopen_closed_position", lot_id=order.lot_id)
+                    pos.closed_at = None
                 pos.state = PositionState.HOLDING.value
         else:  # SELL closes part/all of the long -> realize P&L on the held portion only
             realized_qty = min(fill.qty, pos.qty_filled) if pos.qty_filled > 0 else Decimal(0)
