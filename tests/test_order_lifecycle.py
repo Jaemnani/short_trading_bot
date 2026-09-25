@@ -261,3 +261,23 @@ async def test_balance_prefers_settled_d2_cash() -> None:
 
     bal = await _kis(transport).get_balance()
     assert bal.cash[next(iter(bal.cash))] == Decimal("7000000")
+
+
+async def test_overseas_order_survives_kst_midnight(sf) -> None:
+    """미국 DAY 주문은 KST 자정 뒤에도 살아 있다 — KST 날짜로 만료시키면 중복 주문 (#6)."""
+    from datetime import UTC as _UTC
+
+    async with session_scope(sf) as s:
+        s.add(Position(
+            lot_id="us1", ticker="AAPL", market="NASD", currency="USD", side="BUY",
+            state="WATCHING", strategy_id="s", params_json={},
+        ))
+        s.add(Order(
+            order_id="o-us", lot_id="us1", client_order_id="us", broker_order_no="9001",
+            side="BUY", qty=Decimal(1), price=Decimal(200), state=OrderState.NEW.value,
+            created_at=datetime(2026, 9, 24, 14, 30, tzinfo=_UTC),  # KST 9/24 23:30
+        ))
+    om = OrderManager(_Broker(), sf)
+    assert await om.expire_stale(datetime(2026, 9, 24, 19, 0, tzinfo=_UTC)) == 0  # KST 9/25 04:00
+    assert await _state(sf, "us") == OrderState.NEW.value
+    assert await om.expire_stale(datetime(2026, 9, 25, 15, 0, tzinfo=_UTC)) == 1  # 24h 초과

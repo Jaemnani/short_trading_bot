@@ -25,9 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import Fill as FillRow
-from ..persistence.models import Order
+from ..persistence.models import Order, Position
 from .broker.base import BrokerAdapter
-from .order_manager import created_today_kst
+from .order_manager import order_in_session
 from .types import Fill, FillHandler
 
 
@@ -109,14 +109,17 @@ class FillPoller:
             # KIS 주문번호는 거래일 단위 — 과거 날짜 주문과 번호가 겹칠 수 있다. 체결내역은
             # 오늘자만 조회하므로 오늘 생성된 주문으로 한정한다 (전 기간 scalar_one_or_none 은
             # 번호가 겹치는 날 MultipleResultsFound 로 폴링 전체를 멈추거나 과거 랏에 붙인다 #15).
+            # 해외 주문은 KST 자정을 넘겨 살아 있으므로 시장별 세션으로 판정 (order_in_session).
             candidates = [
                 o
-                for o in (
+                for o, market in (
                     await session.execute(
-                        select(Order).where(Order.broker_order_no == broker_order_no)
+                        select(Order, Position.market)
+                        .outerjoin(Position, Order.lot_id == Position.lot_id)
+                        .where(Order.broker_order_no == broker_order_no)
                     )
-                ).scalars().all()
-                if created_today_kst(o.created_at)
+                ).all()
+                if order_in_session(o.created_at, market)
             ]
             if not candidates:
                 return None

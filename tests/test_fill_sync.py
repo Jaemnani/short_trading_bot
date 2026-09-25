@@ -280,3 +280,66 @@ async def test_delayed_buy_for_lot_closed_before_restart_is_rebuilt_and_managed(
     assert managed is not None and managed.lot_id == lot.lot_id
     assert managed.is_open and managed.qty == Decimal(70)
     assert any(n.event == "fill.orphan_reopened" for n in notifier.sent)
+
+
+async def test_replacement_sell_aborts_when_fill_refresh_fails(sf) -> None:
+    """교체 매도: 취소 뒤 체결 반영이 실패하면 낡은 보유량으로 내지 않고, 반영 성공 후에만 낸다."""
+    from short_trading_bot.execution.types import Execution
+
+    class _Flaky(RestingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = False
+            self.executions: list[Execution] = []
+
+        async def get_executions(self) -> list[Execution]:
+            if self.fail:
+                raise RuntimeError("KIS HTTP 500")
+            return self.executions
+
+    broker = _Flaky()
+    svc, _, _ = _svc(sf, broker)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(9000)))
+    await svc._submit(lot, Side.SELL, Decimal(10), Decimal(9000), is_add=False, reason="kill_switch")
+    broker.executions = [Execution(
+        exec_id="B2:4", broker_order_no="B2", ticker="005930", side=Side.SELL,
+        qty=Decimal(4), price=Decimal(9000),
+    )]
+    broker.fail = True
+    n = len(broker.submitted)
+
+    assert not await svc._submit(
+        lot, Side.SELL, lot.qty, Decimal(8900), is_add=False, reason="kill_switch", replace_pending=True
+    )
+    assert len(broker.submitted) == n  # 낡은 수량(10주)으로 재제출하지 않음
+    # 다음 봉: 잠금은 풀렸지만 반영 실패 표시가 남아 있어 여전히 보류
+    assert not await svc._submit(lot, Side.SELL, lot.qty, Decimal(8900), is_add=False, reason="kill_switch")
+    assert len(broker.submitted) == n
+
+    broker.fail = False  # 반영 성공 → 남은 6주만
+    assert await svc._submit(lot, Side.SELL, lot.qty, Decimal(8900), is_add=False, reason="kill_switch")
+    assert lot.qty == Decimal(6) and broker.submitted[-1].qty == Decimal(6)
+
+
+async def test_open_buy_on_closed_lot_survives_restart_and_blocks_flat(sf) -> None:
+    """청산으로 CLOSED 됐지만 매수 주문이 살아 있는 랏: 재시작 뒤에도 잠금·메타가 복원돼
+    긴급중지 엔진이 조기 종료하지 않고, flat-all 이 그 매수를 취소한다."""
+    s1, _, _ = _svc(sf)
+    lot = await s1._spawn("035420", _TMPL)
+    await s1._submit(lot, Side.BUY, Decimal(100), Decimal(100), is_add=False, reason="enter")
+    buy = s1._pending[(lot.lot_id, Side.BUY)]
+    await s1._on_fill(Fill(buy, Decimal(30), Decimal(100)))
+    await s1._submit(lot, Side.SELL, Decimal(30), Decimal(95), is_add=False, reason="hard_stop")
+    await s1._on_fill(Fill(s1._pending[(lot.lot_id, Side.SELL)], Decimal(30), Decimal(95)))
+    assert (await _db_position(sf, lot.lot_id)).state == PositionState.CLOSED.value
+
+    s2, broker2, _ = _svc(sf)  # 재시작
+    await s2.hydrate()
+    assert s2._pending[(lot.lot_id, Side.BUY)] == buy
+    assert not s2.is_flat()  # 살아 있는 매수 → 아직 종료하면 안 됨
+
+    await s2._flat_all()
+    assert broker2.cancelled  # 슬롯 밖 랏의 매수도 취소
+    assert (lot.lot_id, Side.BUY) not in s2._pending and s2.is_flat()

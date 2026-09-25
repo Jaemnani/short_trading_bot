@@ -201,3 +201,17 @@ async def test_paper_resting_limits_wait_for_cross_and_can_be_cancelled() -> Non
 
     marketable = await broker.submit_order(_limit(Side.SELL, 70000, cid="c3"))  # 이미 교차
     assert marketable.accepted and len(fills) == 2
+
+
+async def test_paper_resting_buys_reserve_cash() -> None:
+    """대기 매수는 대금을 예약 — 같은 현금으로 여러 매수가 받아져 함께 체결되면 현금이 음수가 된다."""
+    broker = PaperBrokerAdapter(PaperConfig(initial_cash=Decimal(1_000_000), resting_limits=True))
+    await broker.on_market_price("005930", Decimal(70000))
+    first = await broker.submit_order(_limit(Side.BUY, 69000, cid="a"))  # 10주 = 69만
+    second = await broker.submit_order(_limit(Side.BUY, 69000, cid="b"))  # 예약 후 잔여 31만 → 거부
+    assert first.accepted and not second.accepted and second.reject_reason == "insufficient_funds"
+    await broker.cancel_order(_limit(Side.BUY, 69000, cid="a"), first.broker_order_no)
+    third = await broker.submit_order(_limit(Side.BUY, 69000, cid="c"))  # 취소로 예약 해제
+    assert third.accepted
+    await broker.on_market_price("005930", Decimal(68000))
+    assert broker.cash() >= 0

@@ -53,6 +53,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._exec_fee_cum: dict[str, Decimal] = {}
         self._exec_tax_cum: dict[str, Decimal] = {}
         self._resting: dict[str, OrderRequest] = {}  # broker_no -> 미체결 지정가 (resting_limits)
+        self._reserved: dict[str, Decimal] = {}  # broker_no -> 대기 매수 예약 대금
         self._log = logger or get_logger("paper_broker")
 
     @property
@@ -76,7 +77,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         if (
             req.side == Side.BUY
             and self.config.enforce_funds
-            and self._estimated_cost(fill_price, req.qty) > self._cash.get(ccy, Decimal(0))
+            and self._estimated_cost(fill_price, req.qty) > self._available_cash(ccy)
         ):
             return OrderAck(req.client_order_id, accepted=False, reject_reason="insufficient_funds")
 
@@ -85,6 +86,10 @@ class PaperBrokerAdapter(BrokerAdapter):
 
         if self.config.resting_limits and not req.is_market and not self._crosses(req, ref):
             self._resting[broker_no] = req  # 시세가 닿을 때까지 대기
+            if req.side == Side.BUY:
+                # 대기 매수의 대금을 예약한다 — 예약 없이 같은 현금으로 여러 매수를 받으면 함께
+                # 체결될 때 현금이 음수가 된다 (실계좌의 주문가능금액 차감과 같은 의미).
+                self._reserved[broker_no] = self._estimated_cost(req.price, req.qty)
             return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_no, tr_id="PAPER")
 
         for qty in self._chunk(req.qty):
@@ -96,6 +101,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         # 즉시 체결 모드엔 걸린 주문이 없다. resting_limits 면 대기 주문을 뺀다.
         if broker_order_no is not None:
             self._resting.pop(broker_order_no, None)
+            self._reserved.pop(broker_order_no, None)
         return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_order_no)
 
     async def on_market_price(self, ticker: str, price: Decimal) -> None:
@@ -104,6 +110,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         for broker_no, req in list(self._resting.items()):
             if req.ticker == ticker and self._crosses(req, price):
                 del self._resting[broker_no]
+                self._reserved.pop(broker_no, None)  # 예약 해제 → 실제 체결 대금으로 차감
                 for qty in self._chunk(req.qty):
                     await self._apply_and_emit(req, req.price, qty, req.market.currency, broker_no)
 
@@ -144,6 +151,14 @@ class PaperBrokerAdapter(BrokerAdapter):
         assert ref is not None
         slip = ref * self.config.slippage_bps / _BPS
         return ref + slip if req.side == Side.BUY else ref - slip
+
+    def _available_cash(self, ccy: Currency) -> Decimal:
+        """현금 - 대기 매수 예약분 (예약 통화는 주문 시장 통화)."""
+        reserved = sum(
+            (amt for no, amt in self._reserved.items() if self._resting[no].market.currency == ccy),
+            Decimal(0),
+        )
+        return self._cash.get(ccy, Decimal(0)) - reserved
 
     def _estimated_cost(self, price: Decimal, qty: Decimal) -> Decimal:
         notional = price * qty

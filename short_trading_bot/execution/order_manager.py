@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..domain.enums import OrderState, PositionState, Side
+from ..domain.enums import Market, OrderState, PositionState, Side
 from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
@@ -47,6 +47,25 @@ def _kst_date(ts: datetime) -> date:
 def created_today_kst(ts: datetime, now: datetime | None = None) -> bool:
     """주문이 오늘(KST) 생성됐나 — KIS 주문번호는 거래일 단위라 날짜로 한정해야 한다."""
     return _kst_date(ts) == (now or datetime.now(UTC)).astimezone(_KST).date()
+
+
+# 해외(미국) DAY 주문은 KST 자정을 넘겨 살아 있다(현지 장 마감 ≈ KST 05~06시). KST 날짜로
+# 자르면 살아 있는 주문을 만료시켜 잠금이 풀리고 중복 주문이 나간다. 해외는 KIS 가 받는
+# 가장 이른 시각(현지 프리마켓)부터 장 마감까지도 24시간을 넘지 않으므로 경과시간으로 판정.
+_OVERSEAS_ORDER_LIFETIME = timedelta(hours=24)
+
+
+def order_in_session(ts: datetime, market: str | None, now: datetime | None = None) -> bool:
+    """주문이 아직 '현재 거래 세션'에 속하나 (KRX = 오늘 KST, 해외 = 24시간 이내)."""
+    now = now or datetime.now(UTC)
+    try:
+        overseas = Market(market).is_overseas if market else False
+    except ValueError:
+        overseas = False
+    if overseas:
+        aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+        return now - aware < _OVERSEAS_ORDER_LIFETIME
+    return created_today_kst(ts, now)
 
 
 # 체결 없이 끝난 것으로 확정된 상태 — 늦게 온 체결이 이 상태를 되돌리면 안 된다.
@@ -239,14 +258,17 @@ class OrderManager:
         없어야 하는 PENDING_NEW(프로세스가 브로커 호출 도중 죽은 흔적)는 오늘 것이면
         UNKNOWN 으로 넘겨 resolver 가 브로커 주문내역으로 정체를 밝히게 한다."""
         now = now or datetime.now(UTC)
-        today = now.astimezone(_KST).date()
         expired = 0
         async with session_scope(self._sf) as s:
             rows = (
-                await s.execute(select(Order).where(Order.state.in_(_OPEN_STATES)))
-            ).scalars().all()
-            for order in rows:
-                if _kst_date(order.created_at) < today:
+                await s.execute(
+                    select(Order, Position.market)
+                    .outerjoin(Position, Order.lot_id == Position.lot_id)
+                    .where(Order.state.in_(_OPEN_STATES))
+                )
+            ).all()
+            for order, market in rows:
+                if not order_in_session(order.created_at, market, now):
                     prev = order.state
                     order.state = OrderState.EXPIRED.value
                     s.add(self._audit("order.expired", order.lot_id, {

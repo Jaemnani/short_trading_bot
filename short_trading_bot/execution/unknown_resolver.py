@@ -30,7 +30,7 @@ from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
 from .broker.base import BrokerAdapter
-from .order_manager import created_today_kst
+from .order_manager import order_in_session
 
 
 class UnknownOrderResolver:
@@ -59,12 +59,12 @@ class UnknownOrderResolver:
                 row.broker_order_no
                 for row in (
                     await session.execute(
-                        select(Order.broker_order_no, Order.created_at).where(
-                            Order.broker_order_no.is_not(None)
-                        )
+                        select(Order.broker_order_no, Order.created_at, Position.market)
+                        .outerjoin(Position, Order.lot_id == Position.lot_id)
+                        .where(Order.broker_order_no.is_not(None))
                     )
                 ).all()
-                if created_today_kst(row.created_at)
+                if order_in_session(row.created_at, row.market)
             }
         records = await self._broker.get_daily_orders()
 
