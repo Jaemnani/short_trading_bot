@@ -554,3 +554,52 @@ async def test_confirmed_refresh_retries_suspended_overseas_reads(sf) -> None:
     await svc._refresh_fills()
     assert overseas.calls == 4 and routing.executions_complete
     assert svc._startup_refresh_pending is False
+
+
+async def test_fill_on_resolver_rejected_order_revives_it_and_relocks(sf) -> None:
+    """resolver 가 '주문내역에 없음'으로 REJECTED 처리한 주문에 체결이 오면 → 접수됐던 것.
+    잔량이 살아 있으니 열린 상태로 되돌리고 중복 주문 잠금을 다시 건다."""
+    svc, _, _ = _svc(sf)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    cid = svc._pending[(lot.lot_id, Side.BUY)]
+    async with session_scope(sf) as s:
+        row = (await s.execute(select(Order).where(Order.client_order_id == cid))).scalar_one()
+        row.state = OrderState.REJECTED.value  # resolver 추정 만료
+    assert await svc._release_if_terminal((lot.lot_id, Side.BUY))
+    svc._co_map.pop(cid, None)
+
+    await svc._on_fill(Fill(cid, Decimal(4), Decimal(9000)))
+
+    assert await _order_state(sf, cid) == OrderState.PARTIALLY_FILLED.value
+    assert svc._pending[(lot.lot_id, Side.BUY)] == cid  # 잔량 6주 — 재주문 금지
+    assert lot.qty == Decimal(4)
+
+
+async def test_off_slot_lots_are_subscribed(sf) -> None:
+    """슬롯 밖 랏(보유/걸린 주문)도 구독 목록에 — 없으면 시세가 안 와 손절·청산이 돌지 않는다."""
+    svc, _, _ = _svc(sf)
+    old = await svc._spawn("035420", _TMPL)
+    await svc._submit(old, Side.BUY, Decimal(3), Decimal(9000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(old.lot_id, Side.BUY)], Decimal(3), Decimal(9000)))
+    svc._lots.pop(svc.lot_key("035420", old.params.resolution))  # 슬롯에서 빠진 상태 재현
+    assert "035420" in svc.tracked_tickers()
+
+
+async def test_reopened_orphan_triggers_subscribe_hook(sf) -> None:
+    svc, _, _ = _svc(sf)
+    subscribed: list[str] = []
+
+    async def hook(ticker: str) -> bool:
+        subscribed.append(ticker)
+        return True
+
+    svc.subscribe_hook = hook
+    lot = await svc._spawn("035420", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    buy = svc._pending[(lot.lot_id, Side.BUY)]
+    await svc._on_fill(Fill(buy, Decimal(4), Decimal(9000)))
+    await svc._submit(lot, Side.SELL, Decimal(4), Decimal(9000), is_add=False, reason="hard_stop")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.SELL)], Decimal(4), Decimal(9000)))
+    await svc._on_fill(Fill(buy, Decimal(6), Decimal(9000)))  # 청산 뒤 매수 잔량 → 재오픈
+    assert subscribed == ["035420"]

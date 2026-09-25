@@ -16,7 +16,7 @@ This matters because KIS allows a single concurrent WS connection per appkey.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from datetime import date as _date
@@ -147,6 +147,9 @@ class TradingService:
         # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
         self.health = EngineHealth()
         self._equity_cache: Decimal | None = None
+        self._cash_cache: Decimal | None = None  # 현금(원화 환산)만 캐시 — 보유 평가는 매번 새로
+        # 실행 중 새로 추적하게 된 종목을 현재 시세 연결에 구독시키는 훅 (cli 가 설정).
+        self.subscribe_hook: Callable[[str], Awaitable[object]] | None = None
         self._equity_at = 0.0  # monotonic
         self._co_map: dict[str, _PendingOrder] = {}
         self._fill_poller: FillPoller | None = None
@@ -430,7 +433,15 @@ class TradingService:
         봉이 없어 못 돌아 랏이 영구히 남는 악순환이 생긴다 (실측: 관망 12 중 6이 미구독
         상태로 잔존). 구독이 붙으면 만료가 정상 작동해 스스로 정리된다."""
         lot_tickers = {lot.ticker for lot in self._lots.values()}
-        return {ticker for ticker, tmpls in self._by_ticker.items() if tmpls} | lot_tickers
+        # 슬롯 밖 랏(재시작 복원된 종결 랏의 살아 있는 주문, 재오픈 고아)도 시세가 있어야
+        # 손절·긴급중지 청산이 돈다 — 보유 중이거나 걸린 주문이 있는 것만.
+        pending_lots = {lot_id for lot_id, _side in self._pending}
+        off_slot = {
+            lot.ticker
+            for lot in self._tracked_lots()
+            if lot.qty > 0 or lot.lot_id in pending_lots
+        }
+        return {ticker for ticker, tmpls in self._by_ticker.items() if tmpls} | lot_tickers | off_slot
 
     async def status_snapshot(self) -> dict[str, object]:
         """대시보드용 실시간 현황 — 엔진이 주기적으로 파일에 기록해 API 프로세스가 읽는다.
@@ -976,6 +987,9 @@ class TradingService:
         meta.filled_qty -= fill.qty  # handle_fill 이 이번 체결을 이미 DB 에 기록했다
         if order.state not in _TERMINAL_ORDER_STATES or order.state == OrderState.FILLED.value:
             self._co_map[fill.client_order_id] = meta  # 이어지는 부분체결도 같은 메타로
+        if order.state in _OPEN_ORDER_STATES:
+            # 잔량이 살아 있는 주문(거부로 추정됐다가 체결로 되살아난 주문 포함) — 잠금을 다시 건다.
+            self._pending.setdefault((lot.lot_id, meta.side), fill.client_order_id)
         self._log.info("fill.meta_recovered", client_order_id=fill.client_order_id, lot_id=lot.lot_id)
         return meta
 
@@ -1004,6 +1018,12 @@ class TradingService:
 
     async def _adopt_reopened(self, lot: PositionLot) -> None:
         """CLOSED 뒤 매수 체결로 다시 열린 랏을 관리 슬롯에 되돌린다 (#5)."""
+        if self.subscribe_hook is not None:
+            # 스캐너 합류분처럼 이미 구독에서 빠진 종목일 수 있다 — 시세가 있어야 손절이 돈다.
+            try:
+                await self.subscribe_hook(lot.ticker)
+            except Exception:
+                self._log.exception("fill.orphan_subscribe_failed", ticker=lot.ticker)
         key = self.lot_key(lot.ticker, lot.params.resolution)
         current = self._lots.get(key)
         if current is not None and current is not lot:
@@ -1124,29 +1144,42 @@ class TradingService:
         return rate
 
     async def _cached_equity(self) -> Decimal | None:
-        """평가금 — 최대 EQUITY_TTL_SECONDS 동안 캐시. 실패 시 직전 값을 유지한다.
+        """평가금 = 캐시된 현금(브로커 REST, 최대 EQUITY_TTL_SECONDS) + **매번 새로** 계산한 보유 평가.
 
-        조회 실패마다 화면이 '—' 로 깜빡이면 오히려 이상해 보인다. 값이 아주 없을 때만 None."""
+        캐시하는 건 느린 잔고 조회(현금)뿐이다. 보유 평가까지 캐시하면 급락이 _last_price 에
+        반영돼도 TTL 동안 평가금·낙폭 판정에 안 닿아, 같은 분의 다른 종목 진입이 하락 전
+        평가금 기준으로 통과한다. 현금 조회 실패 시 직전 현금 유지, 한 번도 없으면 None."""
         now = time.monotonic()
-        if self._equity_cache is not None and now - self._equity_at < EQUITY_TTL_SECONDS:
-            return self._equity_cache
-        try:
-            self._equity_cache = await self._equity()
-            self._equity_at = now
-        except Exception:
-            self._log.warning("equity.refresh_failed")  # 직전 값 유지 (있으면)
+        if self._cash_cache is None or now - self._equity_at >= EQUITY_TTL_SECONDS:
+            try:
+                balance = await self._broker.get_balance()
+                self._cash_cache = self._cash_value(balance.cash)
+                self._equity_at = now
+            except Exception:
+                self._log.warning("equity.refresh_failed")  # 직전 현금 유지 (있으면)
+        if self._cash_cache is None:
+            return None
+        self._equity_cache = self._cash_cache + self._holdings_value()
         return self._equity_cache
 
     async def _equity(self) -> Decimal:
         balance = await self._broker.get_balance()
-        equity = Decimal(0)
-        for currency, amount in balance.cash.items():
-            equity += amount * self._fx_rate_checked(currency)
-        for lot in self._lots.values():
+        return self._cash_value(balance.cash) + self._holdings_value()
+
+    def _cash_value(self, cash: dict[Currency, Decimal]) -> Decimal:
+        return sum(
+            (amount * self._fx_rate_checked(currency) for currency, amount in cash.items()),
+            Decimal(0),
+        )
+
+    def _holdings_value(self) -> Decimal:
+        # 슬롯 밖 보유(재오픈 고아 등)도 실제 보유 — 빼면 평가금·낙폭이 틀어진다.
+        value = Decimal(0)
+        for lot in self._tracked_lots():
             if lot.qty > 0:
                 rate = self._fx_rate_checked(lot.currency)
-                equity += lot.qty * self._last_price.get(lot.ticker, lot.avg_entry) * rate
-        return equity
+                value += lot.qty * self._last_price.get(lot.ticker, lot.avg_entry) * rate
+        return value
 
     def _risk_snapshot(self, equity: Decimal) -> RiskSnapshot:
         # 슬롯 밖 보유(재오픈 고아 등)도 실제 보유다 — 한도 계산에서 빼면 초과 진입이 난다.

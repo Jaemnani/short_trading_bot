@@ -178,3 +178,31 @@ async def test_risk_snapshot_counts_slot_collision_holdings(sf) -> None:
     snap = svc._risk_snapshot(Decimal(10**8))
     assert snap.open_positions == 2
     assert snap.ticker_exposure["035420"] == Decimal(50000)
+
+
+async def test_equity_cache_reuses_cash_but_revalues_holdings(sf) -> None:
+    """잔고(현금) 조회만 캐시 — 보유 평가는 매번 새로 계산해 급락이 즉시 평가금에 반영된다."""
+    class _Cash(RestingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.balance_calls = 0
+
+        async def get_balance(self) -> AccountBalance:
+            from short_trading_bot.domain.enums import Currency
+
+            self.balance_calls += 1
+            return AccountBalance(cash={Currency.KRW: Decimal(1_000_000)})
+
+    broker = _Cash()
+    svc = _svc(sf, broker)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(10000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(10000)))
+    svc._last_price["005930"] = Decimal(10000)
+    assert await svc._cached_equity() == Decimal(1_100_000)
+    svc._last_price["005930"] = Decimal(7000)  # 급락
+    assert await svc._cached_equity() == Decimal(1_070_000)
+    assert broker.balance_calls == 1  # 현금 조회는 TTL 캐시
+
+    svc._lots.pop(svc.lot_key("005930", lot.params.resolution))  # 슬롯 밖 보유도 평가에 포함
+    assert await svc._cached_equity() == Decimal(1_070_000)

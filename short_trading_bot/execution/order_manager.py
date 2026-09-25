@@ -221,7 +221,17 @@ class OrderManager:
             )
 
             total_filled = await self._total_filled(s, order.order_id) + fill.qty
-            if order.state in _TERMINAL_NO_FILL_STATES:
+            if order.state == OrderState.REJECTED.value:
+                # 체결이 왔다 = 브로커가 접수했었다는 증거. resolver 가 '주문내역에 없음'으로
+                # 추정 만료시킨 주문일 수 있다 — REJECTED 로 두면 잠금이 풀린 채 잔량이 살아
+                # 중복 주문이 난다. 체결 수량 기준 열린/완료 상태로 되돌린다.
+                self._log.warning("fill.on_rejected_order", client_order_id=fill.client_order_id)
+                order.state = (
+                    OrderState.FILLED.value
+                    if total_filled >= order.qty
+                    else OrderState.PARTIALLY_FILLED.value
+                )
+            elif order.state in _TERMINAL_NO_FILL_STATES:
                 # 취소/만료/거부 확정 뒤 도착한 체결(취소 직전 체결분 등). 체결 자체는 사실이므로
                 # 체결 행과 포지션 투영에는 반영하되, 주문 상태는 되살리지 않는다 — 되살리면
                 # 이미 끝난 주문이 '열린 주문'으로 보여 (lot, side) 잠금이 다시 걸린다.

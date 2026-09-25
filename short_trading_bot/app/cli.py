@@ -163,6 +163,12 @@ def serve(
     )
     feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
+    async def _subscribe_now(ticker: str) -> bool:
+        feed = feed_ref["feed"]
+        return await feed.subscribe(ticker) if feed is not None else False
+
+    service.subscribe_hook = _subscribe_now  # 재오픈된 고아 랏 등 실행 중 추적 합류분
+
     def _subscriptions() -> list[str]:
         """지금 시세가 필요한 종목 전부 — 매 (재)접속마다 새로 계산한다.
 
