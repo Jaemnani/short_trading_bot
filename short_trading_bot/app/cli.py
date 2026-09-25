@@ -1234,6 +1234,7 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
     10분·1회용이므로 승인 직후 바로 실행할 것.
     """
     import asyncio
+    import secrets
     import time
     import webbrowser
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1295,10 +1296,13 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
         _save_and_test(extract_auth_code(code))
         return
 
+    # OAuth state: 대기 중에 사용자가 연 다른 웹페이지가 localhost 콜백으로 가짜 code/error 를
+    # 밀어 넣어(login CSRF) 공격자 계정 토큰을 저장시키거나 승인을 중단시키지 못하게 한다.
+    oauth_state = secrets.token_urlsafe(16)
     auth_url = (
         "https://kauth.kakao.com/oauth/authorize"
         f"?client_id={key}&redirect_uri={quote(redirect_uri, safe='')}"
-        "&response_type=code&scope=talk_message"
+        f"&response_type=code&scope=talk_message&state={oauth_state}"
     )
     typer.echo("브라우저에서 카카오 로그인 후 [동의하고 계속하기]. 창이 안 열리면 직접 접속:")
     typer.echo(f"  {auth_url}")
@@ -1310,12 +1314,16 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            qs = parse_qs(urlparse(self.path).query)
+            url = urlparse(self.path)
+            qs = parse_qs(url.query)
             got_code, got_error = qs.get("code", [""])[0], qs.get("error", [""])[0]
+            state_ok = url.path == "/kakao" and secrets.compare_digest(
+                qs.get("state", [""])[0].encode(), oauth_state.encode()
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            if got_code or got_error:
+            if (got_code or got_error) and state_ok:
                 captured["code"], captured["error"] = got_code, got_error
                 body = "<h3>승인 완료 — 터미널로 돌아가세요.</h3>"
             else:

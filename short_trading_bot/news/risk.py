@@ -21,6 +21,9 @@ import httpx
 
 from ..infra.logging import get_logger
 
+MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+MAX_UNZIPPED_BYTES = 200 * 1024 * 1024
+
 # (url, params) -> 응답 바이트 (list.json은 json, corpCode.xml은 zip)
 Transport = Callable[[str, dict[str, str]], Awaitable[bytes]]
 
@@ -94,9 +97,18 @@ class DartRiskChecker:
 
     @staticmethod
     def parse_corp_codes(zip_bytes: bytes) -> dict[str, str]:
-        """corpCode.xml(zip) → {종목코드: corp_code} (상장사만)."""
+        """corpCode.xml(zip) → {종목코드: corp_code} (상장사만).
+
+        압축 해제 크기에 상한을 둔다 (zip bomb 방지 — 실제 CORPCODE.xml 은 수십 MB). 헤더의
+        file_size 는 위조될 수 있으므로 읽을 때도 상한+1 바이트까지만 읽어 확인한다."""
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            xml = zf.read(zf.namelist()[0])
+            info = zf.infolist()[0]
+            if info.file_size > MAX_UNZIPPED_BYTES:
+                raise ValueError(f"corpCode.xml too large: {info.file_size} bytes")
+            with zf.open(info) as member:
+                xml = member.read(MAX_UNZIPPED_BYTES + 1)
+            if len(xml) > MAX_UNZIPPED_BYTES:
+                raise ValueError("corpCode.xml exceeds size cap")
         out: dict[str, str] = {}
         for el in ElementTree.fromstring(xml).iter("list"):
             stock = (el.findtext("stock_code") or "").strip()
@@ -109,7 +121,19 @@ class DartRiskChecker:
 
     @staticmethod
     async def _default_transport(url: str, params: dict[str, str]) -> bytes:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        return await dart_http_get(url, params)
+
+
+async def dart_http_get(url: str, params: dict[str, str]) -> bytes:
+    """DART GET. 쿼리에 API 키(crtfc_key)가 실리므로 httpx 예외(URL 전체 포함)를 그대로
+    올리지 않는다 — 로그에 키가 남는다 (#12 과 같은 부류)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
             resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            return resp.content
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"DART request failed: {type(exc).__name__}") from None
+    if resp.status_code >= 400:
+        raise RuntimeError(f"DART HTTP {resp.status_code}")
+    if len(resp.content) > MAX_RESPONSE_BYTES:
+        raise RuntimeError(f"DART response too large: {len(resp.content)} bytes")
+    return resp.content

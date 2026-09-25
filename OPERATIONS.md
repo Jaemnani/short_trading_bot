@@ -54,6 +54,10 @@ go-live 리서치에서 발견한 **실전 거부/오작동 유발 버그를 이
 
 - `.env`(루트, 커밋 금지) 필수: `STB_MODE`(처음 PAPER), `STB_KIS__LIVE__APP_KEY/APP_SECRET/ACCOUNT_NO`, `STB_API_JWT_SECRET`(기본값 금지, 32바이트+). 모의용 `STB_KIS__PAPER__*`도.
 - 안전/운영: `STB_DRY_RUN=true`(시작), `STB_LOG_FORMAT=json`(prod), `STB_API_USERNAME/PASSWORD`(admin/admin 변경).
+  - `STB_DRY_RUN=true` 이면 `STB_MODE=LIVE` 에서 `serve --live-exec`(실전 실주문)이 **기동 거부**된다. 모의계좌 `--live-exec` 에는 영향 없음. LIVE + `--live-exec` 는 preflight critical 전부 통과도 강제.
+  - 대시보드: JWT 시크릿/비밀번호가 기본값이면 `trader api` 는 `--host 127.0.0.1` 로만 뜬다 (0.0.0.0 거부). LIVE preflight 에서도 `api_credentials_secure` 가 critical. 로그인 실패 10회/5분 → 429. CORS 는 기본 꺼짐(`STB_API_CORS_ORIGINS` 명시 목록만). `/ws` 는 `?token=<JWT>` 필요.
+- 긴급중지 영속: 엔진이 STOP 을 받으면 즉시 `data/kill_switch.active` 를 만든다. 청산 도중 죽어도 재기동 시 STOPPED+전량청산을 이어서 하고, 보유·걸린 주문이 0 이 될 때까지 종료하지 않는다. 해제 = 대시보드 `resume` 또는 수동 `./run_paper.sh`.
+- 의존성 고정: `requirements.lock`(해시 포함, `uv pip compile pyproject.toml --universal --generate-hashes` 로 갱신). 재현 설치는 `pip install --require-hashes -r requirements.lock && pip install --no-deps -e .`.
 - 확인: `trader config` (시크릿 마스킹된 설정 출력).
 - **PostgreSQL**: `STB_DB_URL=postgresql+asyncpg://user:pass@host/db`. 실전에 sqlite/`:memory:` 금지(멱등·reconcile가 재시작을 견뎌야 함; preflight `db_persistent` 체크).
 - 마이그레이션: `alembic upgrade head` (prod는 `trader initdb` 쓰지 말 것 — dev 전용).

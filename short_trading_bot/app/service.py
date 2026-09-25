@@ -463,6 +463,7 @@ class TradingService:
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close
+        await self._broker.on_market_price(bar.ticker, bar.close)  # 페이퍼 대기 지정가 매칭
         self.health.on_bar(bar.ticker, datetime.now(UTC))
         if self._regime is not None and bar.ticker == self._regime.proxy_ticker:
             self._regime.on_proxy_bar(bar.ts.date(), bar.close)

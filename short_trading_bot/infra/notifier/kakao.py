@@ -19,6 +19,7 @@ API 사실관계 (2026-08 확인):
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -72,16 +73,22 @@ class KakaoToken:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "access_token": self.access_token,
-                    "refresh_token": self.refresh_token,
-                    "access_expires_at": self.access_expires_at,
-                    "scope": self.scope,
-                }
-            )
-        )
+        data = json.dumps(
+            {
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+                "access_expires_at": self.access_expires_at,
+                "scope": self.scope,
+            }
+        ).encode()
+        # 소유자 전용(0600)으로 만든다 — umask 기본(0644)이면 같은 머신의 다른 계정이
+        # 리프레시 토큰(최대 2개월)을 읽어 내 카카오톡으로 메시지를 보낼 수 있다.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)  # 이전 실행이 남긴 tmp 가 넓은 권한이어도 교정
+            os.write(fd, data)
+        finally:
+            os.close(fd)
         tmp.replace(path)  # 원자적 교체 — 갱신 중 크래시로 토큰 파일이 깨지지 않게
 
 

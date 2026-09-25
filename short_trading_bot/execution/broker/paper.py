@@ -28,6 +28,10 @@ class PaperConfig:
     sell_tax_bps: Decimal = Decimal("20")  # 0.20% KRX 증권거래세 (sell only), 2026
     max_fill_chunks: int = 1  # >1 => simulate partial fills
     enforce_funds: bool = True
+    # True = 지정가는 시세가 교차할 때만 체결, 그 전엔 미체결로 대기(취소 가능) — 실계좌처럼.
+    # 기본 False(기존 검증 동작: 지정가 즉시 체결) 보존. 미체결·부분체결 계열 버그(#4 #5 #7)는
+    # 즉시 체결 모드에선 절대 재현되지 않으므로 회귀 테스트는 이 모드로 쓴다 (#22).
+    resting_limits: bool = False
 
 
 @dataclass(slots=True)
@@ -48,6 +52,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._exec_cum: dict[str, Decimal] = {}  # broker_order_no -> cumulative executed qty
         self._exec_fee_cum: dict[str, Decimal] = {}
         self._exec_tax_cum: dict[str, Decimal] = {}
+        self._resting: dict[str, OrderRequest] = {}  # broker_no -> 미체결 지정가 (resting_limits)
         self._log = logger or get_logger("paper_broker")
 
     @property
@@ -78,14 +83,35 @@ class PaperBrokerAdapter(BrokerAdapter):
         self._seq += 1
         broker_no = f"PAPER-{self._seq:08d}"
 
+        if self.config.resting_limits and not req.is_market and not self._crosses(req, ref):
+            self._resting[broker_no] = req  # 시세가 닿을 때까지 대기
+            return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_no, tr_id="PAPER")
+
         for qty in self._chunk(req.qty):
             await self._apply_and_emit(req, fill_price, qty, ccy, broker_no)
 
         return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_no, tr_id="PAPER")
 
     async def cancel_order(self, req: OrderRequest, broker_order_no: str | None) -> OrderAck:
-        # Paper fills immediately, so there is nothing working to cancel.
+        # 즉시 체결 모드엔 걸린 주문이 없다. resting_limits 면 대기 주문을 뺀다.
+        if broker_order_no is not None:
+            self._resting.pop(broker_order_no, None)
         return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_order_no)
+
+    async def on_market_price(self, ticker: str, price: Decimal) -> None:
+        """시세 갱신 — resting_limits 면 교차한 대기 지정가를 지정가로 체결한다."""
+        self._prices[ticker] = price
+        for broker_no, req in list(self._resting.items()):
+            if req.ticker == ticker and self._crosses(req, price):
+                del self._resting[broker_no]
+                for qty in self._chunk(req.qty):
+                    await self._apply_and_emit(req, req.price, qty, req.market.currency, broker_no)
+
+    @staticmethod
+    def _crosses(req: OrderRequest, ref: Decimal | None) -> bool:
+        if ref is None:
+            return False
+        return ref <= req.price if req.side == Side.BUY else ref >= req.price
 
     async def get_balance(self) -> AccountBalance:
         positions = [
@@ -102,7 +128,10 @@ class PaperBrokerAdapter(BrokerAdapter):
         return AccountBalance(cash=dict(self._cash), positions=positions)
 
     async def get_open_orders(self) -> list[OrderAck]:
-        return []
+        return [
+            OrderAck(req.client_order_id, accepted=True, broker_order_no=no, tr_id="PAPER")
+            for no, req in self._resting.items()
+        ]
 
     async def get_executions(self) -> list[Execution]:
         return list(self._executions)

@@ -7,6 +7,7 @@ mirroring the plan's "broker order/fill events flow back onto the event bus".
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from decimal import Decimal
 
 from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRecord, OrderRequest
 
@@ -38,6 +39,11 @@ class BrokerAdapter(ABC):
         """Authoritative executed-trade records (체결내역). Default empty; live adapters
         override. The FillPoller polls this and dedups by exec_id — ground-truth fills."""
         return []
+
+    async def on_market_price(self, ticker: str, price: Decimal) -> None:
+        """Latest market price for ``ticker``. Default no-op; the paper broker uses it to
+        match resting limit orders (``PaperConfig.resting_limits``)."""
+        return None
 
     async def get_daily_orders(self) -> list[OrderRecord]:
         """Today's broker-side orders, filled or not (주문내역). Default empty; live
