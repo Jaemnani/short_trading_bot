@@ -521,8 +521,10 @@ class TradingService:
         keep: set[str] = set()
         if days:
             handler = self._om.handle_fill if db_only else self._on_fill
-            poller = FillPoller(self._broker, self._sf, handler)
             for day in days:
+                # 날짜마다 새 폴러 — 체결 ID(주문번호:누적수량)는 거래일 단위라 날짜가 다르면
+                # 같은 ID 가 나올 수 있고, 한 폴러의 중복 제거 집합을 공유하면 둘째 날을 건너뛴다.
+                poller = FillPoller(self._broker, self._sf, handler)
                 try:
                     await poller.poll_day(day)
                 except Exception:
@@ -541,7 +543,29 @@ class TradingService:
 
     def make_unknown_resolver(self) -> UnknownOrderResolver:
         """Recovers submit-timeout UNKNOWN orders via the broker 일별주문내역."""
-        return UnknownOrderResolver(self._broker, self._sf)
+        return UnknownOrderResolver(self._broker, self._sf, on_adopt=self._relock_order)
+
+    async def _relock_order(self, client_order_id: str) -> None:
+        """resolver 가 주문을 (재)채택 — 브로커에 살아 있는 주문이니 잠금·메타를 즉시 건다.
+
+        추정 만료로 이미 잠금이 풀린 주문이 채택만 되고 체결이 없으면, 서비스는 걸린 주문이
+        없는 줄 알고 중복 주문을 내거나(신호) flat 으로 판정해 종료한다(긴급중지)."""
+        async with session_scope(self._sf) as session:
+            order = (
+                await session.execute(select(Order).where(Order.client_order_id == client_order_id))
+            ).scalar_one_or_none()
+            if order is None or order.state not in _OPEN_ORDER_STATES:
+                return
+            lot = self._lots_by_id.get(order.lot_id)
+            if lot is None:
+                row = await session.get(Position, order.lot_id)
+                if row is None:
+                    return
+                lot = self._lot_from_row(row)
+                self._lots_by_id[order.lot_id] = lot
+            self._pending[(order.lot_id, Side(order.side))] = client_order_id
+            self._co_map[client_order_id] = await self._meta_from_order(session, order, lot)
+        self._log.info("order.relocked_on_adopt", client_order_id=client_order_id)
 
     async def reconcile(self) -> ReconcileReport:
         """Reconcile local open-position qty against the broker 잔고 (broker = source of truth)."""
@@ -959,7 +983,13 @@ class TradingService:
         was_closed = lot.state is PositionState.CLOSED
         before = lot.realized_pnl
         lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
-        self._daily_realized += lot.realized_pnl - before  # 당일 한도 계산용 (비용 포함)
+        if (
+            fill.ts is None
+            or not isinstance(self._daily_date, _date)
+            or _kst_day(fill.ts) >= self._daily_date
+        ):
+            # 당일 한도 계산용 (비용 포함). 전일 체결 복구분(그날 마감 시각)은 오늘 누계에 넣지 않는다.
+            self._daily_realized += lot.realized_pnl - before
         if was_closed and lot.is_open:
             await self._adopt_reopened(lot)
         await self._sync_runtime(lot)  # 진입 체결로 확정된 initial_stop/original_qty 즉시 영속
@@ -1197,6 +1227,9 @@ class TradingService:
             self._cash_cache -= (notional + fill.fee + fill.tax) * rate
         else:
             self._cash_cache += (notional - fill.fee - fill.tax) * rate
+        # 캐시된 잔고가 이미 이 체결을 담고 있었을 수 있다(체결 후·폴링 전에 조회된 경우) —
+        # 조정값은 다음 조회까지의 추정치로만 쓰고, 다음 호출에서 브로커 값으로 즉시 다시 맞춘다.
+        self._equity_at = float("-inf")
 
     def _cash_value(self, cash: dict[Currency, Decimal]) -> Decimal:
         return sum(

@@ -209,14 +209,25 @@ async def test_equity_cache_reuses_cash_but_revalues_holdings(sf) -> None:
 
 
 async def test_fill_adjusts_cached_cash_immediately(sf) -> None:
-    """캐시된 현금에 체결 대금을 즉시 반영 — 매수 직후 평가금이 매수 대금만큼 부풀지 않는다."""
+    """체결 즉시 캐시된 현금을 조정하고, 다음 호출에선 브로커 잔고로 다시 맞춘다.
+
+    - 조회가 실패하면 조정된 추정치로 평가 (매수 직후 매수 대금만큼 부풀지 않게)
+    - 조회가 되면 브로커 값 그대로 (체결 후·폴링 전에 조회된 잔고에 이중 반영 금지)"""
     from short_trading_bot.domain.enums import Currency
 
     class _Cash(RestingBroker):
-        async def get_balance(self) -> AccountBalance:
-            return AccountBalance(cash={Currency.KRW: Decimal(1_000_000)})
+        def __init__(self) -> None:
+            super().__init__()
+            self.cash = Decimal(1_000_000)
+            self.down = False
 
-    svc = _svc(sf, _Cash())
+        async def get_balance(self) -> AccountBalance:
+            if self.down:
+                raise RuntimeError("KIS 500")
+            return AccountBalance(cash={Currency.KRW: self.cash})
+
+    broker = _Cash()
+    svc = _svc(sf, broker)
     assert await svc._cached_equity() == Decimal(1_000_000)
     lot = await svc._spawn("005930", _TMPL)
     await svc._submit(lot, Side.BUY, Decimal(10), Decimal(10000), is_add=False, reason="enter")
@@ -224,4 +235,30 @@ async def test_fill_adjusts_cached_cash_immediately(sf) -> None:
         Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(10000), fee=Decimal(15))
     )
     svc._last_price["005930"] = Decimal(10000)
-    assert await svc._cached_equity() == Decimal(1_000_000) - Decimal(15)  # 현금 -100,015 + 보유 100,000
+
+    broker.down = True  # 재조회 실패 → 조정된 추정 현금 사용
+    assert await svc._cached_equity() == Decimal(1_000_000) - Decimal(15)
+
+    broker.down = False
+    broker.cash = Decimal(1_000_000) - Decimal(100_015)  # 브로커는 이미 체결 반영
+    assert await svc._cached_equity() == Decimal(1_000_000) - Decimal(15)  # 이중 차감 없음
+
+
+async def test_prior_day_fill_excluded_from_today_realized(sf) -> None:
+    """전일 체결 복구분(그날 마감 시각)은 오늘 일일 실현손익 누계에 들어가지 않는다."""
+    from datetime import timedelta, timezone
+
+    svc = _svc(sf)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(1000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(1000)))
+    kst = timezone(timedelta(hours=9))
+    svc._daily_date = datetime.now(kst).date()  # 엔진의 '오늘' = KST 거래일
+    svc._daily_realized = Decimal(0)
+    await svc._submit(lot, Side.SELL, Decimal(10), Decimal(900), is_add=False, reason="stop")
+    yesterday_close = datetime.now(kst) - timedelta(days=1)
+    await svc._on_fill(
+        Fill(svc._pending[(lot.lot_id, Side.SELL)], Decimal(10), Decimal(900), ts=yesterday_close)
+    )
+    assert lot.realized_pnl == Decimal(-1000)  # 랏 손익은 반영
+    assert svc._daily_realized == Decimal(0)  # 오늘 한도 누계엔 안 들어감

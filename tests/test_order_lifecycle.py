@@ -350,3 +350,62 @@ async def test_prior_day_order_kept_when_fill_lookup_fails(sf) -> None:
     svc = TradingService(_Down(), sf, RiskManager(RiskLimits()), {})
     await svc.expire_stale_orders(db_only=True)
     assert await _state(sf, "prev") == OrderState.NEW.value  # 확인 전엔 만료 안 함
+
+
+async def test_adopted_order_relocks_service_immediately(sf) -> None:
+    """(재)채택된 주문은 체결 전이라도 즉시 서비스 잠금·메타가 걸린다 (중복 주문·조기 flat 방지)."""
+    from short_trading_bot.app.service import TradingService
+    from short_trading_bot.domain.factory import PositionFactory
+    from short_trading_bot.domain.signal import Signal
+    from short_trading_bot.risk.limits import RiskLimits
+    from short_trading_bot.risk.manager import RiskManager
+    from short_trading_bot.strategy.templates import StrategyTemplate
+
+    lot = PositionFactory.create(Signal(ticker="005930"), StrategyTemplate(strategy_id="trend_long_v1"))
+    async with session_scope(sf) as s:
+        s.add(Position(
+            lot_id=lot.lot_id, ticker="005930", market="KRX", currency="KRW", side="BUY",
+            state="WATCHING", strategy_id="trend_long_v1", params_json=lot.params.model_dump(mode="json"),
+        ))
+        s.add(Order(
+            order_id="o-u", lot_id=lot.lot_id, client_order_id="u", side="BUY", qty=Decimal(10),
+            price=Decimal(70000), state=OrderState.UNKNOWN.value,
+            created_at=datetime.now(UTC) - timedelta(minutes=10),
+        ))
+    broker = _Broker()
+    broker.daily = [OrderRecord(broker_order_no="0077", ticker="005930", side=Side.BUY, qty=Decimal(10))]
+    svc = TradingService(broker, sf, RiskManager(RiskLimits()), {})
+    assert await svc.make_unknown_resolver().poll_once() == 1
+    assert svc._pending[(lot.lot_id, Side.BUY)] == "u" and "u" in svc._co_map
+    assert not svc.is_flat()
+
+
+async def test_prior_day_recovery_uses_fresh_dedup_per_day(sf) -> None:
+    """두 날의 체결 ID(주문번호:누적수량)가 같아도 각각 반영된다 (날짜별 새 폴러)."""
+    from short_trading_bot.app.service import TradingService
+    from short_trading_bot.risk.limits import RiskLimits
+    from short_trading_bot.risk.manager import RiskManager
+
+    await _seed_position(sf)
+    d2 = datetime.now(UTC) - timedelta(days=2)
+    d1 = datetime.now(UTC) - timedelta(days=1)
+    await _seed_order(sf, "a", OrderState.NEW.value, d2, broker_no="0001")
+    async with session_scope(sf) as s:
+        s.add(Order(
+            order_id="o-b", lot_id="lot1", client_order_id="b", broker_order_no="0001", side="SELL",
+            qty=Decimal(5), price=Decimal(70000), state=OrderState.NEW.value, created_at=d1,
+        ))
+
+    class _TwoDays(_Broker):
+        async def get_executions_on(self, day: Any) -> list[Execution]:
+            return [Execution(  # 두 날 모두 같은 exec_id "0001:5"
+                exec_id="0001:5", broker_order_no="0001", ticker="005930", side=Side.SELL,
+                qty=Decimal(5), price=Decimal(70000),
+            )]
+
+    svc = TradingService(_TwoDays(), sf, RiskManager(RiskLimits()), {})
+    await svc.expire_stale_orders(db_only=True)
+    async with session_scope(sf) as s:
+        pos = await s.get(Position, "lot1")
+    assert pos is not None and pos.qty_filled == 0  # 10주 = 5 + 5 둘 다 반영
+    assert await _state(sf, "b") == OrderState.FILLED.value

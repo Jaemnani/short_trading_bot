@@ -19,6 +19,7 @@ above the broker HTTP timeout.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -41,9 +42,12 @@ class UnknownOrderResolver:
         *,
         grace_seconds: float = 180.0,
         logger: Any = None,
+        on_adopt: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._broker = broker
         self._sf = session_factory
+        # 채택된 주문의 client_order_id 를 서비스에 알린다 (메모리 잠금·메타 재설정).
+        self._on_adopt = on_adopt
         self._grace = timedelta(seconds=grace_seconds)
         self._log = logger or get_logger("unknown_resolver")
 
@@ -81,6 +85,7 @@ class UnknownOrderResolver:
             by_sig.setdefault(key, []).append((order, ticker))
 
         resolved = 0
+        adopted: list[str] = []
         now = datetime.now(UTC)
         async with session_scope(self._sf) as session:
             for key, group in by_sig.items():
@@ -97,6 +102,7 @@ class UnknownOrderResolver:
                         "order.unknown.readopted" if revived else "order.unknown.adopted",
                         row, {"broker_order_no": found[0]},
                     ))
+                    adopted.append(row.client_order_id)
                     self._log.info(
                         "unknown.adopted",
                         client_order_id=row.client_order_id,
@@ -126,6 +132,9 @@ class UnknownOrderResolver:
                         local=len(group),
                         broker=len(found),
                     )
+        if self._on_adopt is not None:
+            for cid in adopted:  # 커밋 뒤에 — 서비스가 채택된 상태를 읽는다
+                await self._on_adopt(cid)
         return resolved
 
     async def _load_unknowns(self, session: AsyncSession) -> list[tuple[Order, str]]:
