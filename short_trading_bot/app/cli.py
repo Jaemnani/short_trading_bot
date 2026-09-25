@@ -110,6 +110,23 @@ def serve(
         typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
         raise typer.Exit(1)
 
+    if live_exec and s.mode is Mode.LIVE:
+        # 실전 실주문 게이트 (#13). 모의계좌 --live-exec 은 현행 유지.
+        # STB_DRY_RUN 은 문서상 '실전 전환 전 리허설' 스위치 — 켜져 있으면 실주문 금지.
+        if s.dry_run:
+            typer.echo("STB_DRY_RUN=true — 실전(LIVE) 실주문을 거부합니다. 전환하려면 STB_DRY_RUN=false.")
+            raise typer.Exit(1)
+        from .engine import is_ready
+        from .engine import preflight as run_preflight
+
+        checks = run_preflight(s, limits=limits)
+        if not is_ready(checks):
+            for c in checks:
+                if c.critical and not c.ok:
+                    typer.echo(f"  preflight 실패: {c.name} — {c.detail}")
+            typer.echo("실전 preflight 의 critical 항목이 통과하지 않아 가동을 거부합니다.")
+            raise typer.Exit(1)
+
     from ..infra.notifier.factory import build_notifier
     from ..infra.rate_limit import configure_shared_limiter
 
@@ -589,7 +606,14 @@ def serve(
             await asyncio.sleep(2)
 
     async def _run() -> None:
+        from ..risk.control_file import kill_switch_active
+
         restored = await service.hydrate()
+        if kill_switch_active():
+            # 긴급중지 도중 종료(크래시)된 뒤의 재기동 — 청산을 이어서 한다 (#7).
+            service.control.stop()
+            log.warning("kill_switch.restored_on_start")
+            await notifier.notify("kill_switch.restored", 조치="재기동 — 전량청산 재개")
         # 스캐너로 합류했던(워치리스트 밖) 열린 랏의 시세는 _subscriptions() 가 파생시킨다 —
         # 여기서 tickers 에 영구 추가하면 랏 청산 후에도 구독이 남아 한도를 잠식한다.
         if live_exec:
@@ -641,10 +665,21 @@ def serve(
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
         shared_builders = [BarBuilder(res) for res in resolutions]
+        def _done() -> bool:
+            # 긴급중지 후에도 청산이 끝날 때까지는 시세·체결 폴링을 유지해야 한다 — 예전엔
+            # STOP 후 WS 가 한 번 끊기면 청산 체결 확인 전에 종료했다 (#7).
+            return service.control.is_stopped and service.is_flat()
+
         try:
-            # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
-            while not service.control.is_stopped:
-                approval = await auth.approval_key()
+            # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지+청산 완료.
+            while not _done():
+                try:
+                    approval = await auth.approval_key()
+                except Exception:
+                    # 승인키 발급 일시 실패로 프로세스가 죽으면 청산·손절 관리가 통째로 멈춘다.
+                    log.exception("ws.approval_key_failed")
+                    await asyncio.sleep(5)
+                    continue
                 subs = _subscriptions()  # 재접속마다 최신 목록 (합류분 포함·만료분 제외)
                 feed = KisWebSocketFeed(
                     approval, subs, resolutions[0], ws_url=kis_ws_url(s.mode),
@@ -655,7 +690,7 @@ def serve(
                     await service.run(feed)
                 except Exception:
                     log.exception("feed.error")
-                if service.control.is_stopped:
+                if _done():
                     break
                 if live_exec:  # recover anything missed while disconnected
                     try:
@@ -684,7 +719,7 @@ def serve(
             await close_shared_client()
 
     asyncio.run(_run())
-    if service.control.is_stopped:
+    if service.control.is_stopped and service.is_flat():
         # 긴급중지로 인한 종료 — 워치독(run_paper.sh --watchdog)이 되살리지 않게
         # 마커를 남긴다. 재개는 사용자가 ./run_paper.sh (마커 제거) 로만.
         from pathlib import Path

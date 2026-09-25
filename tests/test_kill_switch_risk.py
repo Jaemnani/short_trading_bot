@@ -1,0 +1,152 @@
+"""킬스위치 영속·리스크 상태 복원·잔고 캐시·미체결 한도·실전 게이트 (#7 #8 #9 #10 #13, #21)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from short_trading_bot.app.cli import app
+from short_trading_bot.app.service import TradingService
+from short_trading_bot.domain.enums import Resolution, Side
+from short_trading_bot.execution.types import AccountBalance, Fill
+from short_trading_bot.infra.config import get_settings
+from short_trading_bot.market.types import Bar
+from short_trading_bot.risk.control import ControlSwitch
+from short_trading_bot.risk.control_file import apply_command, kill_switch_active
+from short_trading_bot.risk.limits import RiskLimits
+from short_trading_bot.risk.manager import RiskManager
+from short_trading_bot.strategy.templates import StrategyTemplate
+from tests.test_fill_sync import RestingBroker
+
+_TMPL = StrategyTemplate(strategy_id="trend_long_v1")
+
+
+def _svc(sf, broker: RestingBroker | None = None) -> TradingService:
+    return TradingService(broker or RestingBroker(), sf, RiskManager(RiskLimits()), {})
+
+
+# --- #7 킬스위치 영속 -------------------------------------------------------------------
+
+
+def test_stop_is_persisted_and_resume_clears(tmp_path: Path) -> None:
+    marker = tmp_path / "kill_switch.active"
+    control = ControlSwitch()
+    apply_command(control, "stop", kill_switch_path=marker)
+    assert control.is_stopped and kill_switch_active(marker)
+    apply_command(control, "pause", kill_switch_path=marker)
+    assert kill_switch_active(marker)  # pause 는 긴급중지를 풀지 않는다
+    apply_command(control, "resume", kill_switch_path=marker)
+    assert control.is_running and not kill_switch_active(marker)
+
+
+async def test_is_flat_requires_no_holdings_and_no_working_orders(sf) -> None:
+    svc = _svc(sf)
+    lot = await svc._spawn("005930", _TMPL)
+    assert svc.is_flat()
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(100), is_add=False, reason="enter")
+    assert not svc.is_flat()  # 걸린 주문 → 아직 종료하면 안 됨
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(100)))
+    assert not svc.is_flat()  # 보유 중
+    await svc._submit(lot, Side.SELL, Decimal(10), Decimal(100), is_add=False, reason="kill_switch")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.SELL)], Decimal(10), Decimal(100)))
+    assert svc.is_flat()
+
+
+# --- #8 잔고 조회 실패가 손절 평가를 건너뛰게 하지 않음 --------------------------------------
+
+
+class _BalanceDown(RestingBroker):
+    async def get_balance(self) -> AccountBalance:
+        raise RuntimeError("KIS HTTP 500 EGW00201")
+
+
+async def test_balance_failure_does_not_skip_lot_evaluation(sf, monkeypatch) -> None:
+    svc = TradingService(_BalanceDown(), sf, RiskManager(RiskLimits()), {"005930": _TMPL})
+    calls: list[Decimal] = []
+
+    def fake_evaluate(self, snap, equity, **_kw):  # type: ignore[no-untyped-def]
+        calls.append(equity)
+        return []
+
+    monkeypatch.setattr("short_trading_bot.domain.position.PositionLot.evaluate", fake_evaluate)
+    bar = Bar(
+        "005930", Resolution.D1, datetime(2026, 9, 25, tzinfo=UTC),
+        Decimal(100), Decimal(101), Decimal(99), Decimal(100), Decimal(1000), Decimal(100000),
+    )
+    await svc.process(bar)  # 예외 없이
+    assert calls == [Decimal(0)]
+
+
+# --- #9 미체결 매수도 한도에 센다 ------------------------------------------------------------
+
+
+async def test_risk_snapshot_counts_resting_buys(sf) -> None:
+    svc = _svc(sf)
+    a = await svc._spawn("005930", _TMPL)
+    b = await svc._spawn("000660", _TMPL)
+    await svc._submit(a, Side.BUY, Decimal(10), Decimal(70000), is_add=False, reason="enter")
+    await svc._submit(b, Side.BUY, Decimal(5), Decimal(20000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(b.lot_id, Side.BUY)], Decimal(2), Decimal(20000)))
+
+    snap = svc._risk_snapshot(Decimal("100000000"))
+
+    assert snap.open_positions == 2  # a: 미체결 대기, b: 부분체결 보유
+    assert snap.ticker_exposure["005930"] == Decimal(700000)
+    # b 는 체결 2주(평가) + 미체결 3주
+    assert snap.ticker_exposure["000660"] == Decimal(2) * Decimal(20000) + Decimal(3) * Decimal(20000)
+
+
+# --- #10 재시작해도 일일 손실·최고 평가금 유지 ---------------------------------------------
+
+
+async def test_daily_realized_and_peak_survive_restart(sf) -> None:
+    s1 = _svc(sf)
+    lot = await s1._spawn("005930", _TMPL)
+    await s1._submit(lot, Side.BUY, Decimal(10), Decimal(1000), is_add=False, reason="enter")
+    await s1._on_fill(Fill(s1._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(1000)))
+    await s1._submit(lot, Side.SELL, Decimal(10), Decimal(900), is_add=False, reason="stop")
+    await s1._on_fill(
+        Fill(s1._pending[(lot.lot_id, Side.SELL)], Decimal(10), Decimal(900), fee=Decimal(5), tax=Decimal(3))
+    )
+    assert s1._daily_realized == Decimal(-1008)
+    s1._peak_equity = Decimal("12345678")
+    await s1._persist_peak()
+
+    s2 = _svc(sf)
+    await s2.hydrate()
+
+    assert s2._daily_realized == Decimal(-1008)
+    assert s2._peak_equity == Decimal("12345678")
+
+
+# --- #13 실전 실주문 게이트 -------------------------------------------------------------
+
+
+@pytest.fixture
+def live_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("STB_MODE", "LIVE")
+    monkeypatch.setenv("STB_KIS__LIVE__APP_KEY", "k")
+    monkeypatch.setenv("STB_KIS__LIVE__APP_SECRET", "s")
+    monkeypatch.setenv("STB_KIS__LIVE__ACCOUNT_NO", "12345678-01")
+    monkeypatch.setenv("STB_DB_URL", f"sqlite+aiosqlite:///{tmp_path}/t.db")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def test_live_exec_refused_while_dry_run(live_env) -> None:
+    result = CliRunner().invoke(app, ["serve", "--config", "watchlist.example.json", "--live-exec"])
+    assert result.exit_code == 1
+    assert "STB_DRY_RUN=true" in result.output
+
+
+def test_live_exec_refused_when_preflight_fails(live_env, monkeypatch) -> None:
+    monkeypatch.setenv("STB_DRY_RUN", "false")
+    get_settings.cache_clear()
+    result = CliRunner().invoke(app, ["serve", "--config", "watchlist.example.json", "--live-exec"])
+    assert result.exit_code == 1
+    assert "preflight" in result.output and "api_credentials_secure" in result.output

@@ -17,6 +17,11 @@ from ..infra.logging import get_logger
 from .control import ControlSwitch
 
 DEFAULT_PATH = Path("data/control.json")
+# 긴급중지 상태의 영속 표시. 엔진이 STOP 을 적용하는 즉시 만들고 resume 에서 지운다.
+# 엔진이 청산 도중 죽어 워치독/launchd 가 되살려도, 시작 시 이 파일을 보고 STOPPED(+flat-all)로
+# 복귀한다 — 메모리 전용이던 시절엔 재기동이 곧 RUNNING 복귀였다 (#7).
+# (data/engine_stopped.marker 는 '되살리지 마라'는 워치독용 표시로 의미가 다르다.)
+KILL_SWITCH_PATH = Path("data/kill_switch.active")
 _ACTIONS = ("pause", "resume", "stop")
 
 _log = get_logger("control_file")
@@ -49,10 +54,24 @@ def read_command(*, path: str | Path = DEFAULT_PATH) -> tuple[int, str] | None:
         return None
 
 
-def apply_command(control: ControlSwitch, action: str) -> None:
+def apply_command(
+    control: ControlSwitch, action: str, *, kill_switch_path: str | Path = KILL_SWITCH_PATH
+) -> None:
     if action == "pause":
         control.pause()
     elif action == "resume":
         control.resume()
+        Path(kill_switch_path).unlink(missing_ok=True)
     elif action == "stop":
+        mark_kill_switch(kill_switch_path)  # 먼저 영속 — 적용 직후 죽어도 재기동 시 복원
         control.stop()
+
+
+def mark_kill_switch(path: str | Path = KILL_SWITCH_PATH) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("stop")
+
+
+def kill_switch_active(path: str | Path = KILL_SWITCH_PATH) -> bool:
+    return Path(path).exists()

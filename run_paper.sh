@@ -15,13 +15,16 @@ command -v tmux >/dev/null 2>&1 || { echo "tmux가 필요합니다: brew install
 mkdir -p logs data
 
 MARKER="data/engine_stopped.marker"
-ENGINE_CMD="$(pwd)/.venv/bin/trader serve --config watchlist.json --live-exec 2>&1 | tee -a logs/serve.log"
-API_CMD="$(pwd)/.venv/bin/trader api 2>&1 | tee -a logs/api.log"
+KILL_SWITCH="data/kill_switch.active"   # 긴급중지 진행 중 표시 (엔진이 관리)
+# 명령 문자열은 tmux 가 sh -c 로 실행한다 — 경로에 공백·특수문자가 있어도 깨지지 않게 이스케이프.
+TRADER="$(printf '%q' "$(pwd)/.venv/bin/trader")"
+ENGINE_CMD="$TRADER serve --config watchlist.json --live-exec 2>&1 | tee -a logs/serve.log"
+API_CMD="$TRADER api 2>&1 | tee -a logs/api.log"
 
 if [ "${1:-}" = "--watchdog" ]; then
   [ -f "$MARKER" ] && exit 0   # 의도된 중지 — 되살리지 않음
 else
-  rm -f "$MARKER"              # 수동 가동 = 명시적 재개
+  rm -f "$MARKER" "$KILL_SWITCH"  # 수동 가동 = 명시적 재개 (긴급중지 해제 포함)
 fi
 
 if ! tmux has-session -t stb 2>/dev/null; then

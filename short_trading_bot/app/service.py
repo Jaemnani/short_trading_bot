@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from datetime import date as _date
 from decimal import ROUND_DOWN, Decimal
 from uuid import uuid4
@@ -46,8 +46,8 @@ from ..market.indicators import IndicatorEngine
 from ..market.regime import MarketRegime
 from ..market.types import Bar, IndicatorSnapshot
 from ..persistence.db import session_scope
+from ..persistence.models import AuditLog, Order, Position
 from ..persistence.models import Fill as FillRow
-from ..persistence.models import Order, Position
 from ..risk.limits import RiskSnapshot
 from ..risk.manager import RiskManager
 from ..strategy.registry import create_strategy
@@ -55,6 +55,9 @@ from ..strategy.templates import StrategyTemplate
 from .health import EngineHealth
 
 _ENTRY_KINDS = (IntentKind.ENTER, IntentKind.ADD)
+_KST = timezone(timedelta(hours=9))
+# 최고 평가금(낙폭 브레이크 기준) 영속 간격: 직전 기록 대비 0.1% 이상 올랐을 때만 audit 에 쓴다.
+_PEAK_PERSIST_STEP = Decimal("1.001")
 
 # 대시보드 스냅샷은 5초마다 쓰이지만 잔고 REST 조회는 그보다 훨씬 느리게 해도 된다.
 # 24시간 5초 주기 = 하루 ~17,000회로 KIS 초당 한도를 갉아먹어 체결 조회를 밀어낸다.
@@ -145,6 +148,7 @@ class TradingService:
         self._daily_realized = Decimal(0)  # 당일 실현손익 (수수료·세금 포함), 날짜 바뀌면 리셋
         self._daily_date: object | None = None
         self._peak_equity = Decimal(0)  # high-water mark (총 낙폭 브레이크 기준)
+        self._peak_persisted = Decimal(0)
         self._regime = regime  # 시장 레짐 필터 (None = 미사용)
         self._regime_gated: set[tuple[str, str]] = {
             (key.split("@")[0], t.resolution.value)
@@ -234,6 +238,7 @@ class TradingService:
                 )
             self._lots_by_id[row.lot_id] = lot
             restored += 1
+        await self._restore_risk_state()
         # Restore duplicate-order locks for orders that may still be live at the broker.
         # client_order_id is a fresh uuid per submit, so without this a restart would
         # happily re-order on the next signal while the pre-restart order still works.
@@ -253,6 +258,67 @@ class TradingService:
                     session, order, owner
                 )
         return restored
+
+    async def _restore_risk_state(self) -> None:
+        """재시작해도 일일 손실 한도·낙폭 브레이크가 초기화되지 않게 (#10).
+
+        - 당일 실현손익: 오늘(KST) 매도 체결이 있는 랏의 체결 전체를 시간순으로 재생해
+          ``PositionLot.apply_fill`` 과 같은 산식으로 다시 계산한다 (비용 포함).
+        - 최고 평가금: audit_log 의 마지막 ``risk.peak_equity`` 기록.
+        메모리 전용이던 시절엔 한도 도달 → 크래시 → 워치독 재기동이면 진입이 다시 열렸다."""
+        today = datetime.now(_KST).date()
+        async with session_scope(self._sf) as session:
+            rows = (
+                await session.execute(
+                    select(FillRow, Order.side)
+                    .join(Order, FillRow.order_id == Order.order_id)
+                    .order_by(FillRow.lot_id, FillRow.filled_at, FillRow.fill_id)
+                )
+            ).all()
+            peak_row = (
+                await session.execute(
+                    select(AuditLog.payload_json)
+                    .where(AuditLog.event_type == "risk.peak_equity")
+                    .order_by(AuditLog.seq.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        lots_sold_today = {
+            fill.lot_id for fill, side in rows if side == Side.SELL.value and _kst_day(fill.filled_at) == today
+        }
+        realized = Decimal(0)
+        book: dict[str, tuple[Decimal, Decimal]] = {}  # lot_id -> (qty, avg)
+        for fill, side in rows:
+            if fill.lot_id not in lots_sold_today:
+                continue
+            qty, avg = book.get(fill.lot_id, (Decimal(0), Decimal(0)))
+            if side == Side.BUY.value:
+                new_qty = qty + fill.qty
+                avg = (avg * qty + fill.price * fill.qty) / new_qty if new_qty > 0 else avg
+                qty = new_qty
+            else:
+                held = min(fill.qty, qty) if qty > 0 else Decimal(0)
+                if _kst_day(fill.filled_at) == today:
+                    realized += (fill.price - avg) * held - fill.fee - fill.tax
+                qty = max(Decimal(0), qty - fill.qty)
+            book[fill.lot_id] = (qty, avg)
+        self._daily_date = today
+        self._daily_realized = realized
+        if isinstance(peak_row, dict) and peak_row.get("peak"):
+            self._peak_equity = self._peak_persisted = Decimal(str(peak_row["peak"]))
+        if realized or self._peak_equity:
+            self._log.info(
+                "risk_state.restored", daily_realized=str(realized), peak_equity=str(self._peak_equity)
+            )
+
+    async def _persist_peak(self) -> None:
+        if self._peak_equity <= 0 or self._peak_equity < self._peak_persisted * _PEAK_PERSIST_STEP:
+            return
+        async with session_scope(self._sf) as session:
+            session.add(
+                AuditLog(event_type="risk.peak_equity", payload_json={"peak": str(self._peak_equity)})
+            )
+        self._peak_persisted = self._peak_equity
 
     def prime(self, bars: list[Bar]) -> int:
         """과거 봉으로 지표 워밍업(백필). 평가/주문 없이 IndicatorEngine만 채운다.
@@ -363,6 +429,10 @@ class TradingService:
             "health": self.health.snapshot(datetime.now(UTC)),
         }
 
+    def is_flat(self) -> bool:
+        """보유도, 걸린 주문도 없다 — 긴급중지 후 엔진이 종료해도 되는 조건."""
+        return not any(lot.qty > 0 for lot in self._lots.values()) and not self._pending
+
     async def expire_stale_orders(self) -> int:
         """거래일이 바뀌면 호출 — 전일 미체결 주문을 만료시켜 잠금이 풀리게 한다 (#6)."""
         return await self._om.expire_stale()
@@ -451,8 +521,13 @@ class TradingService:
 
         if lot.is_open:
             lot.on_bar(bar.high)
-        equity = await self._equity()
+        # 잔고 조회(REST)는 캐시한다: 봉마다 조회하면 초당 한도를 잠식하고, 조회가 한 번
+        # 실패하면 그 봉의 손절·트레일링 평가 전체가 예외로 건너뛰어졌다 (#8). 값이 아예
+        # 없으면 0 으로 평가 — 청산 판단엔 영향이 없고 진입은 사이징·한도에서 막힌다.
+        cached = await self._cached_equity()
+        equity = cached if cached is not None else Decimal(0)
         snapshot = self._risk_snapshot(equity)
+        await self._persist_peak()
         news = self._news_provider(ticker) if self._news_provider is not None else self._news
         for intent in lot.evaluate(snap, equity, prev=self._prev.get(pkey), news_ewma=news):
             if intent.is_actionable:
@@ -483,6 +558,13 @@ class TradingService:
         # 매수 올림 때문에 qty x price 가 max_order_notional 을 넘어 한도가 깨진다.
         order_px = bar.close if lot.market.is_overseas else round_to_tick(bar.close, intent.side)
         if intent.kind in _ENTRY_KINDS:
+            if (lot.lot_id, Side.BUY) in self._pending and not await self._release_if_terminal(
+                (lot.lot_id, Side.BUY)
+            ):
+                # 이 랏의 매수가 이미 걸려 있다 — 아래 한도 검사는 그 미체결을 포지션으로 세므로
+                # 여기서 조용히 건너뛴다 (매 봉 'intent.blocked' 알림 스팸 방지).
+                self._log.info("order.pending.skip", lot_id=lot.lot_id, side=Side.BUY.value)
+                return
             # 시장 레짐 필터: 시장 날씨가 나쁜 날은 신규 진입 금지 (청산은 무관).
             if (
                 self._regime is not None
@@ -917,11 +999,29 @@ class TradingService:
             price = self._last_price.get(lot.ticker, lot.avg_entry)
             rate = self._fx_rate_checked(lot.currency)
             exposure[lot.ticker] = exposure.get(lot.ticker, Decimal(0)) + lot.qty * price * rate
+        # 걸려 있는 매수도 한도에 센다: 라이브 체결은 폴링 뒤에야 반영되므로, 체결분만 세면
+        # 같은 분에 신호가 몰릴 때 max_open_positions·종목 노출 한도를 모두 통과한다 (#9).
+        pending_lots: set[str] = set()
+        for cid in self._pending.values():
+            po = self._co_map.get(cid)
+            if po is None or po.side is not Side.BUY:
+                continue
+            remaining = max(Decimal(0), po.requested_qty - po.filled_qty)
+            rate = self._fx_rate_checked(po.lot.currency)
+            exposure[po.lot.ticker] = exposure.get(po.lot.ticker, Decimal(0)) + remaining * po.price * rate
+            if not po.lot.is_open:
+                pending_lots.add(po.lot.lot_id)
         self._peak_equity = max(self._peak_equity, equity)
         return RiskSnapshot(
             equity=equity,
-            open_positions=len(open_lots),
+            open_positions=len(open_lots) + len(pending_lots),
             daily_pnl=self._daily_realized,  # 당일 실현손익 (자정 리셋)
             ticker_exposure=exposure,
             peak_equity=self._peak_equity,
         )
+
+
+def _kst_day(ts: datetime) -> _date:
+    if ts.tzinfo is None:  # SQLite drops tzinfo (UTC 로 저장됨)
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(_KST).date()
