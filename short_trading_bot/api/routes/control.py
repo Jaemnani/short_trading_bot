@@ -39,7 +39,15 @@ def set_control(body: ControlIn, request: Request, _user: str = Depends(require_
         control.stop()
     if body.action in ("pause", "resume", "stop"):
         # 엔진은 별도 프로세스 — 파일 브리지로 전달해야 실제로 멈춘다 (엔진이 2초마다 읽음).
-        from ...risk.control_file import write_command
+        from ...risk.control_file import mark_kill_switch, write_command
 
-        write_command(body.action, path=get_state(request).control_file)
+        state = get_state(request)
+        if body.action == "stop":
+            # 긴급중지 표시를 명령보다 먼저 남긴다. 엔진이 꺼져 있는 동안 누른 stop 은
+            # control.json 만으로는 전달되지 않는다(엔진은 시작 시 잔존 명령을 과거 것으로
+            # 본다) — 이 표시가 있으면 엔진은 STOPPED+전량청산으로 시작한다.
+            mark_kill_switch(state.kill_switch_file)
+        elif body.action == "resume":
+            state.kill_switch_file.unlink(missing_ok=True)
+        write_command(body.action, path=state.control_file)
     return _out(request)

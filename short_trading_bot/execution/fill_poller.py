@@ -14,6 +14,7 @@ Pair with the Reconciler (broker 잔고 = source of truth) as a second safety ne
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -47,10 +48,17 @@ class FillPoller:
         self._sf = session_factory
         self._handler = fill_handler
         self._seen: set[str] = set()
+        # 델타 회계(ex.qty - DB 누적)는 읽기→쓰기 사이에 다른 폴링이 끼면 같은 체결을 두 번
+        # 반영한다. 동시 호출(백그라운드 루프·재접속 복구·주문 교체)을 직렬화한다.
+        self._lock = asyncio.Lock()
         self._log = logger or get_logger("fill_poller")
 
     async def poll_once(self) -> int:
         """Apply any new execution deltas; returns how many fills were delivered."""
+        async with self._lock:
+            return await self._poll_locked()
+
+    async def _poll_locked(self) -> int:
         applied = 0
         for ex in await self._broker.get_executions():
             if ex.exec_id in self._seen:

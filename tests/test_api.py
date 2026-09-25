@@ -31,6 +31,7 @@ def _state(tmp_path) -> tuple[ApiState, async_sessionmaker, ControlSwitch]:
         # 브리지 파일은 반드시 tmp로 — 기본 경로를 쓰면 테스트가 실제 가동 중인
         # 엔진(data/control.json)에 stop 명령을 흘려보낸다.
         control_file=tmp_path / "control.json",
+        kill_switch_file=tmp_path / "kill_switch.active",
         status_file=tmp_path / "engine_status.json",
     )
     return state, sf, control
@@ -282,3 +283,14 @@ def test_dashboard_hashed_assets_are_immutable(tmp_path) -> None:
     resp = client.get(f"/assets/{name}")
     assert resp.status_code == 200
     assert "immutable" in resp.headers.get("cache-control", "")
+
+
+def test_stop_persists_kill_switch_even_if_engine_is_down(tmp_path) -> None:
+    """엔진이 꺼진 동안 누른 stop 도 재기동 시 적용되도록 API 가 표시를 남긴다 (Codex 리뷰)."""
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    token = _token(client)
+    client.post("/api/control", json={"action": "stop"}, headers=_auth(token))
+    assert state.kill_switch_file.exists()
+    client.post("/api/control", json={"action": "resume"}, headers=_auth(token))
+    assert not state.kill_switch_file.exists()

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -201,3 +202,81 @@ async def test_kill_switch_cancels_entries_and_replaces_resting_sell(sf) -> None
     svc._last_price["005930"] = Decimal(9500)
     await svc._flat_all()  # 시세가 바뀌면 재가격
     assert broker.submitted[-1].price == Decimal(9500)
+
+
+# --- Codex 크로스리뷰 1회차 지적 ------------------------------------------------------
+
+
+async def test_flat_all_request_kept_while_buy_is_unresolved(sf) -> None:
+    """보유 0 이어도 UNKNOWN 매수가 남아 있으면 청산 요청을 해제하지 않는다."""
+    from short_trading_bot.domain.enums import Resolution
+    from short_trading_bot.market.types import Bar
+
+    svc, _, _ = _svc(sf)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(100), is_add=False, reason="enter")
+    cid = svc._pending[(lot.lot_id, Side.BUY)]
+    async with session_scope(sf) as s:  # 제출 타임아웃으로 UNKNOWN 이 된 상황
+        (await s.execute(select(Order).where(Order.client_order_id == cid))).scalar_one().state = "UNKNOWN"
+    svc.control.stop()
+    bar = Bar("005930", Resolution.D1, datetime(2026, 9, 25, tzinfo=UTC), *(Decimal(100),) * 4,
+              Decimal(1), Decimal(100))
+
+    await svc.process(bar)
+    assert svc.control.flat_all_requested  # UNKNOWN 은 취소 불가 → 아직 평탄 아님
+
+    async with session_scope(sf) as s:  # resolver 가 '브로커에 없음'으로 거부 확정
+        (await s.execute(select(Order).where(Order.client_order_id == cid))).scalar_one().state = "REJECTED"
+    await svc.process(bar)
+    assert not svc.control.flat_all_requested and svc.is_flat()
+
+
+async def test_replacement_sell_uses_quantity_left_after_unseen_partial_fill(sf) -> None:
+    """교체 직전, 취소된 매도의 미반영 부분체결을 반영하고 남은 수량만 다시 낸다."""
+    from short_trading_bot.execution.types import Execution
+
+    class _Exec(RestingBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.executions: list[Execution] = []
+
+        async def get_executions(self) -> list[Execution]:
+            return self.executions
+
+    broker = _Exec()
+    svc, _, _ = _svc(sf, broker)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(9000)))
+    await svc._submit(lot, Side.SELL, Decimal(10), Decimal(9000), is_add=False, reason="kill_switch")
+    # 브로커에선 4주가 이미 체결됐지만 아직 폴링 전
+    broker.executions = [Execution(
+        exec_id="B2:4", broker_order_no="B2", ticker="005930", side=Side.SELL,
+        qty=Decimal(4), price=Decimal(9000),
+    )]
+    assert await svc._submit(
+        lot, Side.SELL, lot.qty, Decimal(8900), is_add=False, reason="kill_switch", replace_pending=True
+    )
+    assert lot.qty == Decimal(6) and broker.submitted[-1].qty == Decimal(6)
+
+
+async def test_delayed_buy_for_lot_closed_before_restart_is_rebuilt_and_managed(sf) -> None:
+    """재시작 전 CLOSED 랏(hydrate 대상 아님)의 매수 잔량 체결 → 즉시 랏 재구성·관리 편입."""
+    s1, _, _ = _svc(sf)
+    lot = await s1._spawn("035420", _TMPL)
+    await s1._submit(lot, Side.BUY, Decimal(100), Decimal(100), is_add=False, reason="enter")
+    buy = s1._pending[(lot.lot_id, Side.BUY)]
+    await s1._on_fill(Fill(buy, Decimal(30), Decimal(100)))
+    await s1._submit(lot, Side.SELL, Decimal(30), Decimal(95), is_add=False, reason="hard_stop")
+    await s1._on_fill(Fill(s1._pending[(lot.lot_id, Side.SELL)], Decimal(30), Decimal(95)))
+    assert (await _db_position(sf, lot.lot_id)).state == PositionState.CLOSED.value
+
+    s2, _, notifier = _svc(sf)  # 재시작 — CLOSED 랏은 복원되지 않는다
+    await s2.hydrate()
+    assert s2.lot("035420") is None
+    await s2._on_fill(Fill(buy, Decimal(70), Decimal(100)))
+
+    managed = s2.lot("035420")
+    assert managed is not None and managed.lot_id == lot.lot_id
+    assert managed.is_open and managed.qty == Decimal(70)
+    assert any(n.event == "fill.orphan_reopened" for n in notifier.sent)
