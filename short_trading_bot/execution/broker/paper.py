@@ -104,11 +104,22 @@ class PaperBrokerAdapter(BrokerAdapter):
             self._reserved.pop(broker_order_no, None)
         return OrderAck(req.client_order_id, accepted=True, broker_order_no=broker_order_no)
 
-    async def on_market_price(self, ticker: str, price: Decimal) -> None:
-        """시세 갱신 — resting_limits 면 교차한 대기 지정가를 지정가로 체결한다."""
+    async def on_market_price(
+        self,
+        ticker: str,
+        price: Decimal,
+        *,
+        low: Decimal | None = None,
+        high: Decimal | None = None,
+    ) -> None:
+        """시세 갱신 — resting_limits 면 교차한 대기 지정가를 지정가로 체결한다.
+
+        봉 단위 피드면 봉의 저가/고가로 판정한다: 봉 중간에 지정가를 찍고 종가가 되돌아간
+        경우도 실제로는 체결됐을 가격이다 (매수는 저가 ≤ 지정가, 매도는 고가 ≥ 지정가)."""
         self._prices[ticker] = price
         for broker_no, req in list(self._resting.items()):
-            if req.ticker == ticker and self._crosses(req, price):
+            touch = (low if req.side == Side.BUY else high) or price
+            if req.ticker == ticker and self._crosses(req, touch):
                 del self._resting[broker_no]
                 self._reserved.pop(broker_no, None)  # 예약 해제 → 실제 체결 대금으로 차감
                 for qty in self._chunk(req.qty):

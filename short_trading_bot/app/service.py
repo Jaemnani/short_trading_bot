@@ -137,6 +137,8 @@ class TradingService:
         self._lots_by_id: dict[str, PositionLot] = {}
         # 교체 매도의 체결 반영이 실패한 랏 — 반영 성공 전까지 매도 재제출을 보류한다.
         self._refresh_before_sell: set[str] = set()
+        # 매수 취소는 됐지만 취소 직전 체결분 반영(폴링)이 아직 확인 안 된 랏. 비어 있어야 flat.
+        self._unconfirmed_buy_cancels: set[str] = set()
         self._prev: dict[str, IndicatorSnapshot] = {}
         self._last_price: dict[str, Decimal] = {}
         # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
@@ -461,9 +463,26 @@ class TradingService:
             "health": self.health.snapshot(datetime.now(UTC)),
         }
 
+    def _tracked_lots(self) -> list[PositionLot]:
+        """관리 슬롯의 랏 + 슬롯 밖 랏(재오픈됐는데 슬롯이 점유된 고아 등) — 중복 없이."""
+        out: list[PositionLot] = []
+        seen: set[int] = set()
+        for lot in [*self._lots.values(), *self._lots_by_id.values()]:
+            if id(lot) not in seen:
+                seen.add(id(lot))
+                out.append(lot)
+        return out
+
     def is_flat(self) -> bool:
-        """보유도, 걸린 주문도 없다 — 긴급중지 후 엔진이 종료해도 되는 조건."""
-        return not any(lot.qty > 0 for lot in self._lots.values()) and not self._pending
+        """보유도, 걸린 주문도, 미확인 취소 체결도 없다 — 긴급중지 후 엔진이 종료해도 되는 조건.
+
+        슬롯 밖 랏까지 본다: 슬롯이 점유돼 관리 슬롯에 못 들어간 재오픈 랏의 보유를 빼먹으면
+        새 랏만 청산하고 flat 으로 판정해 종료한다."""
+        return (
+            not any(lot.qty > 0 for lot in self._tracked_lots())
+            and not self._pending
+            and not self._unconfirmed_buy_cancels
+        )
 
     async def expire_stale_orders(self) -> int:
         """거래일이 바뀌면 호출 — 전일 미체결 주문을 만료시켜 잠금이 풀리게 한다 (#6)."""
@@ -500,7 +519,8 @@ class TradingService:
 
     async def process(self, bar: Bar) -> None:
         self._last_price[bar.ticker] = bar.close
-        await self._broker.on_market_price(bar.ticker, bar.close)  # 페이퍼 대기 지정가 매칭
+        # 페이퍼 대기 지정가 매칭 — 봉의 저가/고가까지 넘겨 봉 중간 체결도 반영한다.
+        await self._broker.on_market_price(bar.ticker, bar.close, low=bar.low, high=bar.high)
         self.health.on_bar(bar.ticker, datetime.now(UTC))
         if self._regime is not None and bar.ticker == self._regime.proxy_ticker:
             self._regime.on_proxy_bar(bar.ts.date(), bar.close)
@@ -743,14 +763,18 @@ class TradingService:
         )
         return ack.accepted
 
-    async def _refresh_fills(self, lot: PositionLot) -> bool:
-        """체결내역을 한 번 반영한다. 성공하면 '재반영 필요' 표시를 지운다."""
+    async def _refresh_fills(self, lot: PositionLot | None = None) -> bool:
+        """체결내역을 한 번 반영한다. 한 번의 폴링이 모든 랏을 갱신하므로 성공하면 모든
+        '재반영 필요' 표시를 지운다."""
         try:
             await self.make_fill_poller().poll_once()
         except Exception:
-            self._log.exception("order.replace.fill_refresh_failed", lot_id=lot.lot_id)
+            self._log.exception(
+                "order.fill_refresh_failed", lot_id=lot.lot_id if lot is not None else None
+            )
             return False
-        self._refresh_before_sell.discard(lot.lot_id)
+        self._refresh_before_sell.clear()
+        self._unconfirmed_buy_cancels.clear()
         return True
 
     async def _cancel_pending(
@@ -792,6 +816,12 @@ class TradingService:
             return
         if not await self._cancel_pending(key, lot, reason=reason):
             self._log.warning("order.exit.buy_cancel_failed", lot_id=lot.lot_id)
+            return
+        # 취소는 잔량만 없앤다 — 직전 폴링 이후의 부분체결이 아직 메모리에 없을 수 있다. 반영을
+        # 확인하기 전엔 flat 이 아니다 (보유 0 으로 보고 긴급중지를 해제·종료하면 뒤늦게 반영된
+        # 주식이 청산 없이 남는다). 실패하면 표시가 남아 다음 flat-all 패스에서 재시도한다.
+        self._unconfirmed_buy_cancels.add(lot.lot_id)
+        await self._refresh_fills(lot)
 
     async def _release_if_terminal(self, pending_key: tuple[str, Side]) -> bool:
         """Free a pending lock whose order can no longer fill (per the DB order state).
@@ -823,13 +853,11 @@ class TradingService:
         # is_flat() 이 영원히 거짓이라 청산 완료를 판정하지 못한다.
         for key in list(self._pending):
             await self._release_if_terminal(key)
-        lots = list(self._lots.values())
-        # 슬롯 밖 랏(재시작 전 CLOSED 됐는데 매수 주문이 아직 살아 있는 랏)의 매수도 취소 대상.
-        for lot_id, side in list(self._pending):
-            orphan = self._lots_by_id.get(lot_id)
-            if side is Side.BUY and orphan is not None and all(orphan is not x for x in lots):
-                lots.append(orphan)
-        for lot in lots:
+        if self._unconfirmed_buy_cancels:
+            await self._refresh_fills()  # 직전 패스의 매수 취소 뒤 체결 반영 재시도
+        # 슬롯 밖 랏(재시작 전 CLOSED 됐는데 매수가 살아 있는 랏, 슬롯이 점유돼 편입 못 한
+        # 재오픈 랏)까지 전부 — 매수 취소와 보유 청산 모두의 대상이다.
+        for lot in self._tracked_lots():
             # 진입 대기 중인 매수도 취소 — 긴급중지 뒤에 새 보유가 생기면 안 된다.
             await self._cancel_open_buy(lot, reason="kill_switch")
             if not lot.is_open:

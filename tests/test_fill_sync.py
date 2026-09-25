@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -343,3 +344,64 @@ async def test_open_buy_on_closed_lot_survives_restart_and_blocks_flat(sf) -> No
     await s2._flat_all()
     assert broker2.cancelled  # 슬롯 밖 랏의 매수도 취소
     assert (lot.lot_id, Side.BUY) not in s2._pending and s2.is_flat()
+
+
+class _ExecBroker(RestingBroker):
+    """체결내역(폴링 원천)을 테스트가 주입 — 실패도 흉내낸다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+        self.executions: list[Any] = []
+
+    async def get_executions(self) -> list[Any]:
+        if self.fail:
+            raise RuntimeError("KIS HTTP 500")
+        return self.executions
+
+
+async def test_buy_cancel_refreshes_unseen_partial_fill_before_flat(sf) -> None:
+    """긴급중지: 매수 취소 직전의 미반영 부분체결을 반영해 그 보유까지 청산한다 (flat 오판 방지)."""
+    from short_trading_bot.execution.types import Execution
+
+    broker = _ExecBroker()
+    svc, _, _ = _svc(sf, broker)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    broker.executions = [Execution(
+        exec_id="B1:3", broker_order_no="B1", ticker="005930", side=Side.BUY,
+        qty=Decimal(3), price=Decimal(9000),
+    )]
+    broker.fail = True  # 취소 직후 반영 실패
+    await svc._flat_all()
+    assert lot.qty == 0 and not svc.is_flat()  # 미확인 → 아직 flat 아님 (긴급중지 유지)
+
+    broker.fail = False
+    svc._last_price["005930"] = Decimal(9000)
+    await svc._flat_all()  # 반영 재시도 → 3주 발견 → 청산 매도
+    assert lot.qty == Decimal(3)
+    assert broker.submitted[-1].side is Side.SELL and broker.submitted[-1].qty == Decimal(3)
+    assert not svc.is_flat()
+
+
+async def test_orphan_lot_in_occupied_slot_is_liquidated_by_kill_switch(sf) -> None:
+    """재오픈됐지만 슬롯이 보유 중인 새 랏에 점유된 고아 랏도 flat 판정·청산 대상이다."""
+    svc, broker, _ = _svc(sf)
+    old = await svc._spawn("035420", _TMPL)
+    await svc._submit(old, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    old_buy = svc._pending[(old.lot_id, Side.BUY)]
+    await svc._on_fill(Fill(old_buy, Decimal(4), Decimal(9000)))
+    await svc._submit(old, Side.SELL, Decimal(4), Decimal(9000), is_add=False, reason="hard_stop")
+    await svc._on_fill(Fill(svc._pending[(old.lot_id, Side.SELL)], Decimal(4), Decimal(9000)))
+    new = await svc._spawn("035420", _TMPL)  # 슬롯에 새 랏 — 보유까지
+    await svc._submit(new, Side.BUY, Decimal(2), Decimal(9000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(new.lot_id, Side.BUY)], Decimal(2), Decimal(9000)))
+
+    await svc._on_fill(Fill(old_buy, Decimal(6), Decimal(9000)))  # 옛 매수 잔량 체결 → 고아
+    assert old.qty == Decimal(6) and svc.lot("035420") is new
+    assert not svc.is_flat()
+
+    svc._last_price["035420"] = Decimal(9000)
+    await svc._flat_all()
+    sold = {(r.lot_id, r.qty) for r in broker.submitted if r.side is Side.SELL}
+    assert (old.lot_id, Decimal(6)) in sold and (new.lot_id, Decimal(2)) in sold

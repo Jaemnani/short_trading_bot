@@ -215,3 +215,21 @@ async def test_paper_resting_buys_reserve_cash() -> None:
     assert third.accepted
     await broker.on_market_price("005930", Decimal(68000))
     assert broker.cash() >= 0
+
+
+async def test_paper_resting_limit_fills_when_bar_range_touches() -> None:
+    """봉 중간에 지정가를 찍고 종가가 되돌아가도 체결 (저가/고가로 판정)."""
+    broker = PaperBrokerAdapter(PaperConfig(resting_limits=True))
+    fills: list[Fill] = []
+
+    async def on_fill(fill: Fill) -> None:
+        fills.append(fill)
+
+    broker.fill_handler = on_fill
+    await broker.on_market_price("005930", Decimal(70000))
+    await broker.submit_order(_limit(Side.BUY, 69000, cid="b"))
+    await broker.submit_order(_limit(Side.SELL, 71000, cid="s"))
+    await broker.on_market_price("005930", Decimal(70000), low=Decimal(68800), high=Decimal(70500))
+    assert [f.client_order_id for f in fills] == ["b"]  # 저가가 매수 지정가를 찍음
+    await broker.on_market_price("005930", Decimal(70000), low=Decimal(69800), high=Decimal(71200))
+    assert [f.client_order_id for f in fills] == ["b", "s"]  # 고가가 매도 지정가를 찍음

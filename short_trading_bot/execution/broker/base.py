@@ -40,9 +40,17 @@ class BrokerAdapter(ABC):
         override. The FillPoller polls this and dedups by exec_id — ground-truth fills."""
         return []
 
-    async def on_market_price(self, ticker: str, price: Decimal) -> None:
-        """Latest market price for ``ticker``. Default no-op; the paper broker uses it to
-        match resting limit orders (``PaperConfig.resting_limits``)."""
+    async def on_market_price(
+        self,
+        ticker: str,
+        price: Decimal,
+        *,
+        low: Decimal | None = None,
+        high: Decimal | None = None,
+    ) -> None:
+        """Latest market price (and the bar's low/high when known) for ``ticker``. Default
+        no-op; the paper broker uses it to match resting limit orders
+        (``PaperConfig.resting_limits``)."""
         return None
 
     async def get_daily_orders(self) -> list[OrderRecord]:
