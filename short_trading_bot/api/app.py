@@ -1,7 +1,8 @@
 """FastAPI app factory. Mounts auth + dashboard routes and a live WebSocket.
 
-CORS is wide-open for local PWA dev; lock ``allow_origins`` to the dashboard origin and
-serve behind HTTPS in production (this endpoint controls real trading)."""
+The dashboard is served from the same origin, so CORS is off by default. Only origins listed
+in ``ApiState.cors_origins`` (``STB_API_CORS_ORIGINS``) are allowed; ``*`` is never honored —
+with a wildcard any web page the user visits could drive this API (it controls real trading)."""
 
 from __future__ import annotations
 
@@ -42,13 +43,15 @@ class _DashboardFiles(StaticFiles):
 def create_app(state: ApiState) -> FastAPI:
     app = FastAPI(title="short_trading_bot API", version="0.1.0")
     app.state.api = state
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # dev only
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    origins = [o for o in state.cors_origins if o and o != "*"]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=False,  # 인증은 Bearer 헤더 — 쿠키 자격증명 불필요
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
     app.include_router(auth.router)
     app.include_router(strategies.router)
     app.include_router(control.router)
@@ -58,7 +61,8 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:
-        return {"status": "ok", "control": state.control.state.value}
+        # 무인증 생존 확인용 — 제어 상태 등 내부 정보는 싣지 않는다.
+        return {"status": "ok"}
 
     # 빌드된 대시보드(frontend/dist)를 같은 포트에서 서빙 — http://<호스트>:8000 이 곧 현황 페이지.
     # 라우트 등록 뒤의 catch-all 마운트라 /api/* /health /ws 는 영향 없음. dist 없으면 API 전용.

@@ -1,11 +1,19 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from starlette.websockets import WebSocketDisconnect
 
 from short_trading_bot.api.app import create_app
+from short_trading_bot.api.security import (
+    DEFAULT_JWT_SECRET,
+    create_access_token,
+    insecure_api_config,
+    is_loopback_host,
+)
 from short_trading_bot.api.state import ApiState
 from short_trading_bot.persistence.db import init_models, session_scope
 from short_trading_bot.persistence.models import Position
@@ -152,9 +160,97 @@ def test_status_alive_and_dead(tmp_path) -> None:
 def test_ws_pushes_control_state(tmp_path) -> None:
     state, _, _ = _state(tmp_path)
     client = TestClient(create_app(state))
-    with client.websocket_connect("/ws") as conn:
+    with client.websocket_connect(f"/ws?token={_token(client)}") as conn:
         msg = conn.receive_json()
         assert msg["type"] == "control" and msg["state"] == "RUNNING"
+
+
+def test_ws_rejects_missing_or_forged_token(tmp_path) -> None:
+    """무인증 WS 는 계좌 현황 스트림을 그대로 노출한다 (#20)."""
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    forged = create_access_token("attacker", "some-other-secret-0123456789abcdef")
+    for url in ("/ws", f"/ws?token={forged}"):
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(url):
+                pass
+        assert exc.value.code == 1008
+
+
+def test_forged_token_with_public_default_secret_rejected(tmp_path) -> None:
+    """공개된 기본 시크릿으로 서명한 토큰은 실제 시크릿과 다르면 통하지 않는다 (#1)."""
+    state, _, control = _state(tmp_path)
+    client = TestClient(create_app(state))
+    forged = create_access_token("attacker", DEFAULT_JWT_SECRET)
+    r = client.post("/api/control", json={"action": "stop"}, headers=_auth(forged))
+    assert r.status_code == 401 and not control.is_stopped
+
+
+def test_login_throttled_after_repeated_failures(tmp_path) -> None:
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    for _ in range(10):
+        assert client.post("/api/auth/login", json={"username": "admin", "password": "x"}).status_code == 401
+    # 한도 초과 뒤에는 맞는 비밀번호도 잠시 거부 (무차별 대입 차단)
+    assert client.post("/api/auth/login", json={"username": "admin", "password": "admin"}).status_code == 429
+
+
+def test_cors_wildcard_is_not_honored(tmp_path) -> None:
+    """임의 웹페이지가 브라우저를 경유해 봇을 조작하지 못하게 (#2)."""
+    state, _, _ = _state(tmp_path)
+    state.cors_origins = ["*"]
+    client = TestClient(create_app(state))
+    r = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "admin"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_cors_explicit_origin_allowed(tmp_path) -> None:
+    state, _, _ = _state(tmp_path)
+    state.cors_origins = ["http://localhost:5173"]
+    client = TestClient(create_app(state))
+    ok = client.get("/health", headers={"Origin": "http://localhost:5173"})
+    assert ok.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    evil = client.get("/health", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in evil.headers
+
+
+def test_health_exposes_no_control_state(tmp_path) -> None:
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state))
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_scoped_stop_rejected_not_widened(tmp_path) -> None:
+    """엔진은 scope 를 모르므로 scope 지정 stop 은 전량청산으로 커지지 않게 거부 (#14)."""
+    state, _, control = _state(tmp_path)
+    client = TestClient(create_app(state))
+    r = client.post(
+        "/api/control", json={"action": "stop", "scope": "camp-1"}, headers=_auth(_token(client))
+    )
+    assert r.status_code == 422
+    assert not control.is_stopped and not (tmp_path / "control.json").exists()
+
+
+def test_insecure_api_config_detection() -> None:
+    assert insecure_api_config(DEFAULT_JWT_SECRET, "admin")
+    assert insecure_api_config("short", "a-strong-password")
+    assert insecure_api_config("x" * 40, "admin")
+    assert insecure_api_config("x" * 40, "a-strong-password") == []
+    assert is_loopback_host("127.0.0.1") and is_loopback_host("localhost") and is_loopback_host("::1")
+    assert not is_loopback_host("0.0.0.0") and not is_loopback_host("192.168.0.10")
+
+
+def test_default_app_refuses_insecure_config_on_public_bind(monkeypatch) -> None:
+    from short_trading_bot.api import main as api_main
+    from short_trading_bot.infra.config import Settings
+
+    monkeypatch.setattr(api_main, "get_settings", lambda: Settings(_env_file=None, api_host="0.0.0.0"))
+    with pytest.raises(api_main.InsecureApiConfig):
+        api_main.create_default_app()
 
 
 def test_dashboard_index_is_not_cached(tmp_path) -> None:

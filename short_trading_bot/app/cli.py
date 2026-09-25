@@ -690,13 +690,34 @@ def serve(
 
 
 @app.command("api")
-def serve_api(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Serve the dashboard API + WebSocket (FastAPI). Put HTTPS in front for production."""
+def serve_api(host: str | None = None, port: int = 8000) -> None:
+    """Serve the dashboard API + WebSocket (FastAPI). Put HTTPS in front for production.
+
+    기본 바인딩은 STB_API_HOST(기본 0.0.0.0 — 같은 와이파이의 폰에서 접속). 기본 자격증명이
+    남아 있으면 loopback(--host 127.0.0.1)으로만 기동된다."""
+    import os
+
     import uvicorn
 
+    from ..api.security import insecure_api_config, is_loopback_host
+
     s = _bootstrap()
-    get_logger("api").info("api.start", host=host, port=port, mode=s.mode.value)
-    uvicorn.run("short_trading_bot.api.main:app", host=host, port=port)
+    bind = host or s.api_host
+    problems = insecure_api_config(s.api_jwt_secret, s.api_password)
+    if problems and not is_loopback_host(bind):
+        typer.echo(
+            f"대시보드 API 기동 거부 ({bind}): " + "; ".join(problems) + "\n"
+            "  .env 에 STB_API_JWT_SECRET=$(openssl rand -hex 32) 와 STB_API_PASSWORD 를 설정하거나,\n"
+            "  이 컴퓨터에서만 쓸 거면 `trader api --host 127.0.0.1`."
+        )
+        raise typer.Exit(1)
+    # 앱 팩토리(api/main.py)도 같은 검사를 하므로 실제 바인딩 주소를 넘겨준다.
+    os.environ["STB_API_HOST"] = bind
+    get_settings.cache_clear()
+    get_logger("api").info("api.start", host=bind, port=port, mode=s.mode.value)
+    uvicorn.run(
+        "short_trading_bot.api.main:create_default_app", factory=True, host=bind, port=port
+    )
 
 
 @app.command()

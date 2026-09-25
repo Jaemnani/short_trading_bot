@@ -218,6 +218,22 @@ def test_preflight_ready_with_keys(monkeypatch) -> None:
     assert is_ready(checks)
 
 
+def test_preflight_live_requires_secure_dashboard_credentials(monkeypatch) -> None:
+    """실전에서 공개 기본 JWT 시크릿/비밀번호는 critical — 대시보드 = 전량청산 버튼 (#1)."""
+    monkeypatch.setenv("STB_KIS__LIVE__APP_KEY", "k")
+    monkeypatch.setenv("STB_KIS__LIVE__APP_SECRET", "s")
+    monkeypatch.setenv("STB_KIS__LIVE__ACCOUNT_NO", "12345678-01")
+    limits = RiskLimits(daily_loss_limit=Decimal("500000"))
+    insecure = preflight(Settings(_env_file=None, mode="LIVE"), limits=limits)
+    assert not is_ready(insecure)
+    assert any(c.name == "api_credentials_secure" and c.critical and not c.ok for c in insecure)
+    secure = preflight(
+        Settings(_env_file=None, mode="LIVE", api_jwt_secret="x" * 40, api_password="strong-pass-1"),
+        limits=limits,
+    )
+    assert is_ready(secure)
+
+
 def test_build_broker_domestic_only_by_default(monkeypatch) -> None:
     """overseas_enabled 기본 False — 해외 어댑터를 만들지 않아 해외 API 호출이 0이다."""
     from short_trading_bot.infra.config import KisEnvCreds, KisSettings, Settings

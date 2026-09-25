@@ -109,6 +109,9 @@ def preflight(settings: Settings, *, limits: RiskLimits | None = None) -> list[P
         daily_pct is not None and daily_pct > 0
     )
     live = settings.mode is Mode.LIVE
+    from ..api.security import insecure_api_config
+
+    api_problems = insecure_api_config(settings.api_jwt_secret, settings.api_password)
     return [
         PreflightCheck("mode", settings.mode in (Mode.PAPER, Mode.LIVE), settings.mode.value, True),
         PreflightCheck(
@@ -125,10 +128,11 @@ def preflight(settings: Settings, *, limits: RiskLimits | None = None) -> list[P
         ),
         PreflightCheck("db_persistent", ":memory:" not in settings.db_url, settings.db_url, True),
         PreflightCheck(
-            "api_secret_changed",
-            settings.api_jwt_secret != "dev-insecure-change-me",
-            "dashboard JWT secret",
-            critical=False,
+            "api_credentials_secure",
+            not api_problems,
+            "; ".join(api_problems) if api_problems else "dashboard JWT secret + password set",
+            # 실전에서 대시보드 = 실계좌 전량청산 버튼. 공개 기본값이면 가동 금지.
+            critical=live,
         ),
         PreflightCheck(
             "live_smallest_size",
