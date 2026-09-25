@@ -204,7 +204,8 @@ class TradingService:
         # 브로커 호출 도중 죽은 흔적(PENDING_NEW)은 UNKNOWN 으로 넘겨 resolver 가 밝히게 하고,
         # 전 거래일 주문은 만료 — 둘 다 안 하면 해당 (lot, side) 잠금이 영구히 남는다 (#6).
         await self._om.orphan_pending_to_unknown()
-        await self._om.expire_stale()
+        # 아직 메모리 랏이 없으니 전일 체결 복구는 DB 에만 반영한다 — 아래 복원이 그 행을 읽는다.
+        await self.expire_stale_orders(db_only=True)
         open_states = [
             PositionState.HOLDING.value,
             PositionState.SCALING.value,
@@ -508,9 +509,26 @@ class TradingService:
             and not self._startup_refresh_pending
         )
 
-    async def expire_stale_orders(self) -> int:
-        """거래일이 바뀌면 호출 — 전일 미체결 주문을 만료시켜 잠금이 풀리게 한다 (#6)."""
-        return await self._om.expire_stale()
+    async def expire_stale_orders(self, *, db_only: bool = False) -> int:
+        """거래일이 바뀌면 호출 — 전일 미체결 주문을 만료시켜 잠금이 풀리게 한다 (#6).
+
+        만료 **전에** 그 주문들이 걸린 날짜의 체결내역을 반영한다. 엔진이 꺼진 채 날짜를
+        넘기면 전일 체결은 오늘자 폴링으로는 영영 안 보인다 — 그대로 만료하면 브로커엔 주식이
+        있는데 DB·메모리는 0 이고 잠금까지 풀려 중복 진입 + 관리 밖 보유가 된다. 조회에
+        실패한 날짜의 주문은 이번엔 만료하지 않는다(잠금 유지, 다음 거래일 시작에 재시도)."""
+        stale = await self._om.stale_open_orders()
+        days = sorted({day for _oid, broker_no, day in stale if broker_no})
+        keep: set[str] = set()
+        if days:
+            handler = self._om.handle_fill if db_only else self._on_fill
+            poller = FillPoller(self._broker, self._sf, handler)
+            for day in days:
+                try:
+                    await poller.poll_day(day)
+                except Exception:
+                    self._log.exception("order.prior_day_fill_recovery_failed", day=str(day))
+                    keep |= {oid for oid, broker_no, d in stale if d == day and broker_no}
+        return await self._om.expire_stale(keep=keep)
 
     def make_fill_poller(self) -> FillPoller:
         """Ground-truth fill delivery: polls broker 체결내역 -> the composed fill handler.
@@ -937,6 +955,7 @@ class TradingService:
             if meta is None:
                 return
         lot, side, is_add = meta.lot, meta.side, meta.is_add
+        self._adjust_cached_cash(lot, side, fill)
         was_closed = lot.state is PositionState.CLOSED
         before = lot.realized_pnl
         lot.apply_fill(side, fill.qty, fill.price, fill.fee, fill.tax, is_add=is_add)
@@ -1165,6 +1184,19 @@ class TradingService:
     async def _equity(self) -> Decimal:
         balance = await self._broker.get_balance()
         return self._cash_value(balance.cash) + self._holdings_value()
+
+    def _adjust_cached_cash(self, lot: PositionLot, side: Side, fill: Fill) -> None:
+        """체결을 캐시된 현금에 즉시 반영한다. 안 하면 TTL 동안 매수는 '옛 현금 + 새 주식'으로
+        매수 대금만큼 평가금이 부풀고(매도는 반대) 사이징·낙폭 판정이 틀어진다. 다음 TTL
+        갱신 때 브로커 값으로 다시 맞춰진다 (D+2 예수금은 체결 즉시 대금이 반영되는 값)."""
+        if self._cash_cache is None:
+            return
+        rate = self._fx_rate_checked(lot.currency)
+        notional = fill.qty * fill.price
+        if side is Side.BUY:
+            self._cash_cache -= (notional + fill.fee + fill.tax) * rate
+        else:
+            self._cash_cache += (notional - fill.fee - fill.tax) * rate
 
     def _cash_value(self, cash: dict[Currency, Decimal]) -> Decimal:
         return sum(

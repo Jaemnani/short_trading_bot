@@ -88,11 +88,15 @@ class UnknownOrderResolver:
                 if len(group) == 1 and len(found) == 1:
                     order, _ticker = group[0]
                     row = await session.get(Order, order.order_id)
-                    if row is None or row.state != OrderState.UNKNOWN.value:
+                    if row is None or row.state not in _ADOPTABLE_STATES or row.broker_order_no:
                         continue
+                    revived = row.state == OrderState.REJECTED.value
                     row.broker_order_no = found[0]
                     row.state = OrderState.NEW.value
-                    session.add(_audit("order.unknown.adopted", row, {"broker_order_no": found[0]}))
+                    session.add(_audit(
+                        "order.unknown.readopted" if revived else "order.unknown.adopted",
+                        row, {"broker_order_no": found[0]},
+                    ))
                     self._log.info(
                         "unknown.adopted",
                         client_order_id=row.client_order_id,
@@ -101,6 +105,8 @@ class UnknownOrderResolver:
                     resolved += 1
                 elif not found:
                     for order, _ticker in group:
+                        if order.state != OrderState.UNKNOWN.value:
+                            continue  # 이미 추정 만료된 주문 — 다시 만료시킬 것 없음 (채택만 대기)
                         created = order.created_at
                         if created.tzinfo is None:  # SQLite drops tzinfo on DateTime columns
                             created = created.replace(tzinfo=UTC)
@@ -123,17 +129,37 @@ class UnknownOrderResolver:
         return resolved
 
     async def _load_unknowns(self, session: AsyncSession) -> list[tuple[Order, str]]:
+        """UNKNOWN 주문 + 이 resolver 가 '주문내역에 없음'으로 추정 만료시킨 오늘 주문.
+
+        추정 만료(REJECTED)는 주문번호가 없어 체결이 와도 FillPoller 가 매칭하지 못한다.
+        늦게라도 브로커 주문내역에 나타나면 채택해야 체결이 반영되고 잠금이 되살아난다."""
         rows = (
             await session.execute(
-                select(Order, Position.ticker)
+                select(Order, Position.ticker, Position.market)
                 .join(Position, Order.lot_id == Position.lot_id)
                 .where(
-                    Order.state == OrderState.UNKNOWN.value,
+                    Order.state.in_(_ADOPTABLE_STATES),
                     Order.broker_order_no.is_(None),
                 )
             )
         ).all()
-        return [(order, ticker) for order, ticker in rows]
+        payloads: list[dict[str, Any]] = list(
+            (
+                await session.execute(
+                    select(AuditLog.payload_json).where(AuditLog.event_type == "order.unknown.expired")
+                )
+            ).scalars()
+        )
+        presumed = {str((p or {}).get("client_order_id")) for p in payloads}
+        return [
+            (order, ticker)
+            for order, ticker, market in rows
+            if order.state == OrderState.UNKNOWN.value
+            or (order.client_order_id in presumed and order_in_session(order.created_at, market))
+        ]
+
+
+_ADOPTABLE_STATES = (OrderState.UNKNOWN.value, OrderState.REJECTED.value)
 
 
 def _audit(event_type: str, order: Order, extra: dict[str, Any]) -> AuditLog:

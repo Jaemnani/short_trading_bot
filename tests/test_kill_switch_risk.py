@@ -206,3 +206,22 @@ async def test_equity_cache_reuses_cash_but_revalues_holdings(sf) -> None:
 
     svc._lots.pop(svc.lot_key("005930", lot.params.resolution))  # 슬롯 밖 보유도 평가에 포함
     assert await svc._cached_equity() == Decimal(1_070_000)
+
+
+async def test_fill_adjusts_cached_cash_immediately(sf) -> None:
+    """캐시된 현금에 체결 대금을 즉시 반영 — 매수 직후 평가금이 매수 대금만큼 부풀지 않는다."""
+    from short_trading_bot.domain.enums import Currency
+
+    class _Cash(RestingBroker):
+        async def get_balance(self) -> AccountBalance:
+            return AccountBalance(cash={Currency.KRW: Decimal(1_000_000)})
+
+    svc = _svc(sf, _Cash())
+    assert await svc._cached_equity() == Decimal(1_000_000)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(10000), is_add=False, reason="enter")
+    await svc._on_fill(
+        Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(10000), fee=Decimal(15))
+    )
+    svc._last_price["005930"] = Decimal(10000)
+    assert await svc._cached_equity() == Decimal(1_000_000) - Decimal(15)  # 현금 -100,015 + 보유 100,000

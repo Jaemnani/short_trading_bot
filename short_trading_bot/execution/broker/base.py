@@ -7,6 +7,7 @@ mirroring the plan's "broker order/fill events flow back onto the event bus".
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import date
 from decimal import Decimal
 
 from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRecord, OrderRequest
@@ -56,6 +57,11 @@ class BrokerAdapter(ABC):
         no-op; the paper broker uses it to match resting limit orders
         (``PaperConfig.resting_limits``)."""
         return None
+
+    async def get_executions_on(self, day: date) -> list[Execution]:
+        """Executions of a PAST trading day (KST). Default empty (paper/sim keeps nothing
+        across restarts); the KIS adapter queries 일별주문체결조회 for that date."""
+        return []
 
     async def get_daily_orders(self) -> list[OrderRecord]:
         """Today's broker-side orders, filled or not (주문내역). Default empty; live

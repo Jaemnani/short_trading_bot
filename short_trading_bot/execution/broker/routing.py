@@ -8,6 +8,7 @@ reach the OrderManager. This lets the TradingService trade 국내 + 해외 throu
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import date
 from decimal import Decimal
 from typing import TypeVar
 
@@ -126,6 +127,10 @@ class RoutingBrokerAdapter(BrokerAdapter):
             if self._overseas_fail > before or self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
                 self.executions_complete = False
         return execs
+
+    async def get_executions_on(self, day: date) -> list[Execution]:
+        # 전일 체결 복구는 KRX 주문 대상 (해외는 24시간 규칙으로 KST 날짜 만료를 안 한다).
+        return list(await self._domestic.get_executions_on(day))
 
     async def get_daily_orders(self) -> list[OrderRecord]:
         orders = list(await self._domestic.get_daily_orders())

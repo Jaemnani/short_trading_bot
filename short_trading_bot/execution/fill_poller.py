@@ -15,7 +15,7 @@ Pair with the Reconciler (broker 잔고 = source of truth) as a second safety ne
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -28,11 +28,22 @@ from ..persistence.models import Fill as FillRow
 from ..persistence.models import Order, Position
 from .broker.base import BrokerAdapter
 from .order_manager import order_in_session
-from .types import Fill, FillHandler
+from .types import Execution, Fill, FillHandler
 
 
 def _aware(ts: datetime) -> datetime:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _kst_day(ts: datetime) -> date:
+    return _aware(ts).astimezone(_KST).date()
+
+
+def _day_close(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, 15, 30, tzinfo=_KST)
 
 
 class FillPoller:
@@ -56,14 +67,20 @@ class FillPoller:
     async def poll_once(self) -> int:
         """Apply any new execution deltas; returns how many fills were delivered."""
         async with self._lock:
-            return await self._poll_locked()
+            return await self._poll_locked(await self._broker.get_executions())
 
-    async def _poll_locked(self) -> int:
+    async def poll_day(self, day: date) -> int:
+        """지난 거래일(KST) 하루의 체결내역을 반영한다 — 엔진이 꺼진 채 날짜를 넘긴 뒤,
+        그날 주문을 만료시키기 전의 복구용. 주문 매칭은 그날 생성된 주문으로 한정한다."""
+        async with self._lock:
+            return await self._poll_locked(await self._broker.get_executions_on(day), day=day)
+
+    async def _poll_locked(self, executions: list[Execution], *, day: date | None = None) -> int:
         applied = 0
-        for ex in await self._broker.get_executions():
+        for ex in executions:
             if ex.exec_id in self._seen:
                 continue
-            resolved = await self._resolve(ex.broker_order_no)
+            resolved = await self._resolve(ex.broker_order_no, day=day)
             if resolved is None:
                 # Ack may not be persisted yet — retry on the next poll (don't mark seen).
                 self._log.warning("fill_poll.unresolved", broker_order_no=ex.broker_order_no)
@@ -93,7 +110,9 @@ class FillPoller:
                     fee=max(Decimal(0), ex.fee - already_fee),
                     tax=max(Decimal(0), ex.tax - already_tax),
                     currency=ex.currency,
-                    ts=ex.ts,
+                    # 지난 날 체결은 그날 장 마감 시각으로 — 오늘 시각으로 찍히면 당일 실현손익
+                    # (일일 손실 한도) 복원에 전일 체결이 섞인다.
+                    ts=ex.ts or (_day_close(day) if day is not None else None),
                     source="poll",
                 )
             )
@@ -102,7 +121,7 @@ class FillPoller:
         return applied
 
     async def _resolve(
-        self, broker_order_no: str
+        self, broker_order_no: str, *, day: date | None = None
     ) -> tuple[str, Decimal, Decimal, Decimal, Decimal] | None:
         """Map an order to already applied cumulative execution totals."""
         async with session_scope(self._sf) as session:
@@ -119,7 +138,11 @@ class FillPoller:
                         .where(Order.broker_order_no == broker_order_no)
                     )
                 ).all()
-                if order_in_session(o.created_at, market)
+                if (
+                    order_in_session(o.created_at, market)
+                    if day is None
+                    else _kst_day(o.created_at) == day
+                )
             ]
             if not candidates:
                 return None

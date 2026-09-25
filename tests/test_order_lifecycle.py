@@ -285,3 +285,68 @@ async def test_overseas_order_survives_kst_midnight(sf) -> None:
     assert await om.expire_stale(datetime(2026, 9, 24, 19, 0, tzinfo=_UTC)) == 0  # KST 9/25 04:00
     assert await _state(sf, "us") == OrderState.NEW.value
     assert await om.expire_stale(datetime(2026, 9, 25, 15, 0, tzinfo=_UTC)) == 1  # 24h 초과
+
+
+async def test_resolver_readopts_presumed_expired_order_when_it_appears(sf) -> None:
+    """'주문내역에 없음'으로 추정 만료(REJECTED)된 주문이 늦게 나타나면 채택 → 체결 매칭 가능."""
+    await _seed_position(sf)
+    await _seed_order(sf, "u", OrderState.UNKNOWN.value, datetime.now(UTC) - timedelta(minutes=10))
+    broker = _Broker()
+    resolver = UnknownOrderResolver(broker, sf)
+    assert await resolver.poll_once() == 1
+    assert await _state(sf, "u") == OrderState.REJECTED.value  # 추정 만료
+
+    broker.daily = [OrderRecord(broker_order_no="0042", ticker="005930", side=Side.SELL, qty=Decimal(10))]
+    assert await resolver.poll_once() == 1
+    async with session_scope(sf) as s:
+        row = (await s.execute(select(Order).where(Order.client_order_id == "u"))).scalar_one()
+    assert row.state == OrderState.NEW.value and row.broker_order_no == "0042"
+
+
+async def test_prior_day_fills_recovered_before_expiry(sf) -> None:
+    """엔진이 꺼진 채 날짜를 넘김: 전일 체결을 먼저 반영하고 나서 만료 (보유 유실·중복 진입 방지)."""
+    from short_trading_bot.app.service import TradingService
+    from short_trading_bot.risk.limits import RiskLimits
+    from short_trading_bot.risk.manager import RiskManager
+
+    await _seed_position(sf)
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    await _seed_order(sf, "prev", OrderState.NEW.value, yesterday, broker_no="0009")
+
+    class _Prior(_Broker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.asked: list[Any] = []
+
+        async def get_executions_on(self, day: Any) -> list[Execution]:
+            self.asked.append(day)
+            return [Execution(
+                exec_id="0009:10", broker_order_no="0009", ticker="005930", side=Side.SELL,
+                qty=Decimal(10), price=Decimal(70000),
+            )]
+
+    broker = _Prior()
+    svc = TradingService(broker, sf, RiskManager(RiskLimits()), {})
+    await svc.expire_stale_orders(db_only=True)
+    assert broker.asked  # 그날 체결을 조회했다
+    assert await _state(sf, "prev") == OrderState.FILLED.value  # 만료가 아니라 체결 반영
+    async with session_scope(sf) as s:
+        pos = await s.get(Position, "lot1")
+    assert pos is not None and pos.qty_filled == 0  # 보유 10주 매도 체결 반영
+
+
+async def test_prior_day_order_kept_when_fill_lookup_fails(sf) -> None:
+    from short_trading_bot.app.service import TradingService
+    from short_trading_bot.risk.limits import RiskLimits
+    from short_trading_bot.risk.manager import RiskManager
+
+    await _seed_position(sf)
+    await _seed_order(sf, "prev", OrderState.NEW.value, datetime.now(UTC) - timedelta(days=1), broker_no="0009")
+
+    class _Down(_Broker):
+        async def get_executions_on(self, day: Any) -> list[Execution]:
+            raise RuntimeError("KIS 500")
+
+    svc = TradingService(_Down(), sf, RiskManager(RiskLimits()), {})
+    await svc.expire_stale_orders(db_only=True)
+    assert await _state(sf, "prev") == OrderState.NEW.value  # 확인 전엔 만료 안 함

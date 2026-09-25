@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -185,6 +185,10 @@ class KisBrokerAdapter(BrokerAdapter):
         resp = await self._daily_ccld("01")  # 01 = 체결만
         return self._parse_executions(resp)
 
+    async def get_executions_on(self, day: date) -> list[Execution]:
+        resp = await self._daily_ccld("01", day=day)
+        return self._parse_executions(resp)
+
     async def get_daily_orders(self) -> list[OrderRecord]:
         resp = await self._daily_ccld("00")  # 00 = 전체 (체결 + 미체결)
         out: list[OrderRecord] = []
@@ -203,7 +207,7 @@ class KisBrokerAdapter(BrokerAdapter):
             )
         return out
 
-    async def _daily_ccld(self, ccld_dvsn: str) -> dict[str, Any]:
+    async def _daily_ccld(self, ccld_dvsn: str, *, day: date | None = None) -> dict[str, Any]:
         """당일 주문/체결 전체 — 연속조회로 모든 페이지를 합쳐 ``output1`` 로 돌려준다.
 
         첫 페이지만 읽으면 한 페이지를 넘는 날 오래된 주문이 사라진다: 그 체결은 반영되지
@@ -211,7 +215,7 @@ class KisBrokerAdapter(BrokerAdapter):
         재주문 → 이중 주문이 된다 (#16). 조회일은 KST — UTC 로 계산하면 KST 00~09시에는
         전날을 조회한다."""
         tr_id = ("V" + _CCLD_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CCLD_TR_LIVE
-        today = datetime.now(_KST).strftime("%Y%m%d")
+        today = (day or datetime.now(_KST).date()).strftime("%Y%m%d")
         rows: list[Any] = []
         fk = nk = ""
         cont = ""

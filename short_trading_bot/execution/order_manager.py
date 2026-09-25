@@ -259,7 +259,29 @@ class OrderManager:
                 )
             )
 
-    async def expire_stale(self, now: datetime | None = None) -> int:
+    async def stale_open_orders(
+        self, now: datetime | None = None
+    ) -> list[tuple[str, str | None, date]]:
+        """만료 대상(현재 세션 밖의 열린 **KRX** 주문): (order_id, 주문번호, 주문일 KST)."""
+        now = now or datetime.now(UTC)
+        async with session_scope(self._sf) as s:
+            rows = (
+                await s.execute(
+                    select(Order, Position.market)
+                    .outerjoin(Position, Order.lot_id == Position.lot_id)
+                    .where(Order.state.in_(_OPEN_STATES))
+                )
+            ).all()
+        return [
+            (order.order_id, order.broker_order_no, _kst_date(order.created_at))
+            for order, market in rows
+            if not order_in_session(order.created_at, market, now)
+            and not (market and market != Market.KRX.value)
+        ]
+
+    async def expire_stale(
+        self, now: datetime | None = None, *, keep: set[str] | frozenset[str] = frozenset()
+    ) -> int:
         """전 거래일 이전에 낸 열린 주문을 EXPIRED 로 종결한다 (KRX 주문은 당일 유효).
 
         안 하면 장 마감으로 이미 사라진 주문이 DB 에 NEW/PARTIALLY_FILLED 로 남아
@@ -278,6 +300,8 @@ class OrderManager:
                 )
             ).all()
             for order, market in rows:
+                if order.order_id in keep:
+                    continue  # 그날 체결 확인 실패 — 이번엔 만료하지 않는다 (잠금 유지)
                 if not order_in_session(order.created_at, market, now):
                     prev = order.state
                     order.state = OrderState.EXPIRED.value
