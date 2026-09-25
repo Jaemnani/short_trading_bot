@@ -475,3 +475,29 @@ async def test_hydrate_indexes_both_open_rows_sharing_a_slot(sf) -> None:
     assert {(r.lot_id, r.qty) for r in broker2.submitted if r.side is Side.SELL} == {
         (old.lot_id, Decimal(3)), (new.lot_id, Decimal(2)),
     }
+
+
+async def test_incomplete_overseas_poll_keeps_only_overseas_barriers(sf) -> None:
+    """라우팅 어댑터가 해외 조회 실패를 빈 목록으로 강등하면 해외 랏의 반영 장벽은 유지,
+    국내 랏의 장벽은 해제 (해외 조회 중단이 국내 청산을 막지 않게)."""
+    from short_trading_bot.domain.enums import Market
+    from short_trading_bot.execution.broker.routing import RoutingBrokerAdapter
+
+    class _OverseasDown(RestingBroker):
+        async def get_executions(self) -> list[Any]:
+            raise RuntimeError("overseas 500")
+
+    routing = RoutingBrokerAdapter(RestingBroker(), _OverseasDown())
+    await routing.get_executions()
+    assert routing.executions_complete is False
+
+    svc = TradingService(routing, sf, RiskManager(RiskLimits()), {})
+    kr = await svc._spawn("005930", _TMPL)
+    us = await svc._spawn("AAPL", StrategyTemplate(strategy_id="trend_long_v1", market=Market.NASD))
+    svc._refresh_before_sell |= {kr.lot_id, us.lot_id}
+    svc._unconfirmed_buy_cancels |= {kr.lot_id, us.lot_id}
+
+    assert await svc._refresh_fills(kr) is True
+    assert svc._refresh_before_sell == {us.lot_id}
+    assert svc._unconfirmed_buy_cancels == {us.lot_id}
+    assert await svc._refresh_fills(us) is False

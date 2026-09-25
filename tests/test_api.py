@@ -294,3 +294,22 @@ def test_stop_persists_kill_switch_even_if_engine_is_down(tmp_path) -> None:
     assert state.kill_switch_file.exists()
     client.post("/api/control", json={"action": "resume"}, headers=_auth(token))
     assert not state.kill_switch_file.exists()
+
+
+def test_resume_keeps_kill_switch_marker_if_command_write_fails(tmp_path, monkeypatch) -> None:
+    """resume 은 명령을 영속한 뒤에만 긴급중지 표시를 지운다 — 중간 실패 시 STOPPED 유지(안전측)."""
+    import short_trading_bot.risk.control_file as cf
+
+    state, _, _ = _state(tmp_path)
+    client = TestClient(create_app(state), raise_server_exceptions=False)
+    token = _token(client)
+    client.post("/api/control", json={"action": "stop"}, headers=_auth(token))
+    assert state.kill_switch_file.exists()
+
+    def boom(*_a, **_kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cf, "write_command", boom)
+    r = client.post("/api/control", json={"action": "resume"}, headers=_auth(token))
+    assert r.status_code == 500
+    assert state.kill_switch_file.exists()  # resume 이 전달되지 않았으니 긴급중지 유지

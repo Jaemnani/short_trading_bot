@@ -109,8 +109,14 @@ class RoutingBrokerAdapter(BrokerAdapter):
 
     async def get_executions(self) -> list[Execution]:
         execs = list(await self._domestic.get_executions())
+        self.executions_complete = True
         if self._overseas is not None:
+            before = self._overseas_fail
             execs.extend(await self._overseas_read(self._overseas.get_executions))
+            # 해외 레그 실패(또는 연속 실패로 조회 중단)는 빈 목록으로 강등된다 — 국내 폴링은
+            # 계속 돌되, '체결 반영 확인'이 필요한 호출자에게는 미완료로 알린다.
+            if self._overseas_fail > before or self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
+                self.executions_complete = False
         return execs
 
     async def get_daily_orders(self) -> list[OrderRecord]:

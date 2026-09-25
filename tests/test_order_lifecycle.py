@@ -97,6 +97,10 @@ def test_kis_error_definitive_classification() -> None:
     assert KisApiError(403, url, "forbidden").is_definitive_rejection
     assert not KisApiError(500, url, "<html>bad gateway</html>").is_definitive_rejection
     assert not KisApiError(502, url, '{"rt_cd":"1","msg_cd":"OPSQ0001"}').is_definitive_rejection
+    # 타임아웃·재시도류 4xx 는 주문이 이미 닿았을 수 있다 → UNKNOWN 유지 (중복 주문 방지)
+    for status in (408, 409, 425, 429):
+        assert not KisApiError(status, url, "").is_definitive_rejection
+    assert KisApiError(400, url, "").is_definitive_rejection
 
 
 async def test_definitive_rejection_recorded_as_rejected(sf) -> None:

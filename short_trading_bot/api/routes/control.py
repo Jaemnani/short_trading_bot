@@ -47,7 +47,10 @@ def set_control(body: ControlIn, request: Request, _user: str = Depends(require_
             # control.json 만으로는 전달되지 않는다(엔진은 시작 시 잔존 명령을 과거 것으로
             # 본다) — 이 표시가 있으면 엔진은 STOPPED+전량청산으로 시작한다.
             mark_kill_switch(state.kill_switch_file)
-        elif body.action == "resume":
-            state.kill_switch_file.unlink(missing_ok=True)
         write_command(body.action, path=state.control_file)
+        if body.action == "resume":
+            # resume 명령을 먼저 영속한 뒤에 긴급중지 표시를 지운다. 순서가 반대면 그 사이에
+            # 죽었을 때 표시는 없고 control.json 엔 옛 stop 만 남아(엔진은 시작 시 과거 명령으로
+            # 무시) 재기동한 엔진이 전달된 적 없는 resume 상태로 매매를 재개한다.
+            state.kill_switch_file.unlink(missing_ok=True)
     return _out(request)

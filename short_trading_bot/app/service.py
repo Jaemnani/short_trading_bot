@@ -790,6 +790,19 @@ class TradingService:
                 "order.fill_refresh_failed", lot_id=lot.lot_id if lot is not None else None
             )
             return False
+        if not getattr(self._broker, "executions_complete", True):
+            # 해외 레그 실패가 빈 목록으로 강등됐다 — 국내 체결은 반영됐지만 해외는 확인 안 됨.
+            # 해외 랏의 장벽만 남긴다 (전부 남기면 해외 조회 중단 시 국내 청산까지 영원히 막힘).
+            self._log.warning("order.fill_refresh_incomplete")
+            overseas = {lot.lot_id for lot in self._tracked_lots() if lot.market.is_overseas}
+            self._refresh_before_sell &= overseas
+            self._unconfirmed_buy_cancels &= overseas
+            if self._startup_refresh_pending and not any(
+                lot.market.is_overseas and (lot.qty > 0 or (lot.lot_id, Side.BUY) in self._pending)
+                for lot in self._tracked_lots()
+            ):
+                self._startup_refresh_pending = False
+            return lot is None or lot.lot_id not in overseas
         self._refresh_before_sell.clear()
         self._unconfirmed_buy_cancels.clear()
         self._startup_refresh_pending = False

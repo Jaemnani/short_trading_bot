@@ -15,6 +15,10 @@ from ..types import AccountBalance, Execution, FillHandler, OrderAck, OrderRecor
 class BrokerAdapter(ABC):
     #: Set by the OrderManager so the adapter can push fills back asynchronously.
     fill_handler: FillHandler | None = None
+    #: False when the last ``get_executions`` returned without every broker leg answering
+    #: (e.g. a routing adapter degraded a failed overseas leg to an empty list). Callers that
+    #: need a *confirmed* refresh (post-cancel barriers) must treat that poll as failed.
+    executions_complete: bool = True
 
     @property
     @abstractmethod

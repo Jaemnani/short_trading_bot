@@ -38,6 +38,10 @@ from .market_router import MarketRouter
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+# 요청을 처리하기 전에 거부했음이 확실한 4xx (타임아웃·충돌·재시도류 제외).
+_DEFINITIVE_4XX = frozenset({400, 401, 403, 404, 405, 415, 422})
+
+
 class KisApiError(RuntimeError):
     """KIS REST 실패 — 상태코드와 본문(msg_cd/msg1)을 보존한다.
 
@@ -62,13 +66,15 @@ class KisApiError(RuntimeError):
     def is_definitive_rejection(self) -> bool:
         """주문이 **접수되지 않았음이 확실한** 실패인가 (OrderManager 가 REJECTED 로 처리).
 
-        - 4xx: 요청 자체가 거부됨.
-        - 5xx + 게이트웨이 코드(EGW*, 예: EGW00201 초당 한도 초과): 주문 엔진에 닿기 전에
+        - 요청 자체를 처리 전에 거부하는 4xx (400/401/403/404/405/415/422). 408(타임아웃)·
+          409·425·429 등 중간 장비가 낼 수 있거나 처리 여부가 모호한 4xx 는 제외한다 —
+          주문이 이미 브로커에 닿았을 수 있어 거부로 확정하면 중복 주문이 난다.
+        - 게이트웨이 코드(EGW*, 예: EGW00201 초당 한도 초과): 주문 엔진에 닿기 전에
           게이트웨이가 돌려보냄.
-        그 밖의 5xx(본문 없음·프록시 오류 등)는 접수 여부가 불명확 → UNKNOWN 유지.
+        그 밖(본문 없는 5xx·프록시 오류 등)은 접수 여부가 불명확 → UNKNOWN 유지.
         UNKNOWN 은 resolver 가 밝힐 때까지 취소·재주문이 막히므로(손절 포함), 확실한
         거부를 UNKNOWN 으로 두면 손절이 최소 유예시간만큼 멈춘다 (#11)."""
-        if 400 <= self.status < 500:
+        if self.status in _DEFINITIVE_4XX:
             return True
         return self.msg_cd.startswith("EGW")
 
