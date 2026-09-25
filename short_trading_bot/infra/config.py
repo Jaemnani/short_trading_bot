@@ -70,9 +70,15 @@ class Settings(BaseSettings):
     notifier: NotifierSettings = Field(default_factory=NotifierSettings)
 
     # API / dashboard (P10). Override in prod; serve behind HTTPS.
+    # 기본값(공개된 값)이 남아 있으면 loopback 이 아닌 주소로는 API 가 기동을 거부한다
+    # (api/security.py insecure_api_config) — 대시보드는 실계좌 전량청산을 누를 수 있다.
     api_jwt_secret: str = "dev-insecure-change-me"
     api_username: str = "admin"
     api_password: str = "admin"
+    api_host: str = "0.0.0.0"  # `trader api --host` 가 덮어쓴다
+    # 대시보드는 같은 오리진(/)에서 서빙되므로 CORS 불필요. 개발 서버(vite) 등 다른
+    # 오리진이 필요할 때만 명시 목록으로 허용한다. "*" 는 무시된다.
+    api_cors_origins: list[str] = Field(default_factory=list)
 
     @property
     def is_live(self) -> bool:

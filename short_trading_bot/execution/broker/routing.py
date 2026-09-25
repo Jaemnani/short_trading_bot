@@ -8,6 +8,7 @@ reach the OrderManager. This lets the TradingService trade 국내 + 해외 throu
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import date
 from decimal import Decimal
 from typing import TypeVar
 
@@ -76,6 +77,14 @@ class RoutingBrokerAdapter(BrokerAdapter):
         self._overseas_fail = 0
         return result
 
+    def resume_overseas_reads(self) -> None:
+        """연속 실패로 쉬고 있는 해외 조회를 다음 호출에 한 번 다시 시도하게 한다.
+
+        체결 반영 '확인'이 필요한 호출자(취소 뒤 장벽)용. 쉬는 상태를 그대로 두면 장벽이
+        해외 매도를 막고, 조회는 해외 주문이 나가야 재개돼 서로를 영원히 기다린다."""
+        if self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
+            self._overseas_fail = _OVERSEAS_FAIL_LIMIT - 1  # 한 번 시도, 또 실패하면 다시 쉼
+
     async def _overseas_read(self, fetch: Callable[[], Awaitable[list[_T]]]) -> list[_T]:
         empty: list[_T] = []
         return list(await self._overseas_call(fetch, empty))
@@ -109,9 +118,19 @@ class RoutingBrokerAdapter(BrokerAdapter):
 
     async def get_executions(self) -> list[Execution]:
         execs = list(await self._domestic.get_executions())
+        self.executions_complete = True
         if self._overseas is not None:
+            before = self._overseas_fail
             execs.extend(await self._overseas_read(self._overseas.get_executions))
+            # 해외 레그 실패(또는 연속 실패로 조회 중단)는 빈 목록으로 강등된다 — 국내 폴링은
+            # 계속 돌되, '체결 반영 확인'이 필요한 호출자에게는 미완료로 알린다.
+            if self._overseas_fail > before or self._overseas_fail >= _OVERSEAS_FAIL_LIMIT:
+                self.executions_complete = False
         return execs
+
+    async def get_executions_on(self, day: date) -> list[Execution]:
+        # 전일 체결 복구는 KRX 주문 대상 (해외는 24시간 규칙으로 KST 날짜 만료를 안 한다).
+        return list(await self._domestic.get_executions_on(day))
 
     async def get_daily_orders(self) -> list[OrderRecord]:
         orders = list(await self._domestic.get_daily_orders())

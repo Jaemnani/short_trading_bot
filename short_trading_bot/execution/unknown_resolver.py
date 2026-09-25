@@ -19,6 +19,7 @@ above the broker HTTP timeout.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -30,6 +31,7 @@ from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
 from .broker.base import BrokerAdapter
+from .order_manager import order_in_session
 
 
 class UnknownOrderResolver:
@@ -40,9 +42,12 @@ class UnknownOrderResolver:
         *,
         grace_seconds: float = 180.0,
         logger: Any = None,
+        on_adopt: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._broker = broker
         self._sf = session_factory
+        # 채택된 주문의 client_order_id 를 서비스에 알린다 (메모리 잠금·메타 재설정).
+        self._on_adopt = on_adopt
         self._grace = timedelta(seconds=grace_seconds)
         self._log = logger or get_logger("unknown_resolver")
 
@@ -52,13 +57,18 @@ class UnknownOrderResolver:
             unknowns = await self._load_unknowns(session)
             if not unknowns:
                 return 0
+            # '이미 연결된 번호'는 오늘 주문만 — 주문번호는 거래일 단위라 과거 번호까지 넣으면
+            # 오늘 실제 접수된 주문이 후보에서 빠져 만료 → 재주문(이중 주문)된다 (#15).
             linked = {
-                no
-                for no in (
+                row.broker_order_no
+                for row in (
                     await session.execute(
-                        select(Order.broker_order_no).where(Order.broker_order_no.is_not(None))
+                        select(Order.broker_order_no, Order.created_at, Position.market)
+                        .outerjoin(Position, Order.lot_id == Position.lot_id)
+                        .where(Order.broker_order_no.is_not(None))
                     )
-                ).scalars()
+                ).all()
+                if order_in_session(row.created_at, row.market)
             }
         records = await self._broker.get_daily_orders()
 
@@ -75,6 +85,7 @@ class UnknownOrderResolver:
             by_sig.setdefault(key, []).append((order, ticker))
 
         resolved = 0
+        adopted: list[str] = []
         now = datetime.now(UTC)
         async with session_scope(self._sf) as session:
             for key, group in by_sig.items():
@@ -82,11 +93,16 @@ class UnknownOrderResolver:
                 if len(group) == 1 and len(found) == 1:
                     order, _ticker = group[0]
                     row = await session.get(Order, order.order_id)
-                    if row is None or row.state != OrderState.UNKNOWN.value:
+                    if row is None or row.state not in _ADOPTABLE_STATES or row.broker_order_no:
                         continue
+                    revived = row.state == OrderState.REJECTED.value
                     row.broker_order_no = found[0]
                     row.state = OrderState.NEW.value
-                    session.add(_audit("order.unknown.adopted", row, {"broker_order_no": found[0]}))
+                    session.add(_audit(
+                        "order.unknown.readopted" if revived else "order.unknown.adopted",
+                        row, {"broker_order_no": found[0]},
+                    ))
+                    adopted.append(row.client_order_id)
                     self._log.info(
                         "unknown.adopted",
                         client_order_id=row.client_order_id,
@@ -95,6 +111,8 @@ class UnknownOrderResolver:
                     resolved += 1
                 elif not found:
                     for order, _ticker in group:
+                        if order.state != OrderState.UNKNOWN.value:
+                            continue  # 이미 추정 만료된 주문 — 다시 만료시킬 것 없음 (채택만 대기)
                         created = order.created_at
                         if created.tzinfo is None:  # SQLite drops tzinfo on DateTime columns
                             created = created.replace(tzinfo=UTC)
@@ -114,20 +132,43 @@ class UnknownOrderResolver:
                         local=len(group),
                         broker=len(found),
                     )
+        if self._on_adopt is not None:
+            for cid in adopted:  # 커밋 뒤에 — 서비스가 채택된 상태를 읽는다
+                await self._on_adopt(cid)
         return resolved
 
     async def _load_unknowns(self, session: AsyncSession) -> list[tuple[Order, str]]:
+        """UNKNOWN 주문 + 이 resolver 가 '주문내역에 없음'으로 추정 만료시킨 오늘 주문.
+
+        추정 만료(REJECTED)는 주문번호가 없어 체결이 와도 FillPoller 가 매칭하지 못한다.
+        늦게라도 브로커 주문내역에 나타나면 채택해야 체결이 반영되고 잠금이 되살아난다."""
         rows = (
             await session.execute(
-                select(Order, Position.ticker)
+                select(Order, Position.ticker, Position.market)
                 .join(Position, Order.lot_id == Position.lot_id)
                 .where(
-                    Order.state == OrderState.UNKNOWN.value,
+                    Order.state.in_(_ADOPTABLE_STATES),
                     Order.broker_order_no.is_(None),
                 )
             )
         ).all()
-        return [(order, ticker) for order, ticker in rows]
+        payloads: list[dict[str, Any]] = list(
+            (
+                await session.execute(
+                    select(AuditLog.payload_json).where(AuditLog.event_type == "order.unknown.expired")
+                )
+            ).scalars()
+        )
+        presumed = {str((p or {}).get("client_order_id")) for p in payloads}
+        return [
+            (order, ticker)
+            for order, ticker, market in rows
+            if order.state == OrderState.UNKNOWN.value
+            or (order.client_order_id in presumed and order_in_session(order.created_at, market))
+        ]
+
+
+_ADOPTABLE_STATES = (OrderState.UNKNOWN.value, OrderState.REJECTED.value)
 
 
 def _audit(event_type: str, order: Order, extra: dict[str, Any]) -> AuditLog:

@@ -94,8 +94,11 @@ launchctl load   ~/Library/LaunchAgents/com.shorttradingbot.engine.plist  # (재
 
 같은 와이파이의 폰/노트북에서: `http://<아이맥IP>:8000` (아이맥IP는 시스템 설정→네트워크)
 - 로그인은 `.env.local`의 `STB_API_USERNAME/PASSWORD`
+- ⚠️ `.env.local` 에 `STB_API_JWT_SECRET`(`openssl rand -hex 32`)과 기본값이 아닌 `STB_API_PASSWORD`
+  가 없으면 API 가 **기동을 거부**한다 (공개된 기본값이면 같은 와이파이의 누구나 전량청산을 누를 수
+  있어서). 아이맥에서만 볼 거면 `trader api --host 127.0.0.1`.
 - 프론트(PWA)까지 쓰려면 아이맥에서 `cd frontend && npm install && npm run dev -- --host`
-  → `http://<아이맥IP>:5173`
+  → `http://<아이맥IP>:5173` (다른 오리진이므로 `STB_API_CORS_ORIGINS=["http://<아이맥IP>:5173"]` 필요)
 - **집 밖에서** 접속하려면 포트를 그냥 열지 말고 Tailscale(무료 VPN) 권장 — 설치만 하면
   외부에서도 안전하게 같은 주소로 접속됩니다.
 

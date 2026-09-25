@@ -110,6 +110,23 @@ def serve(
         typer.echo("No KIS keys in .env — cannot stream live data. Fill STB_KIS__* then re-run.")
         raise typer.Exit(1)
 
+    if live_exec and s.mode is Mode.LIVE:
+        # 실전 실주문 게이트 (#13). 모의계좌 --live-exec 은 현행 유지.
+        # STB_DRY_RUN 은 문서상 '실전 전환 전 리허설' 스위치 — 켜져 있으면 실주문 금지.
+        if s.dry_run:
+            typer.echo("STB_DRY_RUN=true — 실전(LIVE) 실주문을 거부합니다. 전환하려면 STB_DRY_RUN=false.")
+            raise typer.Exit(1)
+        from .engine import is_ready
+        from .engine import preflight as run_preflight
+
+        checks = run_preflight(s, limits=limits)
+        if not is_ready(checks):
+            for c in checks:
+                if c.critical and not c.ok:
+                    typer.echo(f"  preflight 실패: {c.name} — {c.detail}")
+            typer.echo("실전 preflight 의 critical 항목이 통과하지 않아 가동을 거부합니다.")
+            raise typer.Exit(1)
+
     from ..infra.notifier.factory import build_notifier
     from ..infra.rate_limit import configure_shared_limiter
 
@@ -146,6 +163,12 @@ def serve(
     )
     feed_ref: dict[str, KisWebSocketFeed | None] = {"feed": None}  # 스캐너 동적 구독용
 
+    async def _subscribe_now(ticker: str) -> bool:
+        feed = feed_ref["feed"]
+        return await feed.subscribe(ticker) if feed is not None else False
+
+    service.subscribe_hook = _subscribe_now  # 재오픈된 고아 랏 등 실행 중 추적 합류분
+
     def _subscriptions() -> list[str]:
         """지금 시세가 필요한 종목 전부 — 매 (재)접속마다 새로 계산한다.
 
@@ -173,6 +196,11 @@ def serve(
                 if was_idle:
                     was_idle = False
                     log.info("fill_poll.session_start")
+                    try:
+                        # 새 거래일: 전일 미체결(장 마감으로 소멸) 주문을 만료 → 잠금 해제 (#6)
+                        await service.expire_stale_orders()
+                    except Exception:
+                        log.exception("order.expire_stale.error")
                 ok = True
                 try:
                     await resolver.poll_once()
@@ -584,7 +612,14 @@ def serve(
             await asyncio.sleep(2)
 
     async def _run() -> None:
+        from ..risk.control_file import kill_switch_active
+
         restored = await service.hydrate()
+        if kill_switch_active():
+            # 긴급중지 도중 종료(크래시)된 뒤의 재기동 — 청산을 이어서 한다 (#7).
+            service.control.stop()
+            log.warning("kill_switch.restored_on_start")
+            await notifier.notify("kill_switch.restored", 조치="재기동 — 전량청산 재개")
         # 스캐너로 합류했던(워치리스트 밖) 열린 랏의 시세는 _subscriptions() 가 파생시킨다 —
         # 여기서 tickers 에 영구 추가하면 랏 청산 후에도 구독이 남아 한도를 잠식한다.
         if live_exec:
@@ -636,10 +671,21 @@ def serve(
 
         # 해상도별 공유 빌더: 한 WS 연결의 틱을 모든 해상도로 동시 집계, 재접속에도 봉 보존.
         shared_builders = [BarBuilder(res) for res in resolutions]
+        def _done() -> bool:
+            # 긴급중지 후에도 청산이 끝날 때까지는 시세·체결 폴링을 유지해야 한다 — 예전엔
+            # STOP 후 WS 가 한 번 끊기면 청산 체결 확인 전에 종료했다 (#7).
+            return service.control.is_stopped and service.is_flat()
+
         try:
-            # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지.
-            while not service.control.is_stopped:
-                approval = await auth.approval_key()
+            # Reconnect loop: a WS disconnect ends the stream; resume until 긴급중지+청산 완료.
+            while not _done():
+                try:
+                    approval = await auth.approval_key()
+                except Exception:
+                    # 승인키 발급 일시 실패로 프로세스가 죽으면 청산·손절 관리가 통째로 멈춘다.
+                    log.exception("ws.approval_key_failed")
+                    await asyncio.sleep(5)
+                    continue
                 subs = _subscriptions()  # 재접속마다 최신 목록 (합류분 포함·만료분 제외)
                 feed = KisWebSocketFeed(
                     approval, subs, resolutions[0], ws_url=kis_ws_url(s.mode),
@@ -650,7 +696,7 @@ def serve(
                     await service.run(feed)
                 except Exception:
                     log.exception("feed.error")
-                if service.control.is_stopped:
+                if _done():
                     break
                 if live_exec:  # recover anything missed while disconnected
                     try:
@@ -679,24 +725,50 @@ def serve(
             await close_shared_client()
 
     asyncio.run(_run())
-    if service.control.is_stopped:
+    if service.control.is_stopped and service.is_flat():
         # 긴급중지로 인한 종료 — 워치독(run_paper.sh --watchdog)이 되살리지 않게
         # 마커를 남긴다. 재개는 사용자가 ./run_paper.sh (마커 제거) 로만.
         from pathlib import Path
 
         Path("data").mkdir(exist_ok=True)
         Path("data/engine_stopped.marker").write_text("kill-switch")
+        # 청산 완료 후 정상 종료 — 긴급중지 '진행 중' 표시는 역할을 다했다. 남겨 두면 다음 수동
+        # `trader serve` 가 STOPPED 로 떠서 곧바로 종료하고, 대시보드 resume 도 닿을 엔진이 없다.
+        from ..risk.control_file import KILL_SWITCH_PATH
+
+        KILL_SWITCH_PATH.unlink(missing_ok=True)
         log.info("engine.stop_marker_written")
 
 
 @app.command("api")
-def serve_api(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Serve the dashboard API + WebSocket (FastAPI). Put HTTPS in front for production."""
+def serve_api(host: str | None = None, port: int = 8000) -> None:
+    """Serve the dashboard API + WebSocket (FastAPI). Put HTTPS in front for production.
+
+    기본 바인딩은 STB_API_HOST(기본 0.0.0.0 — 같은 와이파이의 폰에서 접속). 기본 자격증명이
+    남아 있으면 loopback(--host 127.0.0.1)으로만 기동된다."""
+    import os
+
     import uvicorn
 
+    from ..api.security import insecure_api_config, is_loopback_host
+
     s = _bootstrap()
-    get_logger("api").info("api.start", host=host, port=port, mode=s.mode.value)
-    uvicorn.run("short_trading_bot.api.main:app", host=host, port=port)
+    bind = host or s.api_host
+    problems = insecure_api_config(s.api_jwt_secret, s.api_password)
+    if problems and not is_loopback_host(bind):
+        typer.echo(
+            f"대시보드 API 기동 거부 ({bind}): " + "; ".join(problems) + "\n"
+            "  .env 에 STB_API_JWT_SECRET=$(openssl rand -hex 32) 와 STB_API_PASSWORD 를 설정하거나,\n"
+            "  이 컴퓨터에서만 쓸 거면 `trader api --host 127.0.0.1`."
+        )
+        raise typer.Exit(1)
+    # 앱 팩토리(api/main.py)도 같은 검사를 하므로 실제 바인딩 주소를 넘겨준다.
+    os.environ["STB_API_HOST"] = bind
+    get_settings.cache_clear()
+    get_logger("api").info("api.start", host=bind, port=port, mode=s.mode.value)
+    uvicorn.run(
+        "short_trading_bot.api.main:create_default_app", factory=True, host=bind, port=port
+    )
 
 
 @app.command()
@@ -1173,6 +1245,7 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
     10분·1회용이므로 승인 직후 바로 실행할 것.
     """
     import asyncio
+    import secrets
     import time
     import webbrowser
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1234,10 +1307,13 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
         _save_and_test(extract_auth_code(code))
         return
 
+    # OAuth state: 대기 중에 사용자가 연 다른 웹페이지가 localhost 콜백으로 가짜 code/error 를
+    # 밀어 넣어(login CSRF) 공격자 계정 토큰을 저장시키거나 승인을 중단시키지 못하게 한다.
+    oauth_state = secrets.token_urlsafe(16)
     auth_url = (
         "https://kauth.kakao.com/oauth/authorize"
         f"?client_id={key}&redirect_uri={quote(redirect_uri, safe='')}"
-        "&response_type=code&scope=talk_message"
+        f"&response_type=code&scope=talk_message&state={oauth_state}"
     )
     typer.echo("브라우저에서 카카오 로그인 후 [동의하고 계속하기]. 창이 안 열리면 직접 접속:")
     typer.echo(f"  {auth_url}")
@@ -1249,12 +1325,16 @@ def kakao_auth(port: int = 8899, wait_minutes: float = 15.0, code: str = "") -> 
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            qs = parse_qs(urlparse(self.path).query)
+            url = urlparse(self.path)
+            qs = parse_qs(url.query)
             got_code, got_error = qs.get("code", [""])[0], qs.get("error", [""])[0]
+            state_ok = url.path == "/kakao" and secrets.compare_digest(
+                qs.get("state", [""])[0].encode(), oauth_state.encode()
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            if got_code or got_error:
+            if (got_code or got_error) and state_ok:
                 captured["code"], captured["error"] = got_code, got_error
                 body = "<h3>승인 완료 — 터미널로 돌아가세요.</h3>"
             else:

@@ -18,10 +18,12 @@ from decimal import Decimal
 from typing import Any
 
 from ..domain.enums import Resolution
+from ..infra.logging import get_logger
 from .bar_builder import BarBuilder
 from .types import Bar, Tick
 
 KST = timezone(timedelta(hours=9))
+_log = get_logger("kis_ws")
 _TR_TRADE = "H0STCNT0"
 _IDX_TIME, _IDX_PRICE, _IDX_VOLUME = 1, 2, 12  # CNTG_VOL (per-trade); 13 = ACML_VOL (accumulated)
 
@@ -66,7 +68,6 @@ class KisWebSocketFeed:
         return True
 
     async def stream(self) -> AsyncIterator[Bar]:
-        base_date = self._session_date or datetime.now(KST).date()
         try:
             async with self._connect() as ws:
                 self._ws = ws
@@ -77,9 +78,19 @@ class KisWebSocketFeed:
                         if "PINGPONG" in raw:
                             await ws.send(raw)  # echo heartbeat
                         continue
+                    # 프레임마다 날짜를 다시 잡는다 — 연결이 자정을 넘기면 고정 날짜로는 다음 날
+                    # 틱이 전날 시각으로 찍혀 역순이 된다.
+                    base_date = self._session_date or datetime.now(KST).date()
                     for tick in self.parse_ticks(raw, base_date, tr_id=self._tr_id):
                         for builder in self._builders:
-                            for bar in builder.on_tick(tick):
+                            try:
+                                bars = builder.on_tick(tick)
+                            except ValueError:
+                                # 역순 틱 1개로 스트림 전체를 끊지 않는다 — 끊기면 재접속 동안
+                                # 모든 종목의 손절 관리가 멈춘다 (#18). 그 틱만 버린다.
+                                _log.warning("ws.out_of_order_tick", ticker=tick.ticker, ts=str(tick.ts))
+                                continue
+                            for bar in bars:
                                 yield bar
                 if self._flush_on_close:  # 공유 빌더는 flush 금지 (부분 봉 조기 방출 방지)
                     for builder in self._builders:
@@ -104,12 +115,13 @@ class KisWebSocketFeed:
             rec = fields[i * width : (i + 1) * width]
             if len(rec) <= _IDX_VOLUME:
                 continue
-            hhmmss = rec[_IDX_TIME]
-            ts = datetime(
-                base_date.year, base_date.month, base_date.day,
-                int(hhmmss[0:2]), int(hhmmss[2:4]), int(hhmmss[4:6]), tzinfo=KST,
-            )
-            ticks.append(Tick(rec[0], Decimal(rec[_IDX_PRICE]), Decimal(rec[_IDX_VOLUME]), ts))
+            tick = _parse_record(rec, base_date)
+            if tick is None:
+                # 깨진 레코드(시각 형식 오류, NaN·음수·0 가격 등)는 버린다. 예외로 두면
+                # 스트림이 끊기고, 그대로 받으면 가짜 가격이 전략·주문가로 흘러간다 (#18).
+                _log.warning("ws.bad_tick_record", tr_id=tr_id, record=rec[:3])
+                continue
+            ticks.append(tick)
         return ticks
 
     def _subscribe_frame(self, ticker: str) -> str:
@@ -129,3 +141,22 @@ class KisWebSocketFeed:
         import websockets
 
         return websockets.connect(self._url)
+
+
+def _parse_record(rec: list[str], base_date: Any) -> Tick | None:
+    """KIS 체결 레코드 1건 → Tick. 검증 실패면 None."""
+    hhmmss = rec[_IDX_TIME]
+    if len(hhmmss) < 6 or not hhmmss[:6].isdigit():
+        return None
+    try:
+        ts = datetime(
+            base_date.year, base_date.month, base_date.day,
+            int(hhmmss[0:2]), int(hhmmss[2:4]), int(hhmmss[4:6]), tzinfo=KST,
+        )
+        price = Decimal(rec[_IDX_PRICE])
+        volume = Decimal(rec[_IDX_VOLUME])
+    except (ValueError, ArithmeticError):
+        return None
+    if not price.is_finite() or price <= 0 or not volume.is_finite() or volume < 0:
+        return None
+    return Tick(rec[0], price, volume, ts)

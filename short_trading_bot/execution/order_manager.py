@@ -8,7 +8,7 @@ is written to the append-only ``audit_log``.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..domain.enums import OrderState, PositionState, Side
+from ..domain.enums import Market, OrderState, PositionState, Side
 from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import AuditLog, Order, Position
@@ -28,6 +28,49 @@ from .types import Fill, OrderAck, OrderRequest
 _CANCEL_NOOP_STATES = frozenset({
     OrderState.FILLED.value, OrderState.CANCELLED.value,
     OrderState.REJECTED.value, OrderState.EXPIRED.value,
+})
+
+_KST = timezone(timedelta(hours=9))
+# 브로커에 살아 있을 수 있는 주문 상태 (당일 만료 대상).
+_OPEN_STATES = (
+    OrderState.PENDING_NEW.value, OrderState.UNKNOWN.value,
+    OrderState.NEW.value, OrderState.PARTIALLY_FILLED.value,
+)
+
+
+def _kst_date(ts: datetime) -> date:
+    if ts.tzinfo is None:  # SQLite drops tzinfo on DateTime columns (UTC 로 저장됨)
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(_KST).date()
+
+
+def created_today_kst(ts: datetime, now: datetime | None = None) -> bool:
+    """주문이 오늘(KST) 생성됐나 — KIS 주문번호는 거래일 단위라 날짜로 한정해야 한다."""
+    return _kst_date(ts) == (now or datetime.now(UTC)).astimezone(_KST).date()
+
+
+# 해외(미국) DAY 주문은 KST 자정을 넘겨 살아 있다(현지 장 마감 ≈ KST 05~06시). KST 날짜로
+# 자르면 살아 있는 주문을 만료시켜 잠금이 풀리고 중복 주문이 나간다. 해외는 KIS 가 받는
+# 가장 이른 시각(현지 프리마켓)부터 장 마감까지도 24시간을 넘지 않으므로 경과시간으로 판정.
+_OVERSEAS_ORDER_LIFETIME = timedelta(hours=24)
+
+
+def order_in_session(ts: datetime, market: str | None, now: datetime | None = None) -> bool:
+    """주문이 아직 '현재 거래 세션'에 속하나 (KRX = 오늘 KST, 해외 = 24시간 이내)."""
+    now = now or datetime.now(UTC)
+    try:
+        overseas = Market(market).is_overseas if market else False
+    except ValueError:
+        overseas = False
+    if overseas:
+        aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+        return now - aware < _OVERSEAS_ORDER_LIFETIME
+    return created_today_kst(ts, now)
+
+
+# 체결 없이 끝난 것으로 확정된 상태 — 늦게 온 체결이 이 상태를 되돌리면 안 된다.
+_TERMINAL_NO_FILL_STATES = frozenset({
+    OrderState.CANCELLED.value, OrderState.REJECTED.value, OrderState.EXPIRED.value,
 })
 
 
@@ -82,7 +125,19 @@ class OrderManager:
         # 2) Network call (outside the persist transaction).
         try:
             ack = await self._broker.submit_order(req)
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "is_definitive_rejection", False):
+                # 브로커가 '접수 안 함'을 명시한 실패(4xx, 게이트웨이 한도 초과 등)는 거부로
+                # 확정한다 — UNKNOWN 으로 두면 resolver 유예시간 동안 손절까지 막힌다 (#11).
+                self._log.warning(
+                    "order.rejected_by_error", client_order_id=req.client_order_id, error=str(exc)
+                )
+                ack = OrderAck(
+                    client_order_id=req.client_order_id,
+                    accepted=False,
+                    reject_reason=f"broker_error: {exc}"[:200],
+                )
+                return await self._record_outcome(req, ack)
             # A timeout does not mean the broker rejected the order. Preserve the
             # ambiguity so callers cannot mistake a stranded PENDING_NEW row for success.
             async with session_scope(self._sf) as s:
@@ -92,6 +147,9 @@ class OrderManager:
                     s.add(self._audit("order.unknown", req.lot_id, {"client_order_id": req.client_order_id}))
             raise
 
+        return await self._record_outcome(req, ack)
+
+    async def _record_outcome(self, req: OrderRequest, ack: OrderAck) -> OrderAck:
         # 3) Record outcome. Guard against overwriting a fill that already arrived.
         async with session_scope(self._sf) as s:
             order = await self._find_order(s, req.client_order_id)
@@ -163,11 +221,29 @@ class OrderManager:
             )
 
             total_filled = await self._total_filled(s, order.order_id) + fill.qty
-            order.state = (
-                OrderState.FILLED.value
-                if total_filled >= order.qty
-                else OrderState.PARTIALLY_FILLED.value
-            )
+            if order.state == OrderState.REJECTED.value:
+                # 체결이 왔다 = 브로커가 접수했었다는 증거. resolver 가 '주문내역에 없음'으로
+                # 추정 만료시킨 주문일 수 있다 — REJECTED 로 두면 잠금이 풀린 채 잔량이 살아
+                # 중복 주문이 난다. 체결 수량 기준 열린/완료 상태로 되돌린다.
+                self._log.warning("fill.on_rejected_order", client_order_id=fill.client_order_id)
+                order.state = (
+                    OrderState.FILLED.value
+                    if total_filled >= order.qty
+                    else OrderState.PARTIALLY_FILLED.value
+                )
+            elif order.state in _TERMINAL_NO_FILL_STATES:
+                # 취소/만료/거부 확정 뒤 도착한 체결(취소 직전 체결분 등). 체결 자체는 사실이므로
+                # 체결 행과 포지션 투영에는 반영하되, 주문 상태는 되살리지 않는다 — 되살리면
+                # 이미 끝난 주문이 '열린 주문'으로 보여 (lot, side) 잠금이 다시 걸린다.
+                self._log.warning(
+                    "fill.after_terminal", client_order_id=fill.client_order_id, state=order.state
+                )
+            else:
+                order.state = (
+                    OrderState.FILLED.value
+                    if total_filled >= order.qty
+                    else OrderState.PARTIALLY_FILLED.value
+                )
 
             await self._apply_to_position(s, order, fill)
             s.add(
@@ -182,6 +258,75 @@ class OrderManager:
                     },
                 )
             )
+
+    async def stale_open_orders(
+        self, now: datetime | None = None
+    ) -> list[tuple[str, str | None, date]]:
+        """만료 대상(현재 세션 밖의 열린 **KRX** 주문): (order_id, 주문번호, 주문일 KST)."""
+        now = now or datetime.now(UTC)
+        async with session_scope(self._sf) as s:
+            rows = (
+                await s.execute(
+                    select(Order, Position.market)
+                    .outerjoin(Position, Order.lot_id == Position.lot_id)
+                    .where(Order.state.in_(_OPEN_STATES))
+                )
+            ).all()
+        return [
+            (order.order_id, order.broker_order_no, _kst_date(order.created_at))
+            for order, market in rows
+            if not order_in_session(order.created_at, market, now)
+            and not (market and market != Market.KRX.value)
+        ]
+
+    async def expire_stale(
+        self, now: datetime | None = None, *, keep: set[str] | frozenset[str] = frozenset()
+    ) -> int:
+        """전 거래일 이전에 낸 열린 주문을 EXPIRED 로 종결한다 (KRX 주문은 당일 유효).
+
+        안 하면 장 마감으로 이미 사라진 주문이 DB 에 NEW/PARTIALLY_FILLED 로 남아
+        재시작 시 (lot, side) 잠금이 복원되고, 다음 날 손절이 '걸린 주문 취소'에 실패해
+        영원히 못 나간다 (#6). 오늘 주문은 건드리지 않는다. 호출 시점에 진행 중인 제출이
+        없어야 하는 PENDING_NEW(프로세스가 브로커 호출 도중 죽은 흔적)는 오늘 것이면
+        UNKNOWN 으로 넘겨 resolver 가 브로커 주문내역으로 정체를 밝히게 한다."""
+        now = now or datetime.now(UTC)
+        expired = 0
+        async with session_scope(self._sf) as s:
+            rows = (
+                await s.execute(
+                    select(Order, Position.market)
+                    .outerjoin(Position, Order.lot_id == Position.lot_id)
+                    .where(Order.state.in_(_OPEN_STATES))
+                )
+            ).all()
+            for order, market in rows:
+                if order.order_id in keep:
+                    continue  # 그날 체결 확인 실패 — 이번엔 만료하지 않는다 (잠금 유지)
+                if not order_in_session(order.created_at, market, now):
+                    prev = order.state
+                    order.state = OrderState.EXPIRED.value
+                    s.add(self._audit("order.expired", order.lot_id, {
+                        "client_order_id": order.client_order_id, "prev_state": prev,
+                    }))
+                    expired += 1
+        if expired:
+            self._log.info("order.expired_stale", count=expired)
+        return expired
+
+    async def orphan_pending_to_unknown(self) -> int:
+        """재시작 시점의 오늘자 PENDING_NEW = 브로커 호출 결과를 모른 채 죽은 주문 → UNKNOWN."""
+        count = 0
+        async with session_scope(self._sf) as s:
+            rows = (
+                await s.execute(select(Order).where(Order.state == OrderState.PENDING_NEW.value))
+            ).scalars().all()
+            for order in rows:
+                order.state = OrderState.UNKNOWN.value
+                s.add(self._audit("order.unknown", order.lot_id, {
+                    "client_order_id": order.client_order_id, "reason": "pending_new_at_restart",
+                }))
+                count += 1
+        return count
 
     # -- internals -------------------------------------------------------
 
@@ -215,8 +360,12 @@ class OrderManager:
             pos.qty_filled = new_qty
             # Only the WATCHING->HOLDING edge belongs here; richer states (SCALING,
             # EXITING) are owned by the domain lot — stomping them to HOLDING would
-            # corrupt what hydrate() restores after a restart.
-            if pos.state == PositionState.WATCHING.value:
+            # corrupt what hydrate() restores after a restart. CLOSED + 매수 체결 = 청산 뒤
+            # 도착한 매수 잔량: 다시 열어야 hydrate() 가 복원하고 손절이 관리한다.
+            if pos.state in (PositionState.WATCHING.value, PositionState.CLOSED.value):
+                if pos.state == PositionState.CLOSED.value:
+                    self._log.warning("fill.reopen_closed_position", lot_id=order.lot_id)
+                    pos.closed_at = None
                 pos.state = PositionState.HOLDING.value
         else:  # SELL closes part/all of the long -> realize P&L on the held portion only
             realized_qty = min(fill.qty, pos.qty_filled) if pos.qty_filled > 0 else Decimal(0)

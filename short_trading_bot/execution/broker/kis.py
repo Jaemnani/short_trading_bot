@@ -11,8 +11,9 @@ SLL_TYPE. ⚠️ Response field names still follow common KIS shapes — confirm
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +21,7 @@ from ...domain.enums import Currency, Market, Mode, Side
 from ...infra.config import KisEnvCreds
 from ...infra.http import shared_client
 from ...infra.kis_auth import KisAuth
+from ...infra.logging import get_logger
 from ...infra.rate_limit import shared_limiter
 from ..fees import KRX_FEES, FeeModel
 from ..types import (
@@ -36,6 +38,10 @@ from .market_router import MarketRouter
 Transport = Callable[[str, str, dict[str, str], dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+# 요청을 처리하기 전에 거부했음이 확실한 4xx (타임아웃·충돌·재시도류 제외).
+_DEFINITIVE_4XX = frozenset({400, 401, 403, 404, 405, 415, 422})
+
+
 class KisApiError(RuntimeError):
     """KIS REST 실패 — 상태코드와 본문(msg_cd/msg1)을 보존한다.
 
@@ -48,12 +54,40 @@ class KisApiError(RuntimeError):
         path = url.split("/uapi")[-1].split("?")[0]
         super().__init__(f"KIS HTTP {status} {path}: {body}")
 
+    @property
+    def msg_cd(self) -> str:
+        try:
+            data = json.loads(self.body)
+        except ValueError:
+            return ""
+        return str(data.get("msg_cd", "")) if isinstance(data, dict) else ""
+
+    @property
+    def is_definitive_rejection(self) -> bool:
+        """주문이 **접수되지 않았음이 확실한** 실패인가 (OrderManager 가 REJECTED 로 처리).
+
+        - 요청 자체를 처리 전에 거부하는 4xx (400/401/403/404/405/415/422). 408(타임아웃)·
+          409·425·429 등 중간 장비가 낼 수 있거나 처리 여부가 모호한 4xx 는 제외한다 —
+          주문이 이미 브로커에 닿았을 수 있어 거부로 확정하면 중복 주문이 난다.
+        - 게이트웨이 코드(EGW*, 예: EGW00201 초당 한도 초과): 주문 엔진에 닿기 전에
+          게이트웨이가 돌려보냄.
+        그 밖(본문 없는 5xx·프록시 오류 등)은 접수 여부가 불명확 → UNKNOWN 유지.
+        UNKNOWN 은 resolver 가 밝힐 때까지 취소·재주문이 막히므로(손절 포함), 확실한
+        거부를 UNKNOWN 으로 두면 손절이 최소 유예시간만큼 멈춘다 (#11)."""
+        if self.status in _DEFINITIVE_4XX:
+            return True
+        return self.msg_cd.startswith("EGW")
+
 
 _ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 _CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 _BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 _CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 _CCLD_TR_LIVE = "TTTC0081R"  # 일별주문체결조회 — ⚠️ verify on portal
+_CCLD_MAX_PAGES = 20  # 연속조회 상한 (100행/페이지 가정 시 2,000건 — 하루 주문 수를 충분히 넘는다)
+_KST = timezone(timedelta(hours=9))
+_TR_CONT_KEY = "__tr_cont__"
+_log = get_logger("kis")
 
 
 class KisBrokerAdapter(BrokerAdapter):
@@ -151,6 +185,10 @@ class KisBrokerAdapter(BrokerAdapter):
         resp = await self._daily_ccld("01")  # 01 = 체결만
         return self._parse_executions(resp)
 
+    async def get_executions_on(self, day: date) -> list[Execution]:
+        resp = await self._daily_ccld("01", day=day)
+        return self._parse_executions(resp)
+
     async def get_daily_orders(self) -> list[OrderRecord]:
         resp = await self._daily_ccld("00")  # 00 = 전체 (체결 + 미체결)
         out: list[OrderRecord] = []
@@ -169,11 +207,41 @@ class KisBrokerAdapter(BrokerAdapter):
             )
         return out
 
-    async def _daily_ccld(self, ccld_dvsn: str) -> dict[str, Any]:
+    async def _daily_ccld(self, ccld_dvsn: str, *, day: date | None = None) -> dict[str, Any]:
+        """당일 주문/체결 전체 — 연속조회로 모든 페이지를 합쳐 ``output1`` 로 돌려준다.
+
+        첫 페이지만 읽으면 한 페이지를 넘는 날 오래된 주문이 사라진다: 그 체결은 반영되지
+        않고, resolver 는 '브로커에 없음'으로 보고 실제 접수된 UNKNOWN 주문을 만료시켜
+        재주문 → 이중 주문이 된다 (#16). 조회일은 KST — UTC 로 계산하면 KST 00~09시에는
+        전날을 조회한다."""
         tr_id = ("V" + _CCLD_TR_LIVE[1:]) if self._mode is Mode.PAPER else _CCLD_TR_LIVE
-        headers = await self._headers(tr_id)
-        today = datetime.now(UTC).strftime("%Y%m%d")
-        params = {
+        today = (day or datetime.now(_KST).date()).strftime("%Y%m%d")
+        rows: list[Any] = []
+        fk = nk = ""
+        cont = ""
+        seen_cursors: set[tuple[str, str]] = set()
+        for _page in range(_CCLD_MAX_PAGES):
+            headers = await self._headers(tr_id)
+            if cont:
+                headers["tr_cont"] = "N"  # 연속조회 요청
+            resp = await self._transport(
+                "GET", f"{self._base}{_CCLD_PATH}", headers, self._ccld_params(today, ccld_dvsn, fk, nk)
+            )
+            rows.extend(resp.get("output1") or [])
+            # 응답 헤더 tr_cont: M/F = 다음 페이지 있음, D/E = 마지막. 전송 계층이 헤더를
+            # 싣지 않으면(테스트 fake 등) 단일 페이지로 취급한다.
+            cont = str(resp.get(_TR_CONT_KEY, "")).strip()
+            fk = str(resp.get("ctx_area_fk100", "")).strip()
+            nk = str(resp.get("ctx_area_nk100", "")).strip()
+            if cont not in ("M", "F") or (fk, nk) in seen_cursors:
+                break
+            seen_cursors.add((fk, nk))
+        else:
+            _log.warning("kis.ccld_page_cap", pages=_CCLD_MAX_PAGES)
+        return {"output1": rows}
+
+    def _ccld_params(self, today: str, ccld_dvsn: str, fk: str, nk: str) -> dict[str, Any]:
+        return {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._creds.account_product_code,
             "INQR_STRT_DT": today,
@@ -186,10 +254,9 @@ class KisBrokerAdapter(BrokerAdapter):
             "ODNO": "",
             "INQR_DVSN_3": "00",
             "INQR_DVSN_1": "",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
+            "CTX_AREA_FK100": fk,
+            "CTX_AREA_NK100": nk,
         }
-        return await self._transport("GET", f"{self._base}{_CCLD_PATH}", headers, params)
 
     def _parse_executions(self, resp: dict[str, Any]) -> list[Execution]:
         out: list[Execution] = []
@@ -269,8 +336,15 @@ class KisBrokerAdapter(BrokerAdapter):
         cash: dict[Currency, Decimal] = {}
         output2 = resp.get("output2") or []
         summary = output2[0] if isinstance(output2, list) and output2 else output2
-        if isinstance(summary, dict) and "dnca_tot_amt" in summary:
-            cash[Currency.KRW] = Decimal(str(summary["dnca_tot_amt"]))
+        if isinstance(summary, dict):
+            # 평가금 = 현금 + 보유 평가액. D+0 예수금(dnca_tot_amt)은 T+2 결제 전 당일 매수
+            # 대금이 아직 빠지지 않아 보유 평가액과 이중계상된다 → 과대 사이징 (#17).
+            # 가수도정산금액(prvs_rcdl_excc_amt = D+2 예수금)이 결제 반영 현금이다.
+            for key in ("prvs_rcdl_excc_amt", "dnca_tot_amt"):
+                raw = str(summary.get(key, "") or "").strip()
+                if raw:
+                    cash[Currency.KRW] = Decimal(raw)
+                    break
         return AccountBalance(cash=cash, positions=positions)
 
     async def _headers(self, tr_id: str) -> dict[str, str]:
@@ -303,4 +377,7 @@ class KisBrokerAdapter(BrokerAdapter):
             # 2026-08-10 장중 체결조회 356회 실패의 사유를 끝내 못 밝힌 이유.
             raise KisApiError(resp.status_code, url, resp.text[:300])
         data: dict[str, Any] = resp.json()
+        tr_cont = resp.headers.get("tr_cont")
+        if tr_cont is not None:
+            data[_TR_CONT_KEY] = tr_cont  # 연속조회 판단용 (응답 헤더 → 본문으로 전달)
         return data

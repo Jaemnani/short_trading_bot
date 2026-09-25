@@ -45,6 +45,12 @@ class DiscordNotifier(Notifier):
         return "\n".join(lines)[:_MAX_CONTENT]
 
     async def _default_transport(self, url: str, payload: dict[str, Any]) -> None:
+        # 웹후크 URL 자체가 자격증명(<id>/<token>)이다. httpx 예외 메시지(raise_for_status 등)는
+        # URL 전체를 담아 로그에 남기므로, URL 없는 메시지로 바꿔 올린다 (#12).
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
+            try:
+                resp = await client.post(url, json=payload)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"discord request failed: {type(exc).__name__}") from None
+        if resp.status_code >= 400:
+            raise RuntimeError(f"discord HTTP {resp.status_code}")

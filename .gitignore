@@ -43,3 +43,6 @@ frontend/.vite/
 .DS_Store
 .idea/
 .vscode/
+
+# 백업 파일 — 운영 설정 백업이 실수로 커밋되지 않게 (기존 추적 파일은 유지)
+*.bak

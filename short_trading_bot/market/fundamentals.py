@@ -25,8 +25,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from ..infra.logging import get_logger
 
 # (url, params) -> 응답 바이트
@@ -171,7 +169,6 @@ class DartFundamentals:
 
     @staticmethod
     async def _default_transport(url: str, params: dict[str, str]) -> bytes:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            return resp.content
+        from ..news.risk import dart_http_get
+
+        return await dart_http_get(url, params)  # 키가 담긴 URL 을 예외에 싣지 않는 공용 경로

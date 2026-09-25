@@ -14,6 +14,8 @@ Pair with the Reconciler (broker 잔고 = source of truth) as a second safety ne
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -23,9 +25,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..infra.logging import get_logger
 from ..persistence.db import session_scope
 from ..persistence.models import Fill as FillRow
-from ..persistence.models import Order
+from ..persistence.models import Order, Position
 from .broker.base import BrokerAdapter
-from .types import Fill, FillHandler
+from .order_manager import order_in_session
+from .types import Execution, Fill, FillHandler
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _kst_day(ts: datetime) -> date:
+    return _aware(ts).astimezone(_KST).date()
+
+
+def _day_close(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, 15, 30, tzinfo=_KST)
 
 
 class FillPoller:
@@ -41,15 +59,28 @@ class FillPoller:
         self._sf = session_factory
         self._handler = fill_handler
         self._seen: set[str] = set()
+        # 델타 회계(ex.qty - DB 누적)는 읽기→쓰기 사이에 다른 폴링이 끼면 같은 체결을 두 번
+        # 반영한다. 동시 호출(백그라운드 루프·재접속 복구·주문 교체)을 직렬화한다.
+        self._lock = asyncio.Lock()
         self._log = logger or get_logger("fill_poller")
 
     async def poll_once(self) -> int:
         """Apply any new execution deltas; returns how many fills were delivered."""
+        async with self._lock:
+            return await self._poll_locked(await self._broker.get_executions())
+
+    async def poll_day(self, day: date) -> int:
+        """지난 거래일(KST) 하루의 체결내역을 반영한다 — 엔진이 꺼진 채 날짜를 넘긴 뒤,
+        그날 주문을 만료시키기 전의 복구용. 주문 매칭은 그날 생성된 주문으로 한정한다."""
+        async with self._lock:
+            return await self._poll_locked(await self._broker.get_executions_on(day), day=day)
+
+    async def _poll_locked(self, executions: list[Execution], *, day: date | None = None) -> int:
         applied = 0
-        for ex in await self._broker.get_executions():
+        for ex in executions:
             if ex.exec_id in self._seen:
                 continue
-            resolved = await self._resolve(ex.broker_order_no)
+            resolved = await self._resolve(ex.broker_order_no, day=day)
             if resolved is None:
                 # Ack may not be persisted yet — retry on the next poll (don't mark seen).
                 self._log.warning("fill_poll.unresolved", broker_order_no=ex.broker_order_no)
@@ -79,7 +110,9 @@ class FillPoller:
                     fee=max(Decimal(0), ex.fee - already_fee),
                     tax=max(Decimal(0), ex.tax - already_tax),
                     currency=ex.currency,
-                    ts=ex.ts,
+                    # 지난 날 체결은 그날 장 마감 시각으로 — 오늘 시각으로 찍히면 당일 실현손익
+                    # (일일 손실 한도) 복원에 전일 체결이 섞인다.
+                    ts=ex.ts or (_day_close(day) if day is not None else None),
                     source="poll",
                 )
             )
@@ -88,17 +121,36 @@ class FillPoller:
         return applied
 
     async def _resolve(
-        self, broker_order_no: str
+        self, broker_order_no: str, *, day: date | None = None
     ) -> tuple[str, Decimal, Decimal, Decimal, Decimal] | None:
         """Map an order to already applied cumulative execution totals."""
         async with session_scope(self._sf) as session:
-            order = (
-                await session.execute(
-                    select(Order).where(Order.broker_order_no == broker_order_no)
+            # KIS 주문번호는 거래일 단위 — 과거 날짜 주문과 번호가 겹칠 수 있다. 체결내역은
+            # 오늘자만 조회하므로 오늘 생성된 주문으로 한정한다 (전 기간 scalar_one_or_none 은
+            # 번호가 겹치는 날 MultipleResultsFound 로 폴링 전체를 멈추거나 과거 랏에 붙인다 #15).
+            # 해외 주문은 KST 자정을 넘겨 살아 있으므로 시장별 세션으로 판정 (order_in_session).
+            candidates = [
+                o
+                for o, market in (
+                    await session.execute(
+                        select(Order, Position.market)
+                        .outerjoin(Position, Order.lot_id == Position.lot_id)
+                        .where(Order.broker_order_no == broker_order_no)
+                    )
+                ).all()
+                if (
+                    order_in_session(o.created_at, market)
+                    if day is None
+                    else _kst_day(o.created_at) == day
                 )
-            ).scalar_one_or_none()
-            if order is None:
+            ]
+            if not candidates:
                 return None
+            if len(candidates) > 1:
+                self._log.warning(
+                    "fill_poll.duplicate_order_no", broker_order_no=broker_order_no, n=len(candidates)
+                )
+            order = max(candidates, key=lambda o: _aware(o.created_at))
             rows = (
                 await session.execute(
                     select(FillRow.qty, FillRow.price, FillRow.fee, FillRow.tax).where(

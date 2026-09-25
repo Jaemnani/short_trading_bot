@@ -87,6 +87,29 @@ class PositionLot:
         """Leave ERROR after a reconcile/repair."""
         self.transition_to(to)
 
+    def reopen_orphan(self) -> None:
+        """CLOSED 이후 도착한 매수 체결(청산 전에 걸려 있던 매수 잔량)로 다시 보유가 생겼다.
+
+        터미널 상태는 원래 되돌리지 않지만, 되돌리지 않으면 그 주식은 손절·트레일링 어느
+        쪽에서도 관리되지 않는 '고아'가 된다. HOLDING 으로 복귀시켜 관리 대상에 넣는다 —
+        상태표를 우회하는 유일한 경로이며 호출자(서비스)가 알림을 남긴다."""
+        if self.state is PositionState.CLOSED and self.qty > 0:
+            self.state = PositionState.HOLDING
+
+    @property
+    def pending_stop(self) -> Decimal | None:
+        """진입 주문의 손절가 (체결 시 initial_stop 이 된다) — 재시작 복원을 위해 영속된다."""
+        return self._pending_stop
+
+    @property
+    def pending_original_qty(self) -> Decimal | None:
+        return self._pending_original_qty
+
+    def restore_pending_entry(self, stop: Decimal | None, original_qty: Decimal | None) -> None:
+        """재시작 복원: 체결 전(WATCHING) 랏의 진입 손절가·의도 수량을 되살린다."""
+        self._pending_stop = stop
+        self._pending_original_qty = original_qty
+
     @property
     def is_open(self) -> bool:
         return self.state in (PositionState.HOLDING, PositionState.SCALING, PositionState.EXITING)
@@ -174,7 +197,9 @@ class PositionLot:
             if new_qty > 0:
                 self.avg_entry = (self.avg_entry * self.qty + price * qty) / new_qty
             self.qty = new_qty
-            if self.state is PositionState.WATCHING:
+            if self.state is PositionState.CLOSED:
+                self.reopen_orphan()
+            elif self.state is PositionState.WATCHING:
                 self.transition_to(PositionState.HOLDING)
                 if self.peak_price <= 0:
                     self.peak_price = price
