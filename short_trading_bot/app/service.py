@@ -139,6 +139,9 @@ class TradingService:
         self._refresh_before_sell: set[str] = set()
         # 매수 취소는 됐지만 취소 직전 체결분 반영(폴링)이 아직 확인 안 된 랏. 비어 있어야 flat.
         self._unconfirmed_buy_cancels: set[str] = set()
+        # 재시작 직후 체결 반영 전. 위 두 표시는 메모리 전용이라 '취소는 됐는데 반영 전' 상태로
+        # 죽으면 사라진다 — 그래서 재시작 후 첫 폴링이 성공할 때까지 같은 장벽을 전역으로 친다.
+        self._startup_refresh_pending = False
         self._prev: dict[str, IndicatorSnapshot] = {}
         self._last_price: dict[str, Decimal] = {}
         # "살아는 있는데 일을 하나" 판정용 (시세 무소식·폴링 실패). 대시보드/알림 공용.
@@ -214,6 +217,11 @@ class TradingService:
             params = PositionParams(**row.params_json)
             key = self.lot_key(row.ticker, params.resolution)
             if key in self._lots:
+                # 같은 슬롯에 열린 행이 둘(재오픈된 옛 랏 + 새 랏)일 수 있다. 슬롯엔 하나만 들어가도
+                # 보유는 전부 추적돼야 긴급중지가 둘 다 청산한다 — id 인덱스에는 반드시 넣는다.
+                if row.lot_id not in self._lots_by_id and self._lots[key].lot_id != row.lot_id:
+                    self._lots_by_id[row.lot_id] = self._lot_from_row(row)
+                    self._log.warning("hydrate.slot_collision", lot_id=row.lot_id, key=key)
                 continue
             lot = self._lot_from_row(row)
             self._lots[key] = lot
@@ -250,6 +258,10 @@ class TradingService:
                 self._co_map[order.client_order_id] = await self._meta_from_order(
                     session, order, owner
                 )
+        # 다운타임 동안의 체결(취소 직전 체결분 포함)을 먼저 반영한다. 실패하면 장벽이 남아
+        # 매도 재제출·flat 판정이 반영 성공까지 보류된다.
+        self._startup_refresh_pending = True
+        await self._refresh_fills()
         return restored
 
     @staticmethod
@@ -482,6 +494,7 @@ class TradingService:
             not any(lot.qty > 0 for lot in self._tracked_lots())
             and not self._pending
             and not self._unconfirmed_buy_cancels
+            and not self._startup_refresh_pending
         )
 
     async def expire_stale_orders(self) -> int:
@@ -663,6 +676,10 @@ class TradingService:
             return
         if intent.kind is IntentKind.EXIT:
             await self._cancel_open_buy(lot, reason="exit_cancels_entry")
+            # 취소 뒤 체결 반영으로 보유가 늘었을 수 있다 — 전량 청산은 반영 후 수량으로.
+            qty = lot.qty
+            if qty <= 0:
+                return
         submitted = await self._submit(
             lot, intent.side, qty, order_px, is_add=intent.kind is IntentKind.ADD,
             reason=intent.reason,
@@ -698,7 +715,7 @@ class TradingService:
         if qty <= 0:
             return False
         pending_key = (lot.lot_id, side)
-        if side is Side.SELL and lot.lot_id in self._refresh_before_sell:
+        if side is Side.SELL and (lot.lot_id in self._refresh_before_sell or self._startup_refresh_pending):
             # 직전 교체 매도에서 취소는 됐지만 체결 반영(폴링)이 실패했다 — 취소된 주문의 미반영
             # 체결분이 있을 수 있으니, 반영에 성공하기 전엔 다시 내지 않는다 (과매도·거부 방지).
             if not await self._refresh_fills(lot):
@@ -775,6 +792,7 @@ class TradingService:
             return False
         self._refresh_before_sell.clear()
         self._unconfirmed_buy_cancels.clear()
+        self._startup_refresh_pending = False
         return True
 
     async def _cancel_pending(
@@ -853,8 +871,8 @@ class TradingService:
         # is_flat() 이 영원히 거짓이라 청산 완료를 판정하지 못한다.
         for key in list(self._pending):
             await self._release_if_terminal(key)
-        if self._unconfirmed_buy_cancels:
-            await self._refresh_fills()  # 직전 패스의 매수 취소 뒤 체결 반영 재시도
+        if self._unconfirmed_buy_cancels or self._startup_refresh_pending:
+            await self._refresh_fills()  # 매수 취소 뒤·재시작 뒤 체결 반영 (재시도 포함)
         # 슬롯 밖 랏(재시작 전 CLOSED 됐는데 매수가 살아 있는 랏, 슬롯이 점유돼 편입 못 한
         # 재오픈 랏)까지 전부 — 매수 취소와 보유 청산 모두의 대상이다.
         for lot in self._tracked_lots():

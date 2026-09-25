@@ -405,3 +405,73 @@ async def test_orphan_lot_in_occupied_slot_is_liquidated_by_kill_switch(sf) -> N
     await svc._flat_all()
     sold = {(r.lot_id, r.qty) for r in broker.submitted if r.side is Side.SELL}
     assert (old.lot_id, Decimal(6)) in sold and (new.lot_id, Decimal(2)) in sold
+
+
+async def test_exit_quantity_recomputed_after_buy_cancel_refresh(sf) -> None:
+    """EXIT: 매수 취소 뒤 반영된 미확인 체결분까지 포함한 전량을 매도한다."""
+    from short_trading_bot.domain.enums import Resolution
+    from short_trading_bot.domain.signal import Intent, IntentKind
+    from short_trading_bot.execution.types import Execution
+    from short_trading_bot.market.types import Bar
+
+    broker = _ExecBroker()
+    svc, _, _ = _svc(sf, broker)
+    lot = await svc._spawn("005930", _TMPL)
+    await svc._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    await svc._on_fill(Fill(svc._pending[(lot.lot_id, Side.BUY)], Decimal(4), Decimal(9000)))
+    broker.executions = [Execution(  # 브로커 누적 7주 — 3주는 아직 미반영
+        exec_id="B1:7", broker_order_no="B1", ticker="005930", side=Side.BUY,
+        qty=Decimal(7), price=Decimal(9000),
+    )]
+    bar = Bar(
+        "005930", Resolution.D1, datetime(2026, 9, 25, tzinfo=UTC),
+        Decimal(9000), Decimal(9000), Decimal(9000), Decimal(9000), Decimal(1), Decimal(9000),
+    )
+    intent = Intent(kind=IntentKind.EXIT, side=Side.SELL, reason="hard_stop")
+    await svc._handle_intent(intent, lot, bar, svc._risk_snapshot(Decimal(10**8)))
+    assert lot.qty == Decimal(7)
+    assert broker.submitted[-1].side is Side.SELL and broker.submitted[-1].qty == Decimal(7)
+
+
+async def test_restart_blocks_flat_and_sells_until_first_fill_refresh(sf) -> None:
+    """취소 성공 뒤 반영 전에 죽으면 메모리 장벽이 사라진다 → 재시작 후 첫 폴링 성공 전엔
+    flat 도, 매도 재제출도 없다."""
+    s1, _, _ = _svc(sf)
+    lot = await s1._spawn("005930", _TMPL)
+    await s1._submit(lot, Side.BUY, Decimal(10), Decimal(9000), is_add=False, reason="enter")
+    await s1._on_fill(Fill(s1._pending[(lot.lot_id, Side.BUY)], Decimal(10), Decimal(9000)))
+
+    broker = _ExecBroker()
+    broker.fail = True
+    s2, _, _ = _svc(sf, broker)
+    await s2.hydrate()
+    held = s2.lot("005930")
+    assert held is not None and not s2.is_flat()
+    n = len(broker.submitted)
+    assert not await s2._submit(held, Side.SELL, held.qty, Decimal(9000), is_add=False, reason="kill_switch")
+    assert len(broker.submitted) == n
+
+    broker.fail = False
+    assert await s2._submit(held, Side.SELL, held.qty, Decimal(9000), is_add=False, reason="kill_switch")
+    assert s2._startup_refresh_pending is False
+
+
+async def test_hydrate_indexes_both_open_rows_sharing_a_slot(sf) -> None:
+    """같은 종목·해상도의 열린 행이 둘이면 슬롯엔 하나, 추적(청산)은 둘 다."""
+    s1, _, _ = _svc(sf)
+    old = await s1._spawn("035420", _TMPL)
+    await s1._submit(old, Side.BUY, Decimal(3), Decimal(9000), is_add=False, reason="enter")
+    await s1._on_fill(Fill(s1._pending[(old.lot_id, Side.BUY)], Decimal(3), Decimal(9000)))
+    new = await s1._spawn("035420", _TMPL)
+    await s1._submit(new, Side.BUY, Decimal(2), Decimal(9000), is_add=False, reason="enter")
+    await s1._on_fill(Fill(s1._pending[(new.lot_id, Side.BUY)], Decimal(2), Decimal(9000)))
+
+    s2, broker2, _ = _svc(sf)
+    await s2.hydrate()
+    tracked = {lot.lot_id: lot.qty for lot in s2._tracked_lots()}
+    assert tracked == {old.lot_id: Decimal(3), new.lot_id: Decimal(2)}
+    s2._last_price["035420"] = Decimal(9000)
+    await s2._flat_all()
+    assert {(r.lot_id, r.qty) for r in broker2.submitted if r.side is Side.SELL} == {
+        (old.lot_id, Decimal(3)), (new.lot_id, Decimal(2)),
+    }
