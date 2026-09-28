@@ -1026,3 +1026,16 @@ def test_prefix_truncated_mandatory_history_is_rejected(
     assert mx.late_start_codes(["KS11", *EVAL]) == [EVAL[1]]
     with pytest.raises(SystemExit, match=EVAL[1]):
         mx.universe_tickers("A")
+
+
+# -- Codex 28차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_restored_delisted_baseline_is_stored_before_fetch_starts() -> None:
+    # delisted_available 이 없는 이전 형식의 완료 캐시
+    u: dict[str, Any] = {"fetch_complete": True, "delisted": ["111110", "222220"],
+                         "unavailable": ["222220"]}
+    assert mx.available_baseline(u) == {"111110"}
+    assert u["delisted_available"] == ["111110"]  # 진행 중 표시와 함께 영속화될 값
+    u["fetch_complete"] = False  # 이번 실행이 중단됨
+    assert mx.available_baseline(u) == {"111110"}  # 재시도에서도 기준 유지

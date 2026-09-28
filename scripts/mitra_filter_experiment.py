@@ -266,11 +266,14 @@ def available_baseline(universe: dict[str, Any]) -> set[str]:
 
     미완료 실행이 바꾼 ``unavailable`` 로 다시 계산하지 않는다 — 실패한 재시도가 기준을 깎아
     두 번째 실패 때 B 가 조용히 줄어드는 것을 막는다. 기준이 없던 이전 형식은 완료 상태일
-    때만 ``delisted - unavailable`` 로 복원한다."""
+    때만 ``delisted - unavailable`` 로 복원하고 **universe 에 바로 기록**한다 — 호출자가 진행 중
+    표시와 함께 영속화하므로, 이번 실행이 중간에 끊겨도 복원한 기준이 사라지지 않는다."""
     if "delisted_available" in universe:
         return set(universe["delisted_available"])
     if universe.get("fetch_complete") is True and "unavailable" in universe:
-        return set(universe.get("delisted", [])) - set(universe["unavailable"])
+        restored = set(universe.get("delisted", [])) - set(universe["unavailable"])
+        universe["delisted_available"] = sorted(restored)
+        return restored
     return set()
 
 
@@ -372,7 +375,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
     # 이전에 완료된 상폐 조회에서 정상 수신된 종목 — 이번에 실패하면 B 축소 대신 미완료 처리
-    prior_available = available_baseline(universe)
+    prior_available = available_baseline(universe)  # 이전 형식이면 복원 기준을 universe 에 기록
     if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
         # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
         print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
