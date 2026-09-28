@@ -185,6 +185,14 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
     return Series(ticker, days, arr[0], arr[1], arr[2], arr[3], arr[4])
 
 
+def check_fetch_resume(universe: dict[str, Any], refresh: bool) -> None:
+    """중단된 ``--refresh`` 는 ``--refresh`` 로만 이어갈 수 있다 — 일반 fetch 는 기존 파일을
+    건너뛰므로 옛·새 일봉이 섞인 상태를 '완료'로 승인하게 된다."""
+    if universe.get("fetch_complete") is False and universe.get("fetch_mode") == "refresh" \
+            and not refresh:
+        raise SystemExit("이전 `fetch --refresh` 가 중단됨 — 같은 `--refresh` 로 다시 실행")
+
+
 def cmd_fetch(args: argparse.Namespace) -> None:
     import FinanceDataReader as fdr
 
@@ -192,6 +200,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe: dict[str, Any] = (
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
+    check_fetch_resume(universe, args.refresh)
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         if "Marcap" in listing.columns:
@@ -230,6 +239,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         targets += universe.get("delisted", [])
     # 진행 중 표시: 중단되면(예: --refresh 도중) 옛·새 일봉이 섞인 캐시를 후속 명령이 거부한다.
     universe["fetch_complete"] = False
+    universe["fetch_mode"] = "refresh" if args.refresh else "normal"
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
@@ -1219,20 +1229,27 @@ def _stats_row(r: RunStats) -> str:
             f"{roll(r12)} | {roll(r6)} | {bear} |")
 
 
-def g0_section(lines: list[str], template: dict[str, Any], hf_model: str) -> bool:
+def g0_section(
+    lines: list[str], template: dict[str, Any], hf_model: str, missing: list[str]
+) -> bool:
+    """G0 채점. 전제 자료(완전한 예측)가 없으면 ``missing`` 에 적고 판정 불가로 둔다."""
     n = CENTER[0]
     ok = True
     for universe in ("A", "B"):
         mitra, why_m = load_complete_preds("mitra", universe, n, template, hf_model)
         logit, why_l = load_complete_preds("logit", universe, n, template, hf_model)
         if mitra is None:
-            lines.append(f"- 유니버스 {universe}: {why_m} → **G0 판정 불가(미충족)**")
+            lines.append(f"- 유니버스 {universe}: {why_m} → **G0 판정 불가**")
+            missing.append(why_m)
             ok = False
             continue
+        if universe == "A" and logit is None:  # Mitra > 로지스틱 비교의 전제
+            missing.append(why_l)
         if logit is not None and {(p.ticker, p.day) for p in logit} != {
             (p.ticker, p.day) for p in mitra
         }:
             lines.append(f"- 유니버스 {universe}: Mitra/로지스틱 표본 불일치 → **G0 판정 불가**")
+            missing.append(f"유니버스 {universe} Mitra/로지스틱 표본 불일치")
             ok = False
             continue
         if universe == "B":
@@ -1267,23 +1284,64 @@ def g0_section(lines: list[str], template: dict[str, Any], hf_model: str) -> boo
     return ok
 
 
+def final_verdict(missing: Sequence[str], g0: bool, g1_center: bool, g2: bool, g3: bool) -> str:
+    """전제 자료가 하나라도 없으면 '판정 불가' — 미비를 가설 실패(기각)로 기록하지 않는다."""
+    if missing:
+        return "판정 불가"
+    return "채택" if g0 and g1_center and g2 and g3 else "기각"
+
+
+def _write_report(lines: list[str]) -> None:
+    report = "\n".join(lines) + "\n"
+    ROOT.mkdir(parents=True, exist_ok=True)
+    (ROOT / "report.md").write_text(report, encoding="utf-8")
+    print(report)
+
+
+def _verdict_lines(verdict: str, missing: Sequence[str], detail: str) -> list[str]:
+    out = ["", "## 판정", "", f"**{verdict}** — {detail}"]
+    if verdict == "판정 불가":
+        out += ["", "미비 자료:", *(f"- {m}" for m in dict.fromkeys(missing)), "",
+                "> 판정 불가 — BACKLOG.md·STRATEGIES.md 에 채택/기각으로 기록하지 말 것. "
+                "미비 자료를 채운 뒤 evaluate 재실행."]
+    else:
+        out += ["", "> 판정은 BACKLOG.md·STRATEGIES.md 에 옮겨 적는다 (사전등록 H-M1 기준)."]
+    return out
+
+
 def cmd_evaluate(args: argparse.Namespace) -> None:
     template, source = load_template(_watchlist_arg(args.watchlist))
     lines = [
         f"# H-M1 실험 결과 ({date.today().isoformat()})", "",
         f"- 템플릿: {source} — `{json.dumps(template, ensure_ascii=False)}`",
         f"- 평가: {', '.join(EVAL_TICKERS)} · {EVAL_START} ~ 데이터 끝 · 시작자본 {STARTING_EQUITY:,}",
-        "", "## G0 판별력", "",
     ]
-    g0 = g0_section(lines, template, args.hf_model)
+    missing: list[str] = []
+    try:  # 평가 일봉·유니버스 A 선검증 — 없으면 백테스트 없이 판정 불가 보고서만
+        universe_tickers("A")
+    except (SystemExit, FileNotFoundError) as e:
+        missing.append(f"유니버스 A/평가 일봉 미비 ({e})")
+        _write_report(lines + _verdict_lines("판정 불가", missing, "평가 전제 자료 없음"))
+        return
+
+    lines += ["", "## G0 판별력", ""]
+    g0 = g0_section(lines, template, args.hf_model, missing)
 
     tape = tape_for(EVAL_TICKERS, EVAL_START - timedelta(days=450))  # 지표 창(300봉) 포화
     base = run_arm("현행", template, tape, {})
+    for m in (12, 6):
+        if m not in base.roll:
+            missing.append(f"롤링 {m}개월 구간을 만들 데이터 부족")
+    for name, v in base.bear.items():
+        if not math.isfinite(v):
+            missing.append(f"하락장 {name} 구간 데이터 부족")
     arms: dict[tuple[int, float], RunStats] = {}
     passes: dict[tuple[int, float], bool] = {}
     reasons: dict[tuple[int, float], list[str]] = {}
     for n in HORIZONS:
         preds, why = load_complete_preds("mitra", "A", n, template, args.hf_model)
+        if preds is None:
+            missing.append(why)
         for d in DELTAS:
             if preds is None:
                 passes[(n, d)] = False
@@ -1311,7 +1369,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     center_run = load_marker("mitra", "A", CENTER[0], template, args.hf_model)
     run = center_run.get("run") if isinstance(center_run, dict) else None
     lat_ok = lat is not None and latency_matches(lat, args.hf_model, run)
-    if lat is not None and not lat_ok:
+    if lat is None:
+        missing.append("latency 측정 없음 (`latency` 실행)")
+    elif not lat_ok:
+        missing.append("latency 측정이 현재 구성·예측 실행 경로와 다름 (같은 장치·경로로 재측정)")
         lat = {**lat, "불일치": f"현재 구성(hf_model={args.hf_model}, 지지 {MAX_SUPPORT}, "
                               f"피처 {len(FEATURES)}, 예측 실행 {run})과 다름 → 같은 장치·경로로 "
                               "latency 재측정 필요"}
@@ -1319,16 +1380,13 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     lines += ["", "## G3 지연", "",
               f"- {lat if lat else '측정 없음 (`latency` 먼저 실행)'} → {'✓' if g3 else '✗'}"]
 
-    verdict = g0 and passes.get(CENTER, False) and g2 and g3
-    lines += ["", "## 판정", "",
-              f"**{'채택 (배선 단계로)' if verdict else '기각'}** — G0 {'✓' if g0 else '✗'} · "
-              f"G1(중심) {'✓' if passes.get(CENTER, False) else '✗'} · G2 {'✓' if g2 else '✗'} · "
-              f"G3 {'✓' if g3 else '✗'}",
-              "", "> 판정은 BACKLOG.md·STRATEGIES.md 에 옮겨 적는다 (사전등록 H-M1 기준)."]
-    report = "\n".join(lines) + "\n"
-    ROOT.mkdir(parents=True, exist_ok=True)
-    (ROOT / "report.md").write_text(report, encoding="utf-8")
-    print(report)
+    g1c = passes.get(CENTER, False)
+    verdict = final_verdict(missing, g0, g1c, g2, g3)
+    detail = (f"G0 {'✓' if g0 else '✗'} · G1(중심) {'✓' if g1c else '✗'} · "
+              f"G2 {'✓' if g2 else '✗'} · G3 {'✓' if g3 else '✗'}")
+    _write_report(lines + _verdict_lines(
+        "채택 (배선 단계로)" if verdict == "채택" else verdict, missing, detail
+    ))
 
 
 def latency_matches(lat: dict[str, Any], hf_model: str, run: dict[str, Any] | None) -> bool:

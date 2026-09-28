@@ -544,3 +544,37 @@ def test_cost_model_is_part_of_cache_keys(
     monkeypatch.setattr(mx, "CostModel", lambda: replace(real(), sell_tax_bps=15.0))
     assert mx.template_hash(TEMPLATE) != th
     assert mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None) != fp
+
+
+# -- Codex 7차 리뷰 반영 ----------------------------------------------------------------
+
+
+def test_interrupted_refresh_must_resume_with_refresh() -> None:
+    mx.check_fetch_resume({}, refresh=False)  # 처음
+    mx.check_fetch_resume({"fetch_complete": True, "fetch_mode": "refresh"}, refresh=False)
+    mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, refresh=False)
+    interrupted = {"fetch_complete": False, "fetch_mode": "refresh"}
+    with pytest.raises(SystemExit, match="--refresh"):
+        mx.check_fetch_resume(interrupted, refresh=False)
+    mx.check_fetch_resume(interrupted, refresh=True)
+
+
+def test_missing_prerequisites_are_undetermined_not_rejected() -> None:
+    assert mx.final_verdict(["latency 측정 없음"], True, True, True, False) == "판정 불가"
+    assert mx.final_verdict(["mitra/A/N10 예측 없음"], False, False, False, False) == "판정 불가"
+    assert mx.final_verdict([], True, True, True, True) == "채택"
+    assert mx.final_verdict([], True, False, True, True) == "기각"
+
+
+def test_evaluate_without_eval_bars_writes_undetermined_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL[:-1], *TOP], u)  # 평가 종목 하나 일봉 없음
+    monkeypatch.setattr(mx, "ROOT", tmp_path)
+    args = argparse.Namespace(watchlist="none", hf_model="m2")
+    mx.cmd_evaluate(args)  # FileNotFoundError 없이 보고서 작성
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "**판정 불가**" in report and EVAL[-1] in report and "기각" not in report.split("미비")[0]
