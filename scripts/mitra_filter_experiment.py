@@ -388,6 +388,9 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     )
     # 이전에 완료된 상폐 조회에서 정상 수신된 종목 — 이번에 실패하면 B 축소 대신 미완료 처리
     prior_available = available_baseline(universe)  # 이전 형식이면 복원 기준을 universe 에 기록
+    # 이번 실행 전 필수였고 일봉을 받아 둔 종목 — 목록 갱신으로 상폐 쪽으로 옮겨 가도 보호한다
+    prior_mandatory = {c for c in [*universe.get("top", []), *EVAL_TICKERS]
+                       if _has_bars(BARS_DIR / f"{c}.csv")}
     if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
         # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
         print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
@@ -439,6 +442,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if args.delisted:
         targets += universe.get("delisted", [])
     universe["b_stale"] = b_stale_after(universe, args.refresh, args.refresh_universe, args.delisted)
+    # 필수 목록에서 상폐 목록으로 옮겨 간 종목(직전까지 시총 상위 등)은 이미 정상 수신된 종목이다
+    # — 가용 기준에 넣어 진행 표시와 함께 영속화 (중단·재시도에서도 보호 유지)
+    moved = prior_mandatory & set(universe.get("delisted", []))
+    if moved:
+        prior_available |= moved
+        universe["delisted_available"] = sorted(prior_available)
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     delisted_codes = set(universe.get("delisted", [])) - set(universe["eval"]) - set(universe["top"])
@@ -1257,8 +1266,10 @@ def lagging_codes(codes: Iterable[str]) -> list[str]:
 
 
 def coverage_shrunk(path: Path, series: Series) -> bool:
-    """새 응답이 기존 일봉보다 늦게 시작하거나 일찍 끝나는지 (앞·뒤가 잘린 부분 응답)."""
-    return series.days[0] > _first_day(path) or series.days[-1] < _last_day(path)
+    """새 응답이 기존 일봉의 거래일을 하나라도 잃었는지 — 앞·뒤 잘림뿐 아니라 양 끝은 같고
+    중간 구간이 빠진 부분 응답도 잡는다 (둘 다 같은 정규화를 거친 봉 기준)."""
+    new = set(series.days)
+    return any(d not in new for d in load_series(series.ticker, path).days)
 
 
 MAX_START_GAP_DAYS = 14  # 달력일 — 연초 휴장(설 연휴 포함)을 넘는 시작 지연은 앞부분 잘림으로 본다

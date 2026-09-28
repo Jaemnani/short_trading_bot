@@ -1062,9 +1062,12 @@ def test_coverage_shrunk_detects_partial_responses(tmp_path: Path) -> None:
         z = np.ones(len(days))
         return mx.Series("111110", list(days), z, z, z, z, z)
 
-    assert not mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2014, 6, 30)))
-    assert mx.coverage_shrunk(path, series(date(2013, 1, 2), date(2014, 6, 30)))  # 앞 잘림
-    assert mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2013, 1, 2)))  # 뒤 잘림
+    d1, d2, d3 = date(2012, 1, 2), date(2013, 1, 2), date(2014, 6, 30)
+    assert not mx.coverage_shrunk(path, series(d1, d2, d3))
+    assert not mx.coverage_shrunk(path, series(d1, d2, d3, date(2014, 7, 1)))  # 늘어난 건 정상
+    assert mx.coverage_shrunk(path, series(d2, d3))  # 앞 잘림
+    assert mx.coverage_shrunk(path, series(d1, d2))  # 뒤 잘림
+    assert mx.coverage_shrunk(path, series(d1, d3))  # 양 끝은 같고 중간 구간 누락 (Codex 31차)
 
 
 # -- Codex 30차 리뷰 반영 ---------------------------------------------------------------
@@ -1162,3 +1165,37 @@ def test_fetch_without_metadata_refreshes_leftover_bars(
     mx.UNIVERSE_FILE.unlink()  # 메타데이터만 삭제
     _run_fetch(fetch_env, monkeypatch)  # 옵션 없이 실행해도 전체 새로고침
     assert mx._last_day(old) == date(2016, 3, 31)
+
+
+# -- Codex 31차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_former_top_ticker_moved_to_delisted_stays_protected(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = _run_fetch(fetch_env, monkeypatch, "--delisted")
+    assert u["fetch_complete"] is True
+    gone = TOP[-1]  # 시총 상위였다가 상폐됨 → 새 KOSPI 목록에서 빠지고 상폐 목록에 들어감
+    new_top = [f"7{i:04d}0" for i in range(3)]
+    for c in new_top:
+        fetch_env.bars[c] = (date(2010, 1, 4), date(2016, 3, 31))
+    real_listing = fetch_env.StockListing
+
+    def listing(name: str) -> Any:
+        import pandas as pd
+
+        if name == "KOSPI":
+            codes = [*new_top, *TOP[:-1]]
+            return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(codes)])
+        df = real_listing(name)
+        extra = {"Symbol": gone, "Name": "x", "Market": "KOSPI", "DelistingDate": "2016-03-31",
+                 "SecuGroup": "주권"}
+        return pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
+
+    monkeypatch.setattr(fetch_env, "StockListing", listing)
+    fetch_env.bars[gone] = None  # 일시 장애로 빈 응답
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh-universe", "--delisted")
+    assert gone in u["delisted"] and gone not in u["top"]
+    assert u["fetch_complete"] is False and gone in u["required_failed"]  # B 를 조용히 줄이지 않음
+    assert (mx.BARS_DIR / f"{gone}.csv").exists()  # 옛 일봉 보존
+    assert gone in u["delisted_available"]  # 재시도에서도 보호
