@@ -189,12 +189,16 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
     return Series(ticker, days, arr[0], arr[1], arr[2], arr[3], arr[4])
 
 
-def check_fetch_resume(universe: dict[str, Any], refresh: bool, delisted: bool) -> None:
+def check_fetch_resume(
+    universe: dict[str, Any], refresh: bool, delisted: bool, refresh_universe: bool = False
+) -> None:
     """중단된 fetch 는 같은(또는 더 넓은) 범위로만 이어갈 수 있다.
 
     - ``--refresh`` 중단 → ``--refresh`` 필요 (일반 fetch 는 기존 파일을 건너뛰어 옛·새 일봉
       혼합을 '완료'로 승인하게 된다)
     - ``--delisted`` 중단 → ``--delisted`` 필요 (빠지면 상폐 일봉이 일부만 받아진 채 완료 처리)
+    - ``--refresh-universe`` 중단 → ``--refresh-universe`` 필요 (빠지면 요청한 목록 갱신 없이
+      옛 목록으로 완료 처리)
     """
     if universe.get("fetch_complete") is not False:
         return
@@ -202,6 +206,10 @@ def check_fetch_resume(universe: dict[str, Any], refresh: bool, delisted: bool) 
         raise SystemExit("이전 `fetch --refresh` 가 중단됨 — 같은 `--refresh` 로 다시 실행")
     if universe.get("fetch_delisted") and not delisted:
         raise SystemExit("이전 `fetch --delisted` 가 중단됨 — 같은 `--delisted` 로 다시 실행")
+    if universe.get("fetch_refresh_universe") and not refresh_universe:
+        raise SystemExit(
+            "이전 `fetch --refresh-universe` 가 중단됨 — 같은 `--refresh-universe` 로 다시 실행"
+        )
 
 
 def b_stale_after(
@@ -227,12 +235,18 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe: dict[str, Any] = (
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
-    check_fetch_resume(universe, args.refresh, args.delisted)
+    if args.refresh_universe and not args.refresh:
+        # 목록을 바꾸면 전 종목 일봉을 같은 시점으로 다시 받아야 한다 — 새 편입 종목만 최신이고
+        # 잔류 종목·KS11 은 옛 종료일이면 A·B 모두 종료일이 섞인다.
+        print("--refresh-universe 는 전체 일봉 새로고침(--refresh)을 포함합니다")
+        args.refresh = True
+    check_fetch_resume(universe, args.refresh, args.delisted, args.refresh_universe)
     # 진행 중 표시를 유니버스 목록·일봉을 바꾸기 **전에** 영속화 — 어느 지점에서 중단되든
     # 후속 명령이 옛·새 상태가 섞인 캐시를 거부한다.
     universe["fetch_complete"] = False
     universe["fetch_mode"] = "refresh" if args.refresh else "normal"
     universe["fetch_delisted"] = bool(args.delisted)
+    universe["fetch_refresh_universe"] = bool(args.refresh_universe)
     ROOT.mkdir(parents=True, exist_ok=True)
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     if "top" not in universe or args.refresh_universe:
@@ -987,7 +1001,24 @@ def universe_tickers(universe: str) -> list[str]:
         raise SystemExit(
             f"유니버스 {universe}: 일봉 없는 종목 {len(missing)}개 {missing[:10]} — fetch 재실행 필요"
         )
+    # 블록 달력은 KS11 로 만든다 — 종목 일봉이 KS11 보다 늦게 끝나면(KS11 이 옛 시점) 달력 밖
+    # 질의가 생겨 G0 가 왜곡된다. 거래정지·상폐로 일찍 끝나는 건 정상.
+    ks_last = _last_day(BARS_DIR / f"{KS11}.csv")
+    ahead = [t for t in tickers if _last_day(BARS_DIR / f"{t}.csv") > ks_last]
+    if ahead:
+        raise SystemExit(
+            f"유니버스 {universe}: KS11({ks_last})보다 늦게 끝나는 일봉 {ahead[:10]} — "
+            "`fetch --refresh` 로 한 시점 스냅샷을 다시 받을 것"
+        )
     return tickers
+
+
+def _last_day(path: Path) -> date:
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 256))
+        last = f.read().decode().strip().splitlines()[-1]
+    return date.fromisoformat(last.split(",")[0])
 
 
 def _has_bars(path: Path) -> bool:

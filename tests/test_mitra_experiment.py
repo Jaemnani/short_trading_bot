@@ -703,3 +703,27 @@ def test_b_stale_after_top_only_or_bars_only_refresh() -> None:
     assert mx.b_stale_after(stale, refresh=False, refresh_universe=True, delisted=True)
     assert not mx.b_stale_after(stale, refresh=True, refresh_universe=False, delisted=True)
     assert not mx.b_stale_after({}, refresh=True, refresh_universe=True, delisted=False)  # B 없음
+
+
+# -- Codex 13차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_interrupted_refresh_universe_must_resume_with_it() -> None:
+    interrupted = {"fetch_complete": False, "fetch_mode": "refresh", "fetch_delisted": False,
+                   "fetch_refresh_universe": True}
+    with pytest.raises(SystemExit, match="--refresh-universe"):
+        mx.check_fetch_resume(interrupted, refresh=True, delisted=False, refresh_universe=False)
+    mx.check_fetch_resume(interrupted, refresh=True, delisted=False, refresh_universe=True)
+
+
+def test_universe_rejects_bars_newer_than_ks11(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)  # 전부 2016-01-04 에 끝남
+    assert mx.universe_tickers("A")
+    (tmp_path / "bars" / f"{TOP[0]}.csv").write_text(
+        "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n2016-01-05,1,1,1,1,1\n"
+    )  # 새로 받은 종목만 최신, KS11 은 옛 시점
+    with pytest.raises(SystemExit, match="KS11"):
+        mx.universe_tickers("A")
