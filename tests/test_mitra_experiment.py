@@ -1310,10 +1310,11 @@ def test_worst_case_fill_for_right_censored_delisted_samples() -> None:
 
     pool = [pred("A", 0.7, 1, 0.05), pred("A", 0.3, 0, -0.02)]
     censored = [pred("D", 0.8, None, None), pred("D", 0.2, None, None)]
-    filled = mx.worst_case_fill(pool, censored)
+    filled = mx.worst_case_fill(pool, censored, 10)
     kept, removed = filled[2], filled[3]
     assert (kept.label, kept.net_ret) == (0, -1.0)  # 통과 신호 → 상폐 전액 손실
-    assert (removed.label, removed.net_ret) == (1, 0.05)  # 걸러진 신호 → 관측 최대 수익
+    # 걸러진 신호 → 관측 최대(0.05)가 아니라 가격제한폭으로 증명 가능한 10일 상한 (Codex 36차)
+    assert removed.label == 1 and removed.net_ret == pytest.approx(1.3**10 - 1)
     assert censored[0].label is None  # 원본은 그대로
     d = mx.discrimination(filled)
     assert d.kept_mean < d.removed_mean  # 최악 가정이면 ③ 이 뒤집힘 → B 는 판정 불가로 보고

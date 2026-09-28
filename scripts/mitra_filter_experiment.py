@@ -1767,8 +1767,8 @@ def g0_section(
             # 상폐 직전 N봉 안의 셋업은 t+N 종가가 없어 라벨이 없다(우측 검열). 사전등록 라벨
             # 정의를 바꾸지 않고, 가장 불리한 결과로 채워도 판정이 유지되는지만 본다.
             lines.append(f"  - 상폐 직전 우측 검열 표본 {len(censored)}개 — 최악 가정(통과 → "
-                         "-100%·라벨 0, 제외 → 관측 최대 수익·라벨 1)으로 재채점:")
-            worst = _g0_checks([], universe, n, worst_case_fill(pool, censored), dl)
+                         f"-100%·라벨 0, 제외 → 가격제한폭 상한 {max_return_bound(n):+.0%}·라벨 1)으로 재채점:")
+            worst = _g0_checks([], universe, n, worst_case_fill(pool, censored, n), dl)
             lines.append(f"    - 최악 가정에서도 {'유지 ✓' if worst else '뒤집힘 ✗'}")
             if passed and not worst:
                 missing.append(f"유니버스 B: 상폐 직전 우측 검열 표본 {len(censored)}개가 G0 ④ 를 "
@@ -1815,10 +1815,21 @@ def censored_delisted(preds: Sequence[Pred]) -> list[Pred]:
     return [p for p in preds if p.label is None and p.ticker in delisted]
 
 
-def worst_case_fill(pool: Sequence[Pred], censored: Sequence[Pred]) -> list[Pred]:
+PRICE_LIMIT = 0.30  # KRX 일일 가격제한폭 (2015-06-15~, 평가 구간 2016~ 전체에 적용)
+
+
+def max_return_bound(horizon: int) -> float:
+    """N거래일 수익의 증명 가능한 상한: 매일 상한가(+30%)로 N일 — 비용 차감 전이라 더 크다."""
+    return float((1 + PRICE_LIMIT) ** horizon - 1)
+
+
+def worst_case_fill(
+    pool: Sequence[Pred], censored: Sequence[Pred], horizon: int
+) -> list[Pred]:
     """검열 표본을 게이트에 가장 불리하게 채운다: 통과(유지)된 신호는 상폐로 전액 손실(라벨 0,
-    -100%), 걸러진 신호는 관측 최대 수익(라벨 1). 이래도 G0 가 유지되면 검열이 판정을 못 바꾼다."""
-    best = max((p.net_ret for p in pool if p.net_ret is not None), default=0.0)
+    -100% — 증명 가능한 하한), 걸러진 신호는 가격제한폭으로 증명 가능한 N일 최대 수익(라벨 1).
+    관측 최대값은 상한이 아니므로 쓰지 않는다. 이래도 G0 가 유지되면 검열이 판정을 못 바꾼다."""
+    best = max_return_bound(horizon)
     filled = [replace(p, label=0, net_ret=-1.0) if keep(p, 0.0)
               else replace(p, label=1, net_ret=best) for p in censored]
     return [*pool, *filled]
