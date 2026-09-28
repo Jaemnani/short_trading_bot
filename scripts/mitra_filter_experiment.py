@@ -505,6 +505,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     delisted_codes = set(universe.get("delisted", [])) - set(universe["eval"]) - set(universe["top"])
+    failed_once = set(universe.get("delisted_failed_once", []))
     for n, code in enumerate(dict.fromkeys(targets), 1):
         path = BARS_DIR / f"{code}.csv"
         if _has_bars(path) and not args.refresh:  # 헤더만 남은 파일은 다시 받는다
@@ -537,6 +538,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
             continue
         save_series(series, path)
+        if code in failed_once:
+            # 한 번 실패했던 종목이 이번에 정상 수신 — 표시를 즉시 지우고 영속화한다. 이 실행이
+            # 중간에 끊긴 뒤 다음 실패를 '두 번째 연속 실패'로 잘못 세지 않게.
+            failed_once.discard(code)
+            universe["delisted_failed_once"] = sorted(failed_once)
+            write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
         if n % 50 == 0:
             print(f"  {n}/{len(targets)} …", flush=True)
     # 조회 불가로 인정하는 것은 상폐 종목뿐 (유니버스 B 에서 명시적으로 제외·보고). 그 외 실패는
@@ -1022,6 +1029,9 @@ class Pred:
     n_support: int
     label: int | None
     net_ret: float | None
+    # 유동성 통과 여부 — 평가 종목은 G1 게이트용으로 비유동 셋업도 질의하지만, G0 채점은
+    # 사전등록 표본 정의(유동성 통과)만 쓴다
+    liquid: bool = True
 
 
 def block_starts(calendar: Sequence[date], start: date, every: int) -> list[date]:
@@ -1113,6 +1123,7 @@ def walk_forward(
                 q.ticker, q.day, plan.block, float(p[j]), base, plan.hi - plan.lo,
                 (1 if q.fwd[horizon][1] > 0 else 0) if horizon in q.fwd else None,
                 q.fwd[horizon][1] if horizon in q.fwd else None,
+                q.liquid,
             )
             for j, q in enumerate(plan.queries)
         ]
@@ -1145,7 +1156,7 @@ def is_complete(rows: Sequence[Pred], expected: dict[date, set[tuple[str, date]]
     )
 
 
-PRED_FIELDS = ("ticker", "day", "block", "p", "base", "n_support", "label", "net_ret")
+PRED_FIELDS = ("ticker", "day", "block", "p", "base", "n_support", "label", "net_ret", "liquid")
 
 
 def preds_path(model: str, universe: str, horizon: int, fingerprint: str) -> Path:
@@ -1213,6 +1224,7 @@ def read_preds(path: Path) -> list[Pred]:
                 float(r["p"]), float(r["base"]), int(r["n_support"]),
                 int(r["label"]) if r["label"] != "" else None,
                 float(r["net_ret"]) if r["net_ret"] != "" else None,
+                {"1": True, "0": False}[r["liquid"]],
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -1226,7 +1238,7 @@ def _write_pred_rows(f: Any, rows: list[Pred], *, header: bool) -> None:
     for r in rows:
         w.writerow([r.ticker, r.day.isoformat(), r.block.isoformat(), r.p, r.base,
                     r.n_support, "" if r.label is None else r.label,
-                    "" if r.net_ret is None else r.net_ret])
+                    "" if r.net_ret is None else r.net_ret, int(r.liquid)])
 
 
 def _append_preds(path: Path, rows: list[Pred]) -> None:
@@ -1794,8 +1806,11 @@ def g0_section(
             lines.append(f"  - ({unavailable_note()})")
         if logit is None:
             lines.append(f"  - ({why_l})")
+        # G0 는 사전등록 표본 정의(유동성 통과)만 채점 — 평가 종목의 비유동 셋업은 G1 게이트용
+        mitra = [p for p in mitra if p.liquid]
         pool = [p for p in mitra if p.label is not None]
-        dl = discrimination([p for p in logit if p.label is not None]) if logit is not None else None
+        dl = (discrimination([p for p in logit if p.label is not None and p.liquid])
+              if logit is not None else None)
         passed = _g0_checks(lines, universe, n, pool, dl)
         censored = censored_delisted(mitra) if universe == "B" else []
         if censored:

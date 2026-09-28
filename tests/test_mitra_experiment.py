@@ -1452,3 +1452,65 @@ def test_new_delisted_ticker_with_truncated_prefix_is_rejected(
     u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
     assert u["fetch_complete"] is True and cut in u["unavailable"]
     assert not (mx.BARS_DIR / f"{cut}.csv").exists()
+
+
+# -- Codex 41차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_successful_retry_clears_failure_marker_before_interruption(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    flaky = _FakeFdr.DELISTED[3]
+    saved = fetch_env.bars[flaky]
+    fetch_env.bars[flaky] = None
+    u = _run_fetch(fetch_env, monkeypatch, "--delisted")  # 1차 실패
+    assert flaky in u["delisted_failed_once"]
+    fetch_env.bars[flaky] = saved
+    real_reader = fetch_env.DataReader
+    last = _FakeFdr.DELISTED[-1]
+
+    def interrupt(symbol: str, start: str) -> Any:
+        if symbol.removeprefix("KRX-DELISTING:") == last:
+            raise KeyboardInterrupt  # 재시도 도중(flaky 수신 이후) 중단
+        return real_reader(symbol, start)
+
+    monkeypatch.setattr(fetch_env, "DataReader", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    u = json.loads(mx.UNIVERSE_FILE.read_text())
+    assert flaky not in u["delisted_failed_once"]  # 성공이 영속화됨
+    monkeypatch.setattr(fetch_env, "DataReader", real_reader)
+    fetch_env.bars[flaky] = None  # 다음 재시도에서 다시 실패 → 새 첫 실패(두 번째로 세지 않음)
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is False and flaky in u["required_failed"]
+
+
+def test_g0_excludes_illiquid_evaluation_only_queries(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    rows = [mx.Pred("005930", date(2016, 3, 2), date(2016, 3, 2), 0.9, 0.5, 400, 0, -0.5,
+                    liquid=False),
+            mx.Pred("A", date(2016, 3, 2), date(2016, 3, 2), 0.9, 0.5, 400, 1, 0.1)]
+    mx._append_preds(path, rows)
+    back = mx.read_preds(path)
+    assert [r.liquid for r in back] == [False, True]  # CSV 왕복 보존
+
+
+def test_g0_section_scores_only_liquid_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
+    (tmp_path / "universe.json").write_text(json.dumps({"delisted": []}))
+    monkeypatch.setattr(mx, "unavailable_note", lambda: "상폐 0종목")
+    liquid = [mx.Pred("A", date(2017, 1, 2) + timedelta(days=i), date(2017, 1, 2), 0.5, 0.5,
+                      400, i % 2, 0.01) for i in range(40)]
+    illiquid = [mx.Pred("005930", date(2017, 1, 2) + timedelta(days=i), date(2017, 1, 2), 0.5,
+                        0.5, 400, 1, 0.01, liquid=False) for i in range(25)]
+    monkeypatch.setattr(mx, "load_complete_preds",
+                        lambda model, universe, n, t, c: ([*liquid, *illiquid], "ok"))
+    lines: list[str] = []
+    mx.g0_section(lines, {}, "ckpt", [])
+    assert any("표본 40)" in ln for ln in lines) and not any("표본 65)" in ln for ln in lines)
