@@ -843,7 +843,7 @@ def test_universe_rejects_legacy_schema(tmp_path: Path, monkeypatch: pytest.Monk
     assert mx.universe_tickers("A")
     # 형식 버전 표시가 없는 이전 목록(행 순서로 뽑혔을 수 있음) → 거부
     (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
-    with pytest.raises(SystemExit, match="--refresh-universe"):
+    with pytest.raises(SystemExit, match="지우고"):
         mx.universe_tickers("A")
 
 
@@ -1248,3 +1248,39 @@ def test_former_top_stays_protected_across_separate_universe_and_delisted_refres
     u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
     assert u["fetch_complete"] is False and gone in u["required_failed"]
     assert (mx.BARS_DIR / f"{gone}.csv").exists()
+
+
+# -- Codex 33차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_fetch_rejects_cache_from_older_schema(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    _run_fetch(fetch_env, monkeypatch, "--delisted")
+    u = json.loads(mx.UNIVERSE_FILE.read_text())
+    # 이전 버전: 증권 유형 검증 없이 만든 상폐 목록, former_mandatory 기록 없음
+    u["schema"] = mx.UNIVERSE_SCHEMA - 1
+    mx.UNIVERSE_FILE.write_text(json.dumps(u))
+    for flags in [(), ("--delisted",), ("--refresh", "--delisted"), ("--refresh-universe",)]:
+        with pytest.raises(SystemExit, match="지우고"):
+            _run_fetch(fetch_env, monkeypatch, *flags)
+    with pytest.raises(SystemExit, match="지우고"):
+        mx.universe_tickers("B")
+
+
+def test_interrupted_first_fetch_can_resume(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_listing = fetch_env.StockListing
+
+    def broken(name: str) -> Any:
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(fetch_env, "StockListing", broken)
+    with pytest.raises(ConnectionError):
+        _run_fetch(fetch_env, monkeypatch)  # 첫 실행이 목록 조회 중 중단
+    monkeypatch.setattr(fetch_env, "StockListing", real_listing)
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh")  # 형식 버전 거부 없이 재개
+    assert u["fetch_complete"] is True and u["schema"] == mx.UNIVERSE_SCHEMA

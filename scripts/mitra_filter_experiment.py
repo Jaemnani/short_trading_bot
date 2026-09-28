@@ -78,9 +78,12 @@ MIN_SUPPORT = 300
 MIN_CLASS = 50
 MIN_AVG_VALUE = 5e9  # 20일 평균 거래대금 50억
 UNIVERSE_TOP = 100  # 지지 유니버스 A = KOSPI 시총 상위 100 보통주
-# universe.json 형식 버전 — 2: top 을 top_by_marcap(시총 필수 검증)으로 선정. 표시가 없거나 다른
-# 캐시(예: 시총 누락 시 행 순서로 뽑던 이전 코드의 산출물)는 --refresh-universe 전까지 거부.
-UNIVERSE_SCHEMA = 2
+# universe.json 형식 버전. 다른 버전의 캐시는 fetch·predict·evaluate 모두 거부하고 데이터 디렉터리
+# 삭제 후 처음부터 받게 한다 — 이전 코드가 남긴 상태(행 순서로 뽑은 top, 증권 유형 검증 없는 상폐
+# 목록, 가용 기준·옛 필수 종목 기록 없음 등)를 부분 이관하며 믿지 않는다.
+#   2: top 을 top_by_marcap(시총 필수 검증)으로 선정
+#   3: 상폐 목록 parse_delisted(증권 유형 필수), delisted_available·former_mandatory 기록
+UNIVERSE_SCHEMA = 3
 STARTING_EQUITY = Decimal(10_000_000)
 BEAR_WINDOWS = (
     ("2018", date(2018, 1, 1), date(2018, 12, 31)),
@@ -231,6 +234,14 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
             c.append(v)
     arr = [np.asarray(c, dtype=np.float64) for c in cols]
     return Series(ticker, days, arr[0], arr[1], arr[2], arr[3], arr[4])
+
+
+def legacy_cache_message(universe: dict[str, Any]) -> str:
+    return (
+        f"universe.json 형식 버전 {universe.get('schema')} ≠ {UNIVERSE_SCHEMA} — 이전 코드가 만든 "
+        f"캐시(검증 없는 목록·기록 누락 가능)는 이관하지 않음. `{ROOT}` 디렉터리 전체를 지우고 "
+        "처음부터 fetch 할 것"
+    )
 
 
 def orphan_bars(universe: dict[str, Any]) -> bool:
@@ -413,6 +424,9 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe: dict[str, Any] = (
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
+    if universe and universe.get("schema") != UNIVERSE_SCHEMA:
+        raise SystemExit(legacy_cache_message(universe))
+    universe["schema"] = UNIVERSE_SCHEMA  # 처음이면 진행 표시와 함께 기록 (첫 실행이 중단돼도 재개 가능)
     # 이전에 완료된 상폐 조회에서 정상 수신된 종목 — 이번에 실패하면 B 축소 대신 미완료 처리
     prior_available = available_baseline(universe)  # 이전 형식이면 복원 기준을 universe 에 기록
     # 이번 실행 전 필수였고 일봉을 받아 둔 종목 — 목록 갱신으로 상폐 쪽으로 옮겨 가도 보호한다
@@ -421,10 +435,6 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     prior_mandatory = {c for c in [*universe.get("top", []), *EVAL_TICKERS,
                                    *universe.get("former_mandatory", [])]
                        if _has_bars(BARS_DIR / f"{c}.csv")}
-    if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
-        # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
-        print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
-        args.refresh_universe = True
     if orphan_bars(universe) and not args.refresh:
         # 메타데이터 없이 남은 일봉(중단된 이전 실행 등)은 어느 시점 것인지 알 수 없다 — 건너뛰면
         # 누락 파일만 새 시점으로 받아 혼합 스냅샷이 완료된다.
@@ -1211,10 +1221,7 @@ def universe_tickers(universe: str) -> list[str]:
     if u.get("required_failed"):
         raise SystemExit(f"필수 종목 조회 실패 {u['required_failed']} — fetch 재실행 필요")
     if u.get("schema") != UNIVERSE_SCHEMA:
-        raise SystemExit(
-            f"universe.json 형식 버전 {u.get('schema')} ≠ {UNIVERSE_SCHEMA} (시총 선정 검증 없는 "
-            "이전 목록일 수 있음) — `fetch --refresh-universe` 로 다시 만들 것"
-        )
+        raise SystemExit(legacy_cache_message(u))
     if len(u["top"]) != UNIVERSE_TOP or list(u["eval"]) != list(EVAL_TICKERS):
         raise SystemExit(
             f"유니버스가 사전등록(시총 상위 {UNIVERSE_TOP} + 평가 {list(EVAL_TICKERS)})과 다름 — "
