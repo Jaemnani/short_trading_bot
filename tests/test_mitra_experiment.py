@@ -1310,11 +1310,11 @@ def test_worst_case_fill_for_right_censored_delisted_samples() -> None:
 
     pool = [pred("A", 0.7, 1, 0.05), pred("A", 0.3, 0, -0.02)]
     censored = [pred("D", 0.8, None, None), pred("D", 0.2, None, None)]
-    filled = mx.worst_case_fill(pool, censored, 10)
+    filled = mx.worst_case_fill(pool, censored)
     kept, removed = filled[2], filled[3]
     assert (kept.label, kept.net_ret) == (0, -1.0)  # 통과 신호 → 상폐 전액 손실
-    # 걸러진 신호 → 관측 최대(0.05)가 아니라 가격제한폭으로 증명 가능한 10일 상한 (Codex 36차)
-    assert removed.label == 1 and removed.net_ret == pytest.approx(1.3**10 - 1)
+    # 걸러진 신호 → 관측 최대(0.05)도 1.3^N 도 아닌 +inf — 정리매매는 가격제한폭이 없음 (Codex 37차)
+    assert removed.label == 1 and removed.net_ret == math.inf
     assert censored[0].label is None  # 원본은 그대로
     d = mx.discrimination(filled)
     assert d.kept_mean < d.removed_mean  # 최악 가정이면 ③ 이 뒤집힘 → B 는 판정 불가로 보고
@@ -1351,3 +1351,13 @@ def test_g0_b_is_undetermined_when_censoring_could_flip_it(
                         lambda model, universe, n, t, c: (preds, "ok"))  # 검열 없음
     mx.g0_section([], {}, "ckpt", missing)
     assert not any("우측 검열" in m for m in missing)
+
+
+def test_worst_case_holds_when_all_censored_samples_were_kept() -> None:
+    def pred(p: float, label: int | None, ret: float | None) -> Any:
+        return mx.Pred("A", date(2016, 3, 2), date(2016, 3, 2), p, 0.5, 400, label, ret)
+
+    pool = [pred(0.9, 1, 0.10), pred(0.8, 1, 0.08), pred(0.2, 0, -0.30), pred(0.1, 0, -0.40)]
+    d = mx.discrimination(mx.worst_case_fill(pool, [pred(0.7, None, None)]))
+    assert d.removed_mean < d.kept_mean  # 검열 표본이 통과 쪽뿐이면 -100% 로도 판정 가능
+    assert mx._fmt(math.inf) == "+inf" and mx._fmt(math.nan) == "n/a"
