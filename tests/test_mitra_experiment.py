@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import math
 import sys
@@ -882,3 +883,39 @@ def test_write_atomic_fsyncs_parent_directory(
     synced.clear()
     mx.save_series(_series("005930", 5, 1), tmp_path / "005930.csv")
     assert synced == [False, True]
+
+
+# -- Codex 21차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_fsync_dir_propagates_real_io_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                             ) -> None:
+    def fail(err: int) -> Any:
+        def _fsync(fd: int) -> None:
+            raise OSError(err, "x")
+        return _fsync
+
+    monkeypatch.setattr(mx.os, "fsync", fail(errno.EINVAL))  # 디렉터리 fsync 미지원 → 무시
+    mx._fsync_dir(tmp_path)
+    monkeypatch.setattr(mx.os, "fsync", fail(errno.EIO))  # 실제 저장장치 오류 → 전파
+    with pytest.raises(OSError):
+        mx._fsync_dir(tmp_path)
+
+
+def test_verify_preds_rejects_csv_that_diverged_from_marker(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    rows = [_pred("A", date(2016, 1, 4), date(2016, 1, 4)),
+            _pred("B", date(2016, 1, 5), date(2016, 1, 4)),
+            _pred("C", date(2016, 1, 11), date(2016, 1, 11))]
+    mx._append_preds(path, rows)
+    marker = {"rows": 3, "queries": 3, "blocks": 2, "sha256": mx.preds_digest(path)}
+    assert mx.verify_preds(path, mx.read_preds(path), marker) is None
+    # 해시 없는 옛 표시는 거부
+    legacy = {k: v for k, v in marker.items() if k != "sha256"}
+    assert mx.verify_preds(path, mx.read_preds(path), legacy) is not None
+    # 전원 차단으로 뒷부분이 유실된 CSV — 표시는 남아 있어도 거부
+    mx._rewrite_preds(path, rows[:2])
+    assert "다름" in (mx.verify_preds(path, mx.read_preds(path), marker) or "")
+    # 해시가 우연히 맞더라도(표시가 부분 CSV 로 기록된 경우) 행·블록 수로 거부
+    partial = {**marker, "sha256": mx.preds_digest(path)}
+    assert mx.verify_preds(path, mx.read_preds(path), partial) is not None

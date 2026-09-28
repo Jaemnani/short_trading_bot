@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import errno
 import hashlib
 import io
 import json
@@ -162,17 +163,24 @@ def write_atomic(path: Path, text: str) -> None:
     _fsync_dir(path.parent)
 
 
+# 디렉터리 fsync 를 지원하지 않는 파일시스템이 돌려주는 errno — 이것만 무시한다.
+_DIR_FSYNC_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
+
+
 def _fsync_dir(directory: Path) -> None:
-    """rename 을 담은 디렉터리 엔트리까지 영속화 — 전원 차단 후 이전 파일(예: fetch_complete=true 인
-    universe.json)이 되살아나지 않게. 디렉터리 fsync 를 지원하지 않는 플랫폼에선 조용히 넘어간다."""
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError:
+    """rename·unlink 를 담은 디렉터리 엔트리까지 영속화 — 전원 차단 후 이전 파일(예:
+    fetch_complete=true 인 universe.json)이 되살아나지 않게.
+
+    디렉터리를 열 수 없는 Windows 와, 디렉터리 fsync 미지원 errno 만 넘어간다. 그 밖의
+    실패(EIO 등 실제 저장장치 오류)는 전파한다 — 영속화됐다고 믿고 진행하면 안 되므로."""
+    if os.name == "nt":
         return
+    fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as e:
+        if e.errno not in _DIR_FSYNC_UNSUPPORTED:
+            raise
     finally:
         os.close(fd)
 
@@ -1019,9 +1027,19 @@ def claim_run(path: Path, run: dict[str, Any]) -> None:
 
 
 def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
-    path.unlink(missing_ok=True)
-    if rows:
-        _append_preds(path, rows)
+    """완료 블록 행만으로 원자적으로 다시 쓴다 (행이 없으면 파일 삭제)."""
+    if not rows:
+        path.unlink(missing_ok=True)
+        _fsync_dir(path.parent)
+        return
+    buf = io.StringIO(newline="")
+    _write_pred_rows(buf, rows, header=True)
+    write_atomic(path, buf.getvalue())
+
+
+def preds_digest(path: Path) -> str:
+    """예측 CSV 바이트의 해시 — 완료 표시와 파일 내용을 묶는다."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def read_preds(path: Path) -> list[Pred]:
@@ -1051,17 +1069,26 @@ def read_preds(path: Path) -> list[Pred]:
     return out
 
 
+def _write_pred_rows(f: Any, rows: list[Pred], *, header: bool) -> None:
+    w = csv.writer(f)
+    if header:
+        w.writerow(PRED_FIELDS)
+    for r in rows:
+        w.writerow([r.ticker, r.day.isoformat(), r.block.isoformat(), r.p, r.base,
+                    r.n_support, "" if r.label is None else r.label,
+                    "" if r.net_ret is None else r.net_ret])
+
+
 def _append_preds(path: Path, rows: list[Pred]) -> None:
+    """블록 행을 이어 쓰고 fsync — 완료 표시보다 CSV 가 먼저 영속화되게."""
     new = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", newline="") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(PRED_FIELDS)
-        for r in rows:
-            w.writerow([r.ticker, r.day.isoformat(), r.block.isoformat(), r.p, r.base,
-                        r.n_support, "" if r.label is None else r.label,
-                        "" if r.net_ret is None else r.net_ret])
+        _write_pred_rows(f, rows, header=new)
+        f.flush()
+        os.fsync(f.fileno())
+    if new:
+        _fsync_dir(path.parent)
 
 
 def universe_tickers(universe: str) -> list[str]:
@@ -1180,6 +1207,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
         path = preds_path(args.model, args.universe, n, fp)
         claim_run(path, run)
         marker_path(path).unlink(missing_ok=True)
+        _fsync_dir(path.parent)  # 표시 삭제를 영속화 — 이후 CSV 가 바뀌어도 옛 표시가 되살아나지 않게
         expected = expected_keys(plan_blocks(pool, queries, n, blocks)[1])
         existing = read_preds(path)
         done = complete_blocks(existing, expected)
@@ -1206,6 +1234,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
         write_atomic(marker_path(path), json.dumps({
             "fingerprint": fp, "complete": complete, "blocks": len(expected),
             "queries": sum(len(v) for v in expected.values()), "rows": len(final), "run": run,
+            "sha256": preds_digest(path),
         }))
         state = "완료" if complete else "불완전 — 다시 실행하면 이어서 진행"
         print(f"N={n} {state} → {path} ({time.time() - t0:.0f}s)")
@@ -1214,11 +1243,36 @@ def cmd_predict(args: argparse.Namespace) -> None:
 def load_complete_preds(
     model: str, universe: str, horizon: int, template: dict[str, Any], checkpoint: str | None
 ) -> tuple[list[Pred] | None, str]:
-    """현재 구성과 지문이 같고 완전성 표시가 된 예측만 돌려준다. 아니면 (None, 사유)."""
+    """현재 구성과 지문이 같고 완전성 표시가 된 예측만 돌려준다. 아니면 (None, 사유).
+
+    표시만 믿지 않고 CSV 를 다시 대조한다 (verify_preds)."""
     marker = load_marker(model, universe, horizon, template, checkpoint)
     if isinstance(marker, str):
         return None, marker
-    return read_preds(Path(marker["_preds"])), "ok"
+    path = Path(marker["_preds"])
+    rows = read_preds(path)
+    why = verify_preds(path, rows, marker)
+    if why is not None:
+        return None, f"{model}/{universe}/N{horizon}: {why} — predict 재실행 필요"
+    return rows, "ok"
+
+
+def verify_preds(path: Path, rows: Sequence[Pred], marker: dict[str, Any]) -> str | None:
+    """완료 표시와 CSV 대조. 전원 차단 등으로 표시만 남고 CSV 일부가 유실·손상됐으면 사유.
+
+    - 파일 바이트 해시가 표시에 기록된 값과 같아야 한다 (해시 없는 옛 표시는 거부).
+    - 행 수 = 표시의 행 수 = 질의 수, 질의 키 중복 없음, 블록 수 = 표시의 블록 수."""
+    digest = marker.get("sha256")
+    if not isinstance(digest, str):
+        return "완료 표시에 CSV 해시 없음(옛 형식)"
+    if preds_digest(path) != digest:
+        return "예측 CSV 가 완료 표시와 다름(유실·손상)"
+    keys = {(r.ticker, r.day) for r in rows}
+    if not (len(rows) == marker.get("rows") == marker.get("queries") == len(keys)):
+        return f"예측 행 수 불일치 (행 {len(rows)} · 고유 {len(keys)} · 표시 {marker.get('rows')})"
+    if len({r.block for r in rows}) != marker.get("blocks"):
+        return "예측 블록 수가 완료 표시와 다름"
+    return None
 
 
 def load_marker(
