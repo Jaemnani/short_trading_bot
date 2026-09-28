@@ -945,17 +945,22 @@ def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
 
 
 def read_preds(path: Path) -> list[Pred]:
+    """예측 CSV 읽기. 쓰기 도중 중단으로 찢어진 행(필드 누락·파싱 불가)은 건너뛴다 — 그 행의
+    블록은 질의 키가 모자라 불완전 블록으로 판정돼 재실행 시 폐기·재예측된다."""
     if not path.exists():
         return []
     out: list[Pred] = []
     with path.open(newline="") as f:
         for r in csv.DictReader(f):
-            out.append(Pred(
-                r["ticker"], date.fromisoformat(r["day"]), date.fromisoformat(r["block"]),
-                float(r["p"]), float(r["base"]), int(r["n_support"]),
-                int(r["label"]) if r["label"] != "" else None,
-                float(r["net_ret"]) if r["net_ret"] != "" else None,
-            ))
+            try:
+                out.append(Pred(
+                    r["ticker"], date.fromisoformat(r["day"]), date.fromisoformat(r["block"]),
+                    float(r["p"]), float(r["base"]), int(r["n_support"]),
+                    int(r["label"]) if r["label"] != "" else None,
+                    float(r["net_ret"]) if r["net_ret"] != "" else None,
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
     return out
 
 
@@ -1083,6 +1088,9 @@ def cmd_predict(args: argparse.Namespace) -> None:
         kept = [r for r in existing if r.block in done]
         if len(kept) != len(existing):  # 중단으로 반쯤 쓰인 블록 등은 버리고 다시 예측
             print(f"  N={n}: 불완전 행 {len(existing) - len(kept)}개 폐기 후 이어서 진행")
+        if path.exists():
+            # 항상 완료 블록 행만으로 다시 쓴다 — 찢어진 마지막 행(개행 없음)이 남아 있으면
+            # 이어 쓰는 첫 행과 붙어 버리므로, 파싱에서 건너뛴 행도 여기서 확실히 제거한다.
             _rewrite_preds(path, kept)
         t0 = time.time()
         count = [0]
@@ -1224,6 +1232,15 @@ class RunStats:
     mdd: float
     roll: dict[int, tuple[float, float, float]]  # 개월 -> (플러스 비율, 중앙값, 최악)
     bear: dict[str, float]
+    blocked: frozenset[tuple[str, date]] = frozenset()  # 게이트가 막은 (종목, 날짜)
+    entries: frozenset[tuple[str, date]] = frozenset()  # 실제 체결된 최초 진입 (종목, 날짜)
+
+
+def effective_filtered(arm: RunStats, base: RunStats) -> int:
+    """게이트가 실제로 없앤 진입 수 — 현행에서 **체결된** 진입 중 게이트가 막은 것만.
+
+    현금 부족으로 어차피 체결되지 않았을 신호의 차단은 세지 않는다 (G1 ⑤ 부풀림 방지)."""
+    return len(arm.blocked & base.entries)
 
 
 def daily_equity(result: BacktestResult, start: date) -> list[tuple[date, float]]:
@@ -1295,10 +1312,12 @@ def run_arm(
     result = Backtester(tmpl, STARTING_EQUITY, CostModel(), liquidate_open_at_end=True).run(tape)
     curve = daily_equity(result, eval_start)
     roll = {m: r for m in (6, 12) if (r := rolling_windows(curve, m)) is not None}
+    blocked = frozenset(GatedPullback.filtered)
     return RunStats(
-        label, len(result.trades), len(set(GatedPullback.filtered)),
+        label, len(result.trades), len(blocked),
         curve[-1][1] / curve[0][1] - 1, max_drawdown(curve), roll,
         {name: window_return(curve, s, e) for name, s, e in BEAR_WINDOWS},
+        blocked, frozenset((t.ticker, t.opened_at.date()) for t in result.trades),
     )
 
 
@@ -1488,6 +1507,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
                 reasons[(n, d)] = [why]
                 continue
             arm = run_arm(f"N={n} δ={d:+.2f}", template, tape, gate_from(preds, d))
+            arm.filtered = effective_filtered(arm, base)  # 보고·G1 ⑤ 는 실제로 없앤 진입 수
             arms[(n, d)] = arm
             passes[(n, d)], reasons[(n, d)] = g1_pass(arm, base)
 

@@ -727,3 +727,32 @@ def test_universe_rejects_bars_newer_than_ks11(
     )  # 새로 받은 종목만 최신, KS11 은 옛 시점
     with pytest.raises(SystemExit, match="KS11"):
         mx.universe_tickers("A")
+
+
+# -- Codex 14차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_effective_filtered_counts_only_executed_base_entries() -> None:
+    d = [date(2016, 3, k) for k in range(1, 8)]
+    base = mx.RunStats("현행", 3, 0, 0.0, 0.0, {}, {},
+                       entries=frozenset({("A", d[0]), ("B", d[1]), ("C", d[2])}))
+    # 게이트가 5건을 막았지만 현행에서 실제 체결된 건 2건뿐(나머지는 현금 부족 등으로 미체결)
+    arm = mx.RunStats("게이트", 1, 5, 0.0, 0.0, {}, {},
+                      blocked=frozenset({("A", d[0]), ("B", d[1]), ("D", d[3]), ("E", d[4]),
+                                         ("F", d[5])}))
+    assert mx.effective_filtered(arm, base) == 2
+
+
+def test_read_preds_skips_torn_rows(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    good = [_pred("A", date(2016, 1, 4), date(2016, 1, 4)),
+            _pred("B", date(2016, 1, 5), date(2016, 1, 4))]
+    mx._append_preds(path, good)
+    with path.open("a") as f:
+        f.write("C,2016-01-0")  # 쓰기 도중 중단 — 개행 없이 찢어진 행
+    rows = mx.read_preds(path)  # 예외 없이 정상 행만
+    assert [(r.ticker, r.day) for r in rows] == [("A", date(2016, 1, 4)), ("B", date(2016, 1, 5))]
+    # 재개 시 정상 행만으로 다시 쓰면 이어 쓰는 행이 찢어진 행과 붙지 않는다
+    mx._rewrite_preds(path, rows)
+    mx._append_preds(path, [_pred("C", date(2016, 1, 11), date(2016, 1, 11))])
+    assert [r.ticker for r in mx.read_preds(path)] == ["A", "B", "C"]
