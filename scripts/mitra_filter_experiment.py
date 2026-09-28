@@ -76,6 +76,9 @@ MIN_SUPPORT = 300
 MIN_CLASS = 50
 MIN_AVG_VALUE = 5e9  # 20일 평균 거래대금 50억
 UNIVERSE_TOP = 100  # 지지 유니버스 A = KOSPI 시총 상위 100 보통주
+# universe.json 형식 버전 — 2: top 을 top_by_marcap(시총 필수 검증)으로 선정. 표시가 없거나 다른
+# 캐시(예: 시총 누락 시 행 순서로 뽑던 이전 코드의 산출물)는 --refresh-universe 전까지 거부.
+UNIVERSE_SCHEMA = 2
 STARTING_EQUITY = Decimal(10_000_000)
 BEAR_WINDOWS = (
     ("2018", date(2018, 1, 1), date(2018, 12, 31)),
@@ -284,6 +287,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe: dict[str, Any] = (
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
+    if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
+        # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
+        print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
+        args.refresh_universe = True
     if args.refresh_universe and not args.refresh:
         # 목록을 바꾸면 전 종목 일봉을 같은 시점으로 다시 받아야 한다 — 새 편입 종목만 최신이고
         # 잔류 종목·KS11 은 옛 종료일이면 A·B 모두 종료일이 섞인다.
@@ -301,7 +308,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         top = top_by_marcap(listing.to_dict("records"))
-        universe.update({"created": date.today().isoformat(), "top": top})
+        universe.update({"created": date.today().isoformat(), "top": top, "schema": UNIVERSE_SCHEMA})
     universe["eval"] = list(EVAL_TICKERS)
     # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회
     if args.delisted and ("delisted" not in universe or args.refresh or args.refresh_universe):
@@ -1035,6 +1042,11 @@ def universe_tickers(universe: str) -> list[str]:
         raise SystemExit("fetch 가 완료되지 않음(중단된 새로고침 등) — fetch 재실행 필요")
     if u.get("required_failed"):
         raise SystemExit(f"필수 종목 조회 실패 {u['required_failed']} — fetch 재실행 필요")
+    if u.get("schema") != UNIVERSE_SCHEMA:
+        raise SystemExit(
+            f"universe.json 형식 버전 {u.get('schema')} ≠ {UNIVERSE_SCHEMA} (시총 선정 검증 없는 "
+            "이전 목록일 수 있음) — `fetch --refresh-universe` 로 다시 만들 것"
+        )
     if len(u["top"]) != UNIVERSE_TOP or list(u["eval"]) != list(EVAL_TICKERS):
         raise SystemExit(
             f"유니버스가 사전등록(시총 상위 {UNIVERSE_TOP} + 평가 {list(EVAL_TICKERS)})과 다름 — "

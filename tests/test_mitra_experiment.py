@@ -397,7 +397,9 @@ def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
         (tmp_path / "bars" / f"{t}.csv").write_text(
             "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
         )
-    (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
+    (tmp_path / "universe.json").write_text(
+        json.dumps({"fetch_complete": True, "schema": mx.UNIVERSE_SCHEMA, **u})
+    )
 
 
 TOP = [f"9{i:04d}0" for i in range(1, mx.UNIVERSE_TOP + 1)]  # 평가 종목과 겹치지 않게
@@ -426,7 +428,8 @@ def test_universe_rejects_incomplete_fetch_or_wrong_size(
     uf.write_text(json.dumps({**u, "fetch_complete": True, "required_failed": [EVAL[0]]}))
     with pytest.raises(SystemExit, match="조회 실패"):
         mx.universe_tickers("A")
-    uf.write_text(json.dumps({"eval": EVAL, "top": TOP[:50], "fetch_complete": True}))
+    uf.write_text(json.dumps({"eval": EVAL, "top": TOP[:50], "fetch_complete": True,
+                              "schema": mx.UNIVERSE_SCHEMA}))
     with pytest.raises(SystemExit, match="사전등록"):  # 상위 100 이 아닌 유니버스
         mx.universe_tickers("A")
 
@@ -795,7 +798,9 @@ def test_universe_b_rejects_when_no_usable_delisted(
     import json
 
     few = {"eval": EVAL, "top": TOP, "delisted": ["111110"], "unavailable": []}
-    (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **few}))
+    (tmp_path / "universe.json").write_text(
+        json.dumps({"fetch_complete": True, "schema": mx.UNIVERSE_SCHEMA, **few})
+    )
     (tmp_path / "bars" / "111110.csv").write_text(
         "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
     )
@@ -819,3 +824,18 @@ def test_top_by_marcap_sorts_and_requires_marcap() -> None:
         mx.top_by_marcap(bad)
     with pytest.raises(SystemExit, match="< 100"):
         mx.top_by_marcap(rows[:50])
+
+
+# -- Codex 18차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_universe_rejects_legacy_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    assert mx.universe_tickers("A")
+    # 형식 버전 표시가 없는 이전 목록(행 순서로 뽑혔을 수 있음) → 거부
+    (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
+    with pytest.raises(SystemExit, match="--refresh-universe"):
+        mx.universe_tickers("A")
