@@ -30,6 +30,7 @@ import argparse
 import bisect
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -228,6 +229,21 @@ def b_stale_after(
     return prior
 
 
+DELISTED_MIN_KEEP = 0.5  # 재조회한 상폐 목록이 기존의 절반 미만이면 조회 이상으로 본다
+
+
+def check_delisted_list(new: list[str], previous: list[str] | None) -> list[str]:
+    """재조회한 상폐 목록 검증. 비었거나 기존 대비 급감(상폐는 누적만 늘어난다)이면 SystemExit —
+    일시 장애·컬럼 변경으로 B 가 A 와 같아져 생존편향 대조가 무의미해지는 것을 막는다."""
+    if not new:
+        raise SystemExit("상폐 목록 조회 결과가 비어 있음(일시 장애·형식 변경 의심) — 나중에 재시도")
+    if previous and len(new) < len(previous) * DELISTED_MIN_KEEP:
+        raise SystemExit(
+            f"상폐 목록이 {len(previous)} → {len(new)} 로 급감(조회 이상 의심) — 나중에 재시도"
+        )
+    return new
+
+
 def cmd_fetch(args: argparse.Namespace) -> None:
     import FinanceDataReader as fdr
 
@@ -279,7 +295,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 and "스팩" not in name and str(r.get("SecuGroup", "주권")) == "주권"
             ):
                 codes.append(code)
-        universe["delisted"] = sorted(set(codes))
+        # 비었거나 급감한 목록으로 기존 B 를 덮지 않는다 — fetch 는 미완료로 남아 후속 명령이 거부
+        universe["delisted"] = check_delisted_list(sorted(set(codes)), universe.get("delisted"))
     targets = [KS11, *universe["eval"], *universe["top"]]
     if args.delisted:
         targets += universe.get("delisted", [])
@@ -945,22 +962,29 @@ def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
 
 
 def read_preds(path: Path) -> list[Pred]:
-    """예측 CSV 읽기. 쓰기 도중 중단으로 찢어진 행(필드 누락·파싱 불가)은 건너뛴다 — 그 행의
-    블록은 질의 키가 모자라 불완전 블록으로 판정돼 재실행 시 폐기·재예측된다."""
+    """예측 CSV 읽기. 쓰기 도중 중단으로 찢어진 행은 버린다 — 그 행의 블록은 질의 키가 모자라
+    불완전 블록으로 판정돼 재실행 시 폐기·재예측된다.
+
+    - 행 종결자 없이 끝난 마지막 행은 파싱이 되더라도 버린다 (``-0.01234`` 가 ``-0.01`` 까지만
+      써져도 유효한 실수라 손상을 감지할 수 없으므로).
+    - 필드 누락·파싱 불가 행도 건너뛴다."""
     if not path.exists():
         return []
-    out: list[Pred] = []
     with path.open(newline="") as f:
-        for r in csv.DictReader(f):
-            try:
-                out.append(Pred(
-                    r["ticker"], date.fromisoformat(r["day"]), date.fromisoformat(r["block"]),
-                    float(r["p"]), float(r["base"]), int(r["n_support"]),
-                    int(r["label"]) if r["label"] != "" else None,
-                    float(r["net_ret"]) if r["net_ret"] != "" else None,
-                ))
-            except (KeyError, TypeError, ValueError):
-                continue
+        text = f.read()
+    if text and not text.endswith(("\n", "\r")):
+        text = text[: text.rfind("\n") + 1]  # 종결자 없는 마지막 행 제거
+    out: list[Pred] = []
+    for r in csv.DictReader(io.StringIO(text, newline="")):
+        try:
+            out.append(Pred(
+                r["ticker"], date.fromisoformat(r["day"]), date.fromisoformat(r["block"]),
+                float(r["p"]), float(r["base"]), int(r["n_support"]),
+                int(r["label"]) if r["label"] != "" else None,
+                float(r["net_ret"]) if r["net_ret"] != "" else None,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
     return out
 
 
@@ -999,7 +1023,10 @@ def universe_tickers(universe: str) -> list[str]:
             raise SystemExit("상폐 일봉이 --refresh 에서 빠져 B 가 혼합 스냅샷 — "
                              "`fetch --refresh --delisted` 필요")
         unavailable = set(u.get("unavailable", []))
-        tickers += [c for c in u["delisted"] if c not in unavailable]
+        usable = [c for c in u["delisted"] if c not in unavailable]
+        if not usable:  # 상폐가 하나도 없으면 B == A — 생존편향 대조가 성립하지 않는다
+            raise SystemExit("유니버스 B 에 쓸 상폐 종목이 없음 — `fetch --refresh --delisted` 필요")
+        tickers += usable
     tickers = list(dict.fromkeys(tickers))
     missing = [t for t in (KS11, *tickers) if not _has_bars(BARS_DIR / f"{t}.csv")]
     if missing:

@@ -756,3 +756,33 @@ def test_read_preds_skips_torn_rows(tmp_path: Path) -> None:
     mx._rewrite_preds(path, rows)
     mx._append_preds(path, [_pred("C", date(2016, 1, 11), date(2016, 1, 11))])
     assert [r.ticker for r in mx.read_preds(path)] == ["A", "B", "C"]
+
+
+# -- Codex 15차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_read_preds_drops_unterminated_last_row_even_if_parseable(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    mx._append_preds(path, [_pred("A", date(2016, 1, 4), date(2016, 1, 4))])
+    with path.open("a") as f:  # 마지막 필드(net_ret) 도중 끊김 — "-0.01" 은 유효한 실수로 파싱됨
+        f.write("B,2016-01-05,2016-01-04,0.5,0.5,300,1,-0.01")
+    assert [r.ticker for r in mx.read_preds(path)] == ["A"]
+
+
+def test_check_delisted_list_rejects_empty_or_collapsed() -> None:
+    prev = [f"{i:05d}0" for i in range(100)]
+    assert mx.check_delisted_list([*prev, "999990"], prev) == [*prev, "999990"]
+    with pytest.raises(SystemExit, match="비어"):
+        mx.check_delisted_list([], prev)
+    with pytest.raises(SystemExit, match="급감"):
+        mx.check_delisted_list(prev[:40], prev)
+    assert mx.check_delisted_list(["000010"], None) == ["000010"]  # 최초 조회
+
+
+def test_universe_b_rejects_when_no_usable_delisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": EVAL, "top": TOP, "delisted": ["111110"], "unavailable": ["111110"]}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    with pytest.raises(SystemExit, match="상폐 종목이 없음"):
+        mx.universe_tickers("B")
