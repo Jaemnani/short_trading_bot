@@ -919,3 +919,15 @@ def test_verify_preds_rejects_csv_that_diverged_from_marker(tmp_path: Path) -> N
     # 해시가 우연히 맞더라도(표시가 부분 CSV 로 기록된 경우) 행·블록 수로 거부
     partial = {**marker, "sha256": mx.preds_digest(path)}
     assert mx.verify_preds(path, mx.read_preds(path), partial) is not None
+
+
+# -- Codex 22차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_empty_prediction_plan_is_a_verifiable_complete_result(tmp_path: Path) -> None:
+    path = tmp_path / "p.csv"
+    mx._rewrite_preds(path, [])  # 모든 블록이 지지 부족 — 예측 행 없음
+    rows = mx.read_preds(path)
+    assert rows == [] and mx.is_complete(rows, {})
+    marker = {"rows": 0, "queries": 0, "blocks": 0, "sha256": mx.preds_digest(path)}
+    assert mx.verify_preds(path, rows, marker) is None

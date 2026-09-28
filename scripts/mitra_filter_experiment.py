@@ -1027,11 +1027,7 @@ def claim_run(path: Path, run: dict[str, Any]) -> None:
 
 
 def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
-    """완료 블록 행만으로 원자적으로 다시 쓴다 (행이 없으면 파일 삭제)."""
-    if not rows:
-        path.unlink(missing_ok=True)
-        _fsync_dir(path.parent)
-        return
+    """완료 블록 행만으로 원자적으로 다시 쓴다 (행이 없으면 헤더만 있는 파일)."""
     buf = io.StringIO(newline="")
     _write_pred_rows(buf, rows, header=True)
     write_atomic(path, buf.getvalue())
@@ -1229,6 +1225,8 @@ def cmd_predict(args: argparse.Namespace) -> None:
                 print(f"  N={n}: 블록 {count[0]} ({time.time() - t0:.0f}s)", flush=True)
 
         walk_forward(pool, queries, n, predictor, blocks, done=done, on_block=on_block)
+        if not path.exists():  # 예측할 블록이 없음(전부 지지 부족 등) — 빈 결과도 완료로 영속화
+            _rewrite_preds(path, [])
         final = read_preds(path)
         complete = is_complete(final, expected)
         write_atomic(marker_path(path), json.dumps({
