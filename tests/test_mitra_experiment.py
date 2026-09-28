@@ -561,7 +561,10 @@ def test_interrupted_refresh_must_resume_with_refresh() -> None:
     mx.check_fetch_resume({}, refresh=False, delisted=False)  # 처음
     done = {"fetch_complete": True, "fetch_mode": "refresh", "fetch_delisted": True}
     mx.check_fetch_resume(done, refresh=False, delisted=False)  # 완료된 뒤엔 자유
-    mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, False, False)
+    # 일반 fetch 가 중단·필수 실패로 미완료여도 전체 재수신(--refresh)으로만 재개 (Codex 25차)
+    with pytest.raises(SystemExit, match="--refresh"):
+        mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, False, False)
+    mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, True, False)
     interrupted = {"fetch_complete": False, "fetch_mode": "refresh", "fetch_delisted": False}
     with pytest.raises(SystemExit, match="--refresh"):
         mx.check_fetch_resume(interrupted, refresh=False, delisted=False)

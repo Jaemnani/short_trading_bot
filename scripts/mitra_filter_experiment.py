@@ -13,6 +13,7 @@
     .venv/bin/pip install finance-datareader "autogluon.tabular[mitra]==1.6.3"
     .venv/bin/python scripts/mitra_filter_experiment.py fetch                 # 유니버스 A
     .venv/bin/python scripts/mitra_filter_experiment.py fetch --delisted      # + 상폐(B), 오래 걸림
+    # 중단·필수 종목 실패로 미완료면 `--refresh`(+같은 옵션)로 전 종목을 다시 받아야 재개된다
     .venv/bin/python scripts/mitra_filter_experiment.py predict --model logit --universe A
     .venv/bin/python scripts/mitra_filter_experiment.py predict --model logit --universe B --horizons 10
     .venv/bin/python scripts/mitra_filter_experiment.py predict --model mitra --universe A
@@ -235,30 +236,35 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
 def check_fetch_resume(
     universe: dict[str, Any], refresh: bool, delisted: bool, refresh_universe: bool = False
 ) -> None:
-    """중단된 fetch 는 같은(또는 더 넓은) 범위로만 이어갈 수 있다.
+    """미완료 fetch(중단 또는 필수 종목 실패)는 같은(또는 더 넓은) 범위의 **전체 재수신**
+    (``--refresh``)으로만 이어갈 수 있다.
 
-    - ``--refresh`` 중단 → ``--refresh`` 필요 (일반 fetch 는 기존 파일을 건너뛰어 옛·새 일봉
-      혼합을 '완료'로 승인하게 된다)
+    - 모드와 무관하게 ``--refresh`` 필요: 일반 fetch 는 기존 파일을 건너뛰므로, 재개 시점이
+      다르면 나중에 받은 종목(예: 실패했던 KS11)만 최신이 되어 종료일이 섞인 스냅샷이 '완료'로
+      승인된다. 전 종목을 한 시점에 다시 받아야 한 스냅샷이 보장된다.
     - ``--delisted`` 중단 → ``--delisted`` 필요 (빠지면 상폐 일봉이 일부만 받아진 채 완료 처리)
     - ``--refresh-universe`` 중단 → ``--refresh-universe`` 필요 (빠지면 요청한 목록 갱신 없이
       옛 목록으로 완료 처리)
     """
     if universe.get("fetch_complete") is not False:
         return
-    if universe.get("fetch_mode") == "refresh" and not refresh:
-        raise SystemExit("이전 `fetch --refresh` 가 중단됨 — 같은 `--refresh` 로 다시 실행")
     if universe.get("fetch_delisted") and not delisted:
-        raise SystemExit("이전 `fetch --delisted` 가 중단됨 — 같은 `--delisted` 로 다시 실행")
+        raise SystemExit("이전 `fetch --delisted` 가 미완료 — `--refresh --delisted` 로 다시 실행")
     if universe.get("fetch_refresh_universe") and not refresh_universe:
         raise SystemExit(
-            "이전 `fetch --refresh-universe` 가 중단됨 — 같은 `--refresh-universe` 로 다시 실행"
+            "이전 `fetch --refresh-universe` 가 미완료 — 같은 `--refresh-universe` 로 다시 실행"
+        )
+    if not refresh:
+        raise SystemExit(
+            "이전 fetch 가 미완료(중단 또는 필수 종목 실패) — `--refresh` 로 전 종목을 다시 받아야 "
+            "함 (재개 시점이 달라 일봉 종료일이 섞이는 것 방지)"
         )
 
 
 def finish_fetch(universe: dict[str, Any], failed: Sequence[str]) -> list[str]:
     """fetch 종료 상태 기록. 필수 종목(지수·평가·시총 상위)이 하나라도 실패하면 **미완료**로
-    남겨 fetch_mode·범위 표시를 보존한다 — 재실행이 check_fetch_resume 에 따라 같은 범위
-    (예: ``--refresh``)로 전 종목을 다시 받게 해, 실패 종목만 나중 시점으로 채운 혼합 스냅샷이
+    남겨 범위 표시를 보존한다 — 재실행이 check_fetch_resume 에 따라 같은 범위의 ``--refresh``
+    로 전 종목을 다시 받게 해, 실패 종목만 나중 시점으로 채운 혼합 스냅샷이
     완료로 승인되지 않게 한다. 반환: 필수 실패 종목."""
     delisted = set(universe.get("delisted", []))
     required_failed = [c for c in failed if c not in delisted]
@@ -417,7 +423,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
         print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — fetch 미완료로 남김, "
-              "같은 옵션으로 재실행 전엔 predict 불가")
+              "`--refresh`(+같은 옵션)로 재실행 전엔 predict 불가")
     if args.delisted and universe["unavailable"]:
         print(f"상폐 {len(delisted)}종목 중 조회 불가 {len(universe['unavailable'])} — B 에서 제외")
 
