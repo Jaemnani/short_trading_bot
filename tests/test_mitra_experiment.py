@@ -996,7 +996,8 @@ def test_current_tickers_lagging_ks11_are_rejected(
 
 def test_delisted_baseline_survives_failed_retries() -> None:
     # 완료된 fetch: 111110·222220 정상 수신, 333330 조회 불가 → 기준 확정
-    u: dict[str, Any] = {"delisted": ["111110", "222220", "333330"], "unavailable": ["333330"]}
+    u: dict[str, Any] = {"delisted": ["111110", "222220", "333330"], "unavailable": ["333330"],
+                         "fetch_complete": True}
     assert mx.finish_fetch(u, ["333330"], mx.available_baseline(u), delisted_fetched=True) == []
     assert u["delisted_available"] == ["111110", "222220"]
     # 1차 재시도: 222220 이 일시 실패 → unavailable 에 들어가지만 fetch 는 미완료
@@ -1039,3 +1040,28 @@ def test_restored_delisted_baseline_is_stored_before_fetch_starts() -> None:
     assert u["delisted_available"] == ["111110"]  # 진행 중 표시와 함께 영속화될 값
     u["fetch_complete"] = False  # 이번 실행이 중단됨
     assert mx.available_baseline(u) == {"111110"}  # 재시도에서도 기준 유지
+
+
+# -- Codex 29차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_legacy_incomplete_delisted_cache_without_baseline_is_rejected() -> None:
+    fresh: dict[str, Any] = {"delisted": ["111110"]}  # 상폐 조회를 완료한 적 없음
+    assert mx.available_baseline(fresh) == set() and fresh["delisted_available"] == []
+    legacy = {"fetch_complete": False, "delisted": ["111110"], "unavailable": ["111110"]}
+    with pytest.raises(SystemExit, match="복원할 수 없음"):
+        mx.available_baseline(legacy)
+
+
+def test_coverage_shrunk_detects_partial_responses(tmp_path: Path) -> None:
+    path = tmp_path / "111110.csv"
+    path.write_text("date,open,high,low,close,volume\n"
+                    "2012-01-02,1,1,1,1,1\n2013-01-02,1,1,1,1,1\n2014-06-30,1,1,1,1,1\n")
+
+    def series(*days: date) -> Any:
+        z = np.ones(len(days))
+        return mx.Series("111110", list(days), z, z, z, z, z)
+
+    assert not mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2014, 6, 30)))
+    assert mx.coverage_shrunk(path, series(date(2013, 1, 2), date(2014, 6, 30)))  # 앞 잘림
+    assert mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2013, 1, 2)))  # 뒤 잘림

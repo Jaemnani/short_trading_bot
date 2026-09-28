@@ -270,11 +270,18 @@ def available_baseline(universe: dict[str, Any]) -> set[str]:
     표시와 함께 영속화하므로, 이번 실행이 중간에 끊겨도 복원한 기준이 사라지지 않는다."""
     if "delisted_available" in universe:
         return set(universe["delisted_available"])
-    if universe.get("fetch_complete") is True and "unavailable" in universe:
+    if "unavailable" not in universe:  # 상폐 조회를 완료한 적 없음 → 기준 없음(빈 기준을 명시)
+        universe["delisted_available"] = []
+        return set()
+    if universe.get("fetch_complete") is True:
         restored = set(universe.get("delisted", [])) - set(universe["unavailable"])
         universe["delisted_available"] = sorted(restored)
         return restored
-    return set()
+    # 기준 도입 전 버전에서 중단된 캐시: unavailable 이 미완료 실행으로 바뀌었을 수 있어 복원 불가
+    raise SystemExit(
+        "이전 버전에서 중단된 상폐 캐시라 가용 기준을 복원할 수 없음 — "
+        f"`{UNIVERSE_FILE}` 를 지우고 처음부터 `fetch --delisted` 로 다시 받을 것"
+    )
 
 
 def finish_fetch(
@@ -437,6 +444,14 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             if df is not None and len(df) > 0:
                 break
         series = _frame_to_series(code, df) if df is not None and len(df) > 0 else None
+        if code in prior_available and _has_bars(path) and (
+            series is None or not series.days or coverage_shrunk(path, series)
+        ):
+            # 이전에 정상 수신된 상폐 종목의 실패·부분 응답: 옛 일봉을 커버리지 기준으로 남겨 두고
+            # 필수 실패로 처리 — fetch 는 미완료라 섞인 파일이 승인되지 않고, 재시도(--refresh)가
+            # 다시 받을 때 이 기준과 대조한다.
+            failed.append(code)
+            continue
         if series is None or not series.days:  # 원본이 비었거나 정규화 후 유효 봉 0개
             failed.append(code)
             path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
@@ -1227,6 +1242,11 @@ def lagging_codes(codes: Iterable[str]) -> list[str]:
     cutoff = days[-1 - MAX_LAG_DAYS]
     return [c for c in dict.fromkeys(codes)
             if _has_bars(BARS_DIR / f"{c}.csv") and _last_day(BARS_DIR / f"{c}.csv") < cutoff]
+
+
+def coverage_shrunk(path: Path, series: Series) -> bool:
+    """새 응답이 기존 일봉보다 늦게 시작하거나 일찍 끝나는지 (앞·뒤가 잘린 부분 응답)."""
+    return series.days[0] > _first_day(path) or series.days[-1] < _last_day(path)
 
 
 MAX_START_GAP_DAYS = 14  # 달력일 — 연초 휴장(설 연휴 포함)을 넘는 시작 지연은 앞부분 잘림으로 본다
