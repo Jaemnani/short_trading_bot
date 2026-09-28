@@ -359,6 +359,33 @@ def top_by_marcap(rows: Iterable[dict[str, Any]]) -> list[str]:
 MIN_DELISTED = 100  # 2010년 이후 KOSPI·KOSDAQ 보통주 상폐의 현실적 하한 — 미만이면 조회 이상
 
 
+DELISTED_COLUMNS = ("Symbol", "Name", "Market", "DelistingDate", "SecuGroup")
+
+
+def parse_delisted(dl: Any) -> list[str]:
+    """KRX 상폐 목록에서 사전등록 표본(2010 년 이후 상폐한 KOSPI·KOSDAQ 보통주, 스팩 제외) 코드.
+
+    필요한 컬럼(특히 증권 유형 ``SecuGroup``)이 없으면 SystemExit — 기본값으로 '주권'을 가정하면
+    ETF 등 다른 증권이 상폐 보통주 표본(B)에 섞여도 목록 크기·누적성 검사를 통과한다."""
+    absent = [c for c in DELISTED_COLUMNS if c not in dl.columns]
+    if absent:
+        raise SystemExit(f"상폐 목록에 컬럼 {absent} 없음 (제공처 형식 변경 의심) — 표본 선정 불가")
+    codes: list[str] = []
+    for _, r in dl.iterrows():
+        code, name, market = str(r["Symbol"]), str(r["Name"]), str(r["Market"])
+        try:
+            when = datetime.fromisoformat(str(r["DelistingDate"])[:10]).date()
+        except ValueError:
+            continue
+        if (
+            when >= SUPPORT_START and code.endswith("0") and len(code) == 6
+            and (market == "KOSPI" or market.startswith("KOSDAQ"))
+            and "스팩" not in name and str(r["SecuGroup"]) == "주권"
+        ):
+            codes.append(code)
+    return sorted(set(codes))
+
+
 def check_delisted_list(new: list[str], previous: list[str] | None) -> list[str]:
     """재조회한 상폐 목록 검증 — 생존편향 대조군(B)이 조용히 줄어드는 것을 막는다.
 
@@ -389,7 +416,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     # 이전에 완료된 상폐 조회에서 정상 수신된 종목 — 이번에 실패하면 B 축소 대신 미완료 처리
     prior_available = available_baseline(universe)  # 이전 형식이면 복원 기준을 universe 에 기록
     # 이번 실행 전 필수였고 일봉을 받아 둔 종목 — 목록 갱신으로 상폐 쪽으로 옮겨 가도 보호한다
-    prior_mandatory = {c for c in [*universe.get("top", []), *EVAL_TICKERS]
+    # former_mandatory: 이전 목록 갱신에서 상위에서 빠진 옛 필수 종목 — 목록 갱신과 상폐 목록 갱신을
+    # 따로 실행해도(`--refresh-universe` 뒤 `--refresh --delisted`) 보호가 이어진다
+    prior_mandatory = {c for c in [*universe.get("top", []), *EVAL_TICKERS,
+                                   *universe.get("former_mandatory", [])]
                        if _has_bars(BARS_DIR / f"{c}.csv")}
     if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
         # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
@@ -417,27 +447,16 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         top = top_by_marcap(listing.to_dict("records"))
+        dropped = {c for c in universe.get("top", []) if c not in top} & prior_mandatory
+        if dropped:  # 아래 진행 표시와 함께 영속화 (새 top 과 원자적으로)
+            universe["former_mandatory"] = sorted(set(universe.get("former_mandatory", [])) | dropped)
         universe.update({"created": date.today().isoformat(), "top": top, "schema": UNIVERSE_SCHEMA})
     universe["eval"] = list(EVAL_TICKERS)
     # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회
     if args.delisted and ("delisted" not in universe or args.refresh or args.refresh_universe):
-        dl = fdr.StockListing("KRX-DELISTING")
-        codes: list[str] = []
-        for _, r in dl.iterrows():
-            code, name = str(r.get("Symbol", "")), str(r.get("Name", ""))
-            market = str(r.get("Market", ""))
-            try:
-                when = datetime.fromisoformat(str(r.get("DelistingDate"))[:10]).date()
-            except ValueError:
-                continue
-            if (
-                when >= SUPPORT_START and code.endswith("0") and len(code) == 6
-                and (market == "KOSPI" or market.startswith("KOSDAQ"))
-                and "스팩" not in name and str(r.get("SecuGroup", "주권")) == "주권"
-            ):
-                codes.append(code)
+        codes = parse_delisted(fdr.StockListing("KRX-DELISTING"))
         # 비었거나 급감한 목록으로 기존 B 를 덮지 않는다 — fetch 는 미완료로 남아 후속 명령이 거부
-        universe["delisted"] = check_delisted_list(sorted(set(codes)), universe.get("delisted"))
+        universe["delisted"] = check_delisted_list(codes, universe.get("delisted"))
     targets = [KS11, *universe["eval"], *universe["top"]]
     if args.delisted:
         targets += universe.get("delisted", [])

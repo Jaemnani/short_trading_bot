@@ -1199,3 +1199,52 @@ def test_former_top_ticker_moved_to_delisted_stays_protected(
     assert u["fetch_complete"] is False and gone in u["required_failed"]  # B 를 조용히 줄이지 않음
     assert (mx.BARS_DIR / f"{gone}.csv").exists()  # 옛 일봉 보존
     assert gone in u["delisted_available"]  # 재시도에서도 보호
+
+
+# -- Codex 32차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_parse_delisted_requires_security_type_column() -> None:
+    import pandas as pd
+
+    rows = [{"Symbol": "111110", "Name": "a", "Market": "KOSPI", "DelistingDate": "2014-07-01",
+             "SecuGroup": "주권"},
+            {"Symbol": "222220", "Name": "b", "Market": "KOSPI", "DelistingDate": "2014-07-01",
+             "SecuGroup": "ETF"}]
+    assert mx.parse_delisted(pd.DataFrame(rows)) == ["111110"]  # 실제 '주권'만
+    with pytest.raises(SystemExit, match="SecuGroup"):
+        mx.parse_delisted(pd.DataFrame(rows).drop(columns=["SecuGroup"]))
+
+
+def test_former_top_stays_protected_across_separate_universe_and_delisted_refresh(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pandas as pd
+
+    _run_fetch(fetch_env, monkeypatch, "--delisted")
+    gone = TOP[-1]
+    new_top = [f"7{i:04d}0" for i in range(3)]
+    for c in new_top:
+        fetch_env.bars[c] = (date(2010, 1, 4), date(2016, 3, 31))
+    real_listing = fetch_env.StockListing
+    delisted_now = [False]
+
+    def listing(name: str) -> Any:
+        if name == "KOSPI":
+            codes = [*new_top, *TOP[:-1]]
+            return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(codes)])
+        df = real_listing(name)
+        if not delisted_now[0]:
+            return df
+        extra = {"Symbol": gone, "Name": "x", "Market": "KOSPI", "DelistingDate": "2016-03-31",
+                 "SecuGroup": "주권"}
+        return pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
+
+    monkeypatch.setattr(fetch_env, "StockListing", listing)
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh-universe")  # 목록만 먼저 갱신
+    assert gone not in u["top"] and gone in u["former_mandatory"]
+    delisted_now[0] = True  # 그 뒤 상폐 목록에 등장
+    fetch_env.bars[gone] = None  # 일시 장애로 빈 응답
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is False and gone in u["required_failed"]
+    assert (mx.BARS_DIR / f"{gone}.csv").exists()
