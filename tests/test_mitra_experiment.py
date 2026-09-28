@@ -1552,3 +1552,26 @@ def test_late_start_uses_listing_date_for_top_tickers(
     listed = {"111110": "2016-05-30", "222220": "2008-01-02"}  # 111110 은 신규 상장(정상)
     # 222220 은 2008 상장인데 2016 부터 → 잘림, 333330 은 상장일 모름 → 검증 불가
     assert mx.late_start_codes(["111110", "222220", "333330"], listed) == ["222220", "333330"]
+
+
+# -- Codex 43차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_missing_listing_dates_are_refetched_on_retry(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_listing = fetch_env.StockListing
+    gap = [True]
+
+    def listing(name: str) -> Any:
+        df = real_listing(name)
+        if name == "KRX-DESC" and gap[0]:
+            return df[df["Code"] != TOP[9]]  # 일시적으로 한 종목 상장일 누락
+        return df
+
+    monkeypatch.setattr(fetch_env, "StockListing", listing)
+    u = _run_fetch(fetch_env, monkeypatch)
+    assert u["fetch_complete"] is False and TOP[9] in u["required_failed"]
+    gap[0] = False  # 제공처 정상화
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh")  # 목록은 그대로, 상장일만 다시 조회
+    assert u["fetch_complete"] is True and TOP[9] in u["top_listed"]

@@ -504,6 +504,14 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             universe["former_mandatory"] = sorted(set(universe.get("former_mandatory", [])) | dropped)
         universe.update({"created": date.today().isoformat(), "top": top, "schema": UNIVERSE_SCHEMA})
     universe["eval"] = list(EVAL_TICKERS)
+    # 상장일을 못 받은 상위 종목이 있으면(이전 실행의 일시 누락 등) 매 실행 다시 조회 — 목록을
+    # 다시 뽑지 않는 재시도에서도 메타데이터가 채워져야 잘림 판정이 풀린다
+    lacking = [c for c in universe["top"] if c not in universe.get("top_listed", {})]
+    if lacking:
+        universe["top_listed"] = {
+            **universe.get("top_listed", {}),
+            **parse_listing_dates(fdr.StockListing("KRX-DESC"), lacking),
+        }
     # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회
     if args.delisted and ("delisted" not in universe or args.refresh or args.refresh_universe):
         meta = parse_delisted(fdr.StockListing("KRX-DELISTING"))
