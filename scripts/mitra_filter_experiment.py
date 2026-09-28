@@ -83,7 +83,8 @@ UNIVERSE_TOP = 100  # 지지 유니버스 A = KOSPI 시총 상위 100 보통주
 # 목록, 가용 기준·옛 필수 종목 기록 없음 등)를 부분 이관하며 믿지 않는다.
 #   2: top 을 top_by_marcap(시총 필수 검증)으로 선정
 #   3: 상폐 목록 parse_delisted(증권 유형 필수), delisted_available·former_mandatory 기록
-UNIVERSE_SCHEMA = 3
+#   4: 상폐일(delisted_dates) 기록 — 최초 수신 상폐 일봉의 뒷부분 잘림 검증
+UNIVERSE_SCHEMA = 4
 STARTING_EQUITY = Decimal(10_000_000)
 BEAR_WINDOWS = (
     ("2018", date(2018, 1, 1), date(2018, 12, 31)),
@@ -373,15 +374,16 @@ MIN_DELISTED = 100  # 2010년 이후 KOSPI·KOSDAQ 보통주 상폐의 현실적
 DELISTED_COLUMNS = ("Symbol", "Name", "Market", "DelistingDate", "SecuGroup")
 
 
-def parse_delisted(dl: Any) -> list[str]:
-    """KRX 상폐 목록에서 사전등록 표본(2010 년 이후 상폐한 KOSPI·KOSDAQ 보통주, 스팩 제외) 코드.
+def parse_delisted(dl: Any) -> dict[str, str]:
+    """KRX 상폐 목록에서 사전등록 표본(2010 년 이후 상폐한 KOSPI·KOSDAQ 보통주, 스팩 제외)의
+    {코드: 상폐일(ISO)}.
 
     필요한 컬럼(특히 증권 유형 ``SecuGroup``)이 없으면 SystemExit — 기본값으로 '주권'을 가정하면
     ETF 등 다른 증권이 상폐 보통주 표본(B)에 섞여도 목록 크기·누적성 검사를 통과한다."""
     absent = [c for c in DELISTED_COLUMNS if c not in dl.columns]
     if absent:
         raise SystemExit(f"상폐 목록에 컬럼 {absent} 없음 (제공처 형식 변경 의심) — 표본 선정 불가")
-    codes: list[str] = []
+    codes: dict[str, str] = {}
     for _, r in dl.iterrows():
         code, name, market = str(r["Symbol"]), str(r["Name"]), str(r["Market"])
         try:
@@ -393,8 +395,8 @@ def parse_delisted(dl: Any) -> list[str]:
             and (market == "KOSPI" or market.startswith("KOSDAQ"))
             and "스팩" not in name and str(r["SecuGroup"]) == "주권"
         ):
-            codes.append(code)
-    return sorted(set(codes))
+            codes[code] = max(codes.get(code, ""), when.isoformat())
+    return dict(sorted(codes.items()))
 
 
 def check_delisted_list(new: list[str], previous: list[str] | None) -> list[str]:
@@ -464,9 +466,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe["eval"] = list(EVAL_TICKERS)
     # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회
     if args.delisted and ("delisted" not in universe or args.refresh or args.refresh_universe):
-        codes = parse_delisted(fdr.StockListing("KRX-DELISTING"))
+        dates = parse_delisted(fdr.StockListing("KRX-DELISTING"))
         # 비었거나 급감한 목록으로 기존 B 를 덮지 않는다 — fetch 는 미완료로 남아 후속 명령이 거부
-        universe["delisted"] = check_delisted_list(codes, universe.get("delisted"))
+        universe["delisted"] = check_delisted_list(list(dates), universe.get("delisted"))
+        universe["delisted_dates"] = {**universe.get("delisted_dates", {}), **dates}
     targets = [KS11, *universe["eval"], *universe["top"]]
     if args.delisted:
         targets += universe.get("delisted", [])
@@ -493,16 +496,21 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             if df is not None and len(df) > 0:
                 break
         series = _frame_to_series(code, df) if df is not None and len(df) > 0 else None
+        early = code in delisted_codes and ends_before_delisting(
+            df, universe.get("delisted_dates", {}).get(code))
         protected = code not in delisted_codes or code in prior_available
         if protected and _has_bars(path) and (
-            series is None or not series.days or coverage_shrunk(path, series)
+            series is None or not series.days or early or coverage_shrunk(path, series)
         ):
             # 필수 종목(지수·평가·시총 상위)이나 이전에 정상 수신된 상폐 종목의 실패·부분 응답(기존
             # 일봉보다 늦게 시작·일찍 끝남): 옛 일봉을 커버리지 기준으로 남겨 두고 필수 실패로 처리
             # — fetch 는 미완료라 섞인 파일이 승인되지 않고, 재시도(--refresh)가 이 기준과 대조한다.
             failed.append(code)
             continue
-        if series is None or not series.days:  # 원본이 비었거나 정규화 후 유효 봉 0개
+        if series is None or not series.days or early:
+            # 원본이 비었거나, 정규화 후 유효 봉 0개이거나, 상폐일보다 한참 일찍 끝난 부분 응답
+            # (처음 받는 상폐 종목은 비교할 옛 일봉이 없으므로 상폐일로 검증 — 잘린 이력으로
+            # B 를 채점하지 않고 '조회 불가'로 제외·보고)
             failed.append(code)
             path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
             continue
@@ -1289,6 +1297,22 @@ def lagging_codes(codes: Iterable[str]) -> list[str]:
     cutoff = days[-1 - MAX_LAG_DAYS]
     return [c for c in dict.fromkeys(codes)
             if _has_bars(BARS_DIR / f"{c}.csv") and _last_day(BARS_DIR / f"{c}.csv") < cutoff]
+
+
+MAX_DELIST_GAP_DAYS = 90  # 원본 응답 마지막 행(거래정지 행 포함)이 상폐일보다 이만큼 이르면 잘림
+
+
+def ends_before_delisting(df: Any, delisted_on: str | None) -> bool:
+    """상폐 종목 원본 응답이 상폐일보다 ``MAX_DELIST_GAP_DAYS`` 넘게 일찍 끝나는지.
+
+    정규화(거래량 0 제외) 전 원본의 마지막 날짜로 본다 — 상폐 전 장기 거래정지 구간은 원본에
+    거래량 0 행으로 남으므로 정상 종목을 잘림으로 오판하지 않는다. 상폐일을 모르면 판단 보류."""
+    if df is None or len(df) == 0 or not delisted_on:
+        return False
+    last = max(df.index)
+    return date(last.year, last.month, last.day) < (
+        date.fromisoformat(delisted_on) - timedelta(days=MAX_DELIST_GAP_DAYS)
+    )
 
 
 def coverage_shrunk(path: Path, series: Series) -> bool:

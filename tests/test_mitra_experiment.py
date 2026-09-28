@@ -1211,7 +1211,7 @@ def test_parse_delisted_requires_security_type_column() -> None:
              "SecuGroup": "주권"},
             {"Symbol": "222220", "Name": "b", "Market": "KOSPI", "DelistingDate": "2014-07-01",
              "SecuGroup": "ETF"}]
-    assert mx.parse_delisted(pd.DataFrame(rows)) == ["111110"]  # 실제 '주권'만
+    assert mx.parse_delisted(pd.DataFrame(rows)) == {"111110": "2014-07-01"}  # 실제 '주권'만
     with pytest.raises(SystemExit, match="SecuGroup"):
         mx.parse_delisted(pd.DataFrame(rows).drop(columns=["SecuGroup"]))
 
@@ -1284,3 +1284,18 @@ def test_interrupted_first_fetch_can_resume(
     monkeypatch.setattr(fetch_env, "StockListing", real_listing)
     u = _run_fetch(fetch_env, monkeypatch, "--refresh")  # 형식 버전 거부 없이 재개
     assert u["fetch_complete"] is True and u["schema"] == mx.UNIVERSE_SCHEMA
+
+
+# -- Codex 34차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_new_delisted_ticker_ending_long_before_delisting_is_excluded(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cut = _FakeFdr.DELISTED[4]
+    fetch_env.bars[cut] = (date(2011, 1, 3), date(2012, 1, 2))  # 상폐일(2014-07-01)보다 2년 이상 이름
+    u = _run_fetch(fetch_env, monkeypatch, "--delisted")
+    assert u["fetch_complete"] is True
+    assert cut in u["unavailable"] and cut not in u["delisted_available"]  # 잘린 이력으로 채점 안 함
+    assert not (mx.BARS_DIR / f"{cut}.csv").exists()
+    assert _FakeFdr.DELISTED[5] in u["delisted_available"]  # 정상 응답은 그대로
