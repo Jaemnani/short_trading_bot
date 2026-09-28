@@ -931,3 +931,26 @@ def test_empty_prediction_plan_is_a_verifiable_complete_result(tmp_path: Path) -
     assert rows == [] and mx.is_complete(rows, {})
     marker = {"rows": 0, "queries": 0, "blocks": 0, "sha256": mx.preds_digest(path)}
     assert mx.verify_preds(path, rows, marker) is None
+
+
+# -- Codex 23차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_required_failure_keeps_refresh_fetch_incomplete() -> None:
+    u: dict[str, Any] = {"fetch_complete": False, "fetch_mode": "refresh", "fetch_delisted": False,
+                         "delisted": ["999990"]}
+    assert mx.finish_fetch(u, [mx.KS11, "999990"]) == [mx.KS11]  # 상폐 실패는 필수 아님
+    assert u["fetch_complete"] is False
+    with pytest.raises(SystemExit, match="--refresh"):  # 옵션 없는 재실행으로 혼합 스냅샷 승인 불가
+        mx.check_fetch_resume(u, False, False)
+    assert mx.finish_fetch(u, ["999990"]) == [] and u["fetch_complete"] is True
+
+
+def test_impl_key_covers_experiment_script_source(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    script = tmp_path / "exp.py"
+    script.write_text("A = 1\n")
+    monkeypatch.setattr(mx, "SCRIPT_FILE", script)
+    before = mx.impl_key()
+    script.write_text("A = 2\n")  # 예측 구현 수정
+    assert mx.impl_key() != before

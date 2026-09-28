@@ -255,6 +255,18 @@ def check_fetch_resume(
         )
 
 
+def finish_fetch(universe: dict[str, Any], failed: Sequence[str]) -> list[str]:
+    """fetch 종료 상태 기록. 필수 종목(지수·평가·시총 상위)이 하나라도 실패하면 **미완료**로
+    남겨 fetch_mode·범위 표시를 보존한다 — 재실행이 check_fetch_resume 에 따라 같은 범위
+    (예: ``--refresh``)로 전 종목을 다시 받게 해, 실패 종목만 나중 시점으로 채운 혼합 스냅샷이
+    완료로 승인되지 않게 한다. 반환: 필수 실패 종목."""
+    delisted = set(universe.get("delisted", []))
+    required_failed = [c for c in failed if c not in delisted]
+    universe["required_failed"] = required_failed
+    universe["fetch_complete"] = not required_failed
+    return required_failed
+
+
 def b_stale_after(
     universe: dict[str, Any], refresh: bool, refresh_universe: bool, delisted: bool
 ) -> bool:
@@ -400,13 +412,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if args.delisted:  # 상폐 종목을 실제로 조회한 실행만 '조회 불가' 목록을 갱신한다
         universe["unavailable"] = sorted(c for c in delisted if not _has_bars(BARS_DIR / f"{c}.csv"))
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
-    required_failed = [c for c in failed if c not in delisted]
-    universe["required_failed"] = required_failed
-    universe["fetch_complete"] = True
+    required_failed = finish_fetch(universe, failed)
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
-        print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — 재실행 전엔 predict 불가")
+        print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — fetch 미완료로 남김, "
+              "같은 옵션으로 재실행 전엔 predict 불가")
     if args.delisted and universe["unavailable"]:
         print(f"상폐 {len(delisted)}종목 중 조회 불가 {len(universe['unavailable'])} — B 에서 제외")
 
@@ -455,6 +466,7 @@ def _watchlist_arg(value: str) -> Path | None:
 
 
 IMPL_PACKAGES = ("domain", "strategy", "market", "backtest")
+SCRIPT_FILE = Path(__file__).resolve()
 
 
 def impl_key() -> str:
@@ -470,6 +482,8 @@ def impl_key() -> str:
     for pkg in IMPL_PACKAGES:
         for path in sorted((root / pkg).rglob("*.py")):
             h.update(f"{path.relative_to(root).as_posix()}:{file_sha(path)};".encode())
+    # 이 스크립트(피처·표본·예측기·블록 계획) 자체도 — 예측 구현을 고치면 옛 결과를 재사용하지 않게
+    h.update(f"script:{file_sha(SCRIPT_FILE)};".encode())
     return h.hexdigest()[:16]
 
 
