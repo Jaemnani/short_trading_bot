@@ -85,7 +85,8 @@ UNIVERSE_TOP = 100  # 지지 유니버스 A = KOSPI 시총 상위 100 보통주
 #   3: 상폐 목록 parse_delisted(증권 유형 필수), delisted_available·former_mandatory 기록
 #   4: 상폐일 기록 — 최초 수신 상폐 일봉의 뒷부분 잘림 검증
 #   5: 상장일·상폐일(delisted_meta) 기록 — 앞부분 잘림도 검증, 상폐 조회 불가는 두 번 실패로 확정
-UNIVERSE_SCHEMA = 5
+#   6: 시총 상위 종목 상장일(top_listed) 기록 — 신규 편입 종목의 앞부분 잘림 검증
+UNIVERSE_SCHEMA = 6
 STARTING_EQUITY = Decimal(10_000_000)
 BEAR_WINDOWS = (
     ("2018", date(2018, 1, 1), date(2018, 12, 31)),
@@ -421,6 +422,22 @@ def parse_delisted(dl: Any) -> dict[str, list[str | None]]:
     return dict(sorted(codes.items()))
 
 
+def parse_listing_dates(desc: Any, codes: Sequence[str]) -> dict[str, str]:
+    """KRX 상장 종목 설명 목록에서 ``codes`` 의 {코드: 상장일(ISO)}. 읽을 수 없는 종목은 빠진다
+    (late_start_codes 가 상장일 없는 시총 상위 종목을 검증 불가 = 잘림으로 처리)."""
+    absent = [c for c in ("Code", "ListingDate") if c not in desc.columns]
+    if absent:
+        raise SystemExit(f"상장 종목 설명 목록에 컬럼 {absent} 없음 — 상장일 검증 불가")
+    wanted = set(codes)
+    out: dict[str, str] = {}
+    for _, r in desc.iterrows():
+        code = str(r["Code"])
+        listed = _iso_date(r["ListingDate"])
+        if code in wanted and listed is not None:
+            out[code] = listed
+    return dict(sorted(out.items()))
+
+
 def check_delisted_list(new: list[str], previous: list[str] | None) -> list[str]:
     """재조회한 상폐 목록 검증 — 생존편향 대조군(B)이 조용히 줄어드는 것을 막는다.
 
@@ -481,6 +498,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         top = top_by_marcap(listing.to_dict("records"))
+        universe["top_listed"] = parse_listing_dates(fdr.StockListing("KRX-DESC"), top)
         dropped = {c for c in universe.get("top", []) if c not in top} & prior_mandatory
         if dropped:  # 아래 진행 표시와 함께 영속화 (새 top 과 원자적으로)
             universe["former_mandatory"] = sorted(set(universe.get("former_mandatory", [])) | dropped)
@@ -537,13 +555,14 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             failed.append(code)
             path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
             continue
-        save_series(series, path)
         if code in failed_once:
-            # 한 번 실패했던 종목이 이번에 정상 수신 — 표시를 즉시 지우고 영속화한다. 이 실행이
-            # 중간에 끊긴 뒤 다음 실패를 '두 번째 연속 실패'로 잘못 세지 않게.
+            # 한 번 실패했던 종목이 이번에 정상 수신 — 표시를 **일봉 저장보다 먼저** 지우고
+            # 영속화한다. 두 쓰기 사이에 끊겨도 남는 상태는 '표시 없음'뿐이라, 다음 실패는 새 첫
+            # 실패(재시도 요구)로 세지고 '두 번째 연속 실패'로 잘못 확정되지 않는다(보수적 순서).
             failed_once.discard(code)
             universe["delisted_failed_once"] = sorted(failed_once)
             write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
+        save_series(series, path)
         if n % 50 == 0:
             print(f"  {n}/{len(targets)} …", flush=True)
     # 조회 불가로 인정하는 것은 상폐 종목뿐 (유니버스 B 에서 명시적으로 제외·보고). 그 외 실패는
@@ -553,7 +572,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         universe["unavailable"] = sorted(c for c in delisted if not _has_bars(BARS_DIR / f"{c}.csv"))
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     lagging = lagging_codes([*universe["eval"], *universe["top"]])
-    truncated = late_start_codes([KS11, *universe["eval"]])
+    truncated = late_start_codes([KS11, *universe["eval"], *universe["top"]],
+                                 universe.get("top_listed", {}))
     if truncated:
         print(f"⚠️ {SUPPORT_START} 부터의 이력이 앞부분에서 잘린 필수 일봉 {truncated} (잘린 응답 의심)")
     if lagging:
@@ -1299,7 +1319,7 @@ def universe_tickers(universe: str) -> list[str]:
             f"유니버스 {universe}: KS11({ks_last})보다 늦게 끝나는 일봉 {ahead[:10]} — "
             "`fetch --refresh` 로 한 시점 스냅샷을 다시 받을 것"
         )
-    truncated = late_start_codes([KS11, *u["eval"]])
+    truncated = late_start_codes([KS11, *u["eval"], *u["top"]], u.get("top_listed", {}))
     if truncated:
         raise SystemExit(
             f"유니버스 {universe}: {SUPPORT_START} 부터의 이력이 잘린 필수 일봉 {truncated} — "
@@ -1370,14 +1390,29 @@ def coverage_shrunk(path: Path, series: Series) -> bool:
 MAX_START_GAP_DAYS = 14  # 달력일 — 연초 휴장(설 연휴 포함)을 넘는 시작 지연은 앞부분 잘림으로 본다
 
 
-def late_start_codes(codes: Iterable[str]) -> list[str]:
-    """``SUPPORT_START`` 부터의 이력이 앞부분에서 잘린(첫 봉이 너무 늦은) 일봉을 가진 종목.
+def late_start_codes(codes: Iterable[str], listed: dict[str, str] | None = None) -> list[str]:
+    """이력 앞부분이 잘린(첫 봉이 기대 시작일보다 ``MAX_START_GAP_DAYS`` 넘게 늦은) 일봉의 종목.
 
-    KS11 과 평가 3종목(모두 2010 년 이전 상장)만 대상 — 시총 상위의 신규 상장 종목은 늦게
-    시작하는 게 정상이다. 잘린 응답으로 지지·평가 기간 앞부분이 조용히 빠진 채 판정하지 않게."""
-    limit = SUPPORT_START + timedelta(days=MAX_START_GAP_DAYS)
-    return [c for c in dict.fromkeys(codes)
-            if _has_bars(BARS_DIR / f"{c}.csv") and _first_day(BARS_DIR / f"{c}.csv") > limit]
+    기대 시작일 = max(상장일, SUPPORT_START). KS11·평가 3종목은 2010 년 이전 상장이라
+    SUPPORT_START, 그 밖(시총 상위)은 ``listed`` 의 상장일 — 없으면 검증 불가로 잘림 처리한다.
+    잘린 응답으로 지지·평가 기간 앞부분이 조용히 빠진 채 판정하지 않게."""
+    listed = listed or {}
+    pre2010 = {KS11, *EVAL_TICKERS}
+    out: list[str] = []
+    for c in dict.fromkeys(codes):
+        path = BARS_DIR / f"{c}.csv"
+        if not _has_bars(path):
+            continue
+        if c in pre2010:
+            start = SUPPORT_START
+        elif c in listed:
+            start = max(date.fromisoformat(listed[c]), SUPPORT_START)
+        else:
+            out.append(c)  # 상장일 모름 → 앞부분 검증 불가
+            continue
+        if _first_day(path) > start + timedelta(days=MAX_START_GAP_DAYS):
+            out.append(c)
+    return out
 
 
 def _first_day(path: Path) -> date:

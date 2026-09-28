@@ -399,7 +399,8 @@ def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
             "date,open,high,low,close,volume\n2010-01-04,1,1,1,1,1\n2016-01-04,1,1,1,1,1\n"
         )
     (tmp_path / "universe.json").write_text(
-        json.dumps({"fetch_complete": True, "schema": mx.UNIVERSE_SCHEMA, **u})
+        json.dumps({"fetch_complete": True, "schema": mx.UNIVERSE_SCHEMA,
+                    "top_listed": {c: "2005-01-03" for c in TOP}, **u})
     )
 
 
@@ -1012,10 +1013,11 @@ def test_delisted_baseline_survives_failed_retries() -> None:
 def test_prefix_truncated_mandatory_history_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    u = {"eval": EVAL, "top": TOP}
+    listed = {c: "2005-01-03" for c in TOP} | {TOP[0]: "2016-01-04"}  # TOP[0] 은 신규 상장
+    u = {"eval": EVAL, "top": TOP, "top_listed": listed}
     _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
     mx.universe_tickers("A")  # 전부 2010-01-04 부터 → 통과
-    # 신규 상장 시총 상위 종목은 늦게 시작해도 정상
+    # 신규 상장 시총 상위 종목은 (상장일 기준으로) 늦게 시작해도 정상
     (tmp_path / "bars" / f"{TOP[0]}.csv").write_text(
         "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
     )
@@ -1099,6 +1101,8 @@ class _FakeFdr:
 
         if name == "KOSPI":
             return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(TOP)])
+        if name == "KRX-DESC":
+            return pd.DataFrame([{"Code": c, "ListingDate": "2005-01-03"} for c in self.bars])
         return pd.DataFrame([{"Symbol": c, "Name": "x", "Market": "KOSDAQ",
                               "DelistingDate": "2014-07-01", "SecuGroup": "주권", "ListingDate": "2005-01-03"}
                              for c in self.DELISTED])
@@ -1514,3 +1518,37 @@ def test_g0_section_scores_only_liquid_rows(
     lines: list[str] = []
     mx.g0_section(lines, {}, "ckpt", [])
     assert any("표본 40)" in ln for ln in lines) and not any("표본 65)" in ln for ln in lines)
+
+
+# -- Codex 42차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_new_top_ticker_with_truncated_prefix_is_rejected(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pandas as pd
+
+    newcomer = "700000"
+    fetch_env.bars[newcomer] = (date(2015, 1, 2), date(2016, 3, 31))  # 2005 상장인데 2015 부터
+    real_listing = fetch_env.StockListing
+
+    def listing(name: str) -> Any:
+        if name == "KOSPI":
+            codes = [newcomer, *TOP[:-1]]
+            return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(codes)])
+        return real_listing(name)
+
+    monkeypatch.setattr(fetch_env, "StockListing", listing)
+    u = _run_fetch(fetch_env, monkeypatch)
+    assert u["fetch_complete"] is False and newcomer in u["required_failed"]
+
+
+def test_late_start_uses_listing_date_for_top_tickers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path)
+    for code, first in [("111110", "2016-06-01"), ("222220", "2016-06-01"), ("333330", "2010-01-04")]:
+        (tmp_path / f"{code}.csv").write_text(f"date,open,high,low,close,volume\n{first},1,1,1,1,1\n")
+    listed = {"111110": "2016-05-30", "222220": "2008-01-02"}  # 111110 은 신규 상장(정상)
+    # 222220 은 2008 상장인데 2016 부터 → 잘림, 333330 은 상장일 모름 → 검증 불가
+    assert mx.late_start_codes(["111110", "222220", "333330"], listed) == ["222220", "333330"]
