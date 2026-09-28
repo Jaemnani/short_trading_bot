@@ -1310,7 +1310,7 @@ def test_worst_case_fill_for_right_censored_delisted_samples() -> None:
 
     pool = [pred("A", 0.7, 1, 0.05), pred("A", 0.3, 0, -0.02)]
     censored = [pred("D", 0.8, None, None), pred("D", 0.2, None, None)]
-    filled = mx.worst_case_fill(pool, censored)
+    filled = mx.censored_fill(pool, censored, adverse=True)
     kept, removed = filled[2], filled[3]
     assert (kept.label, kept.net_ret) == (0, -1.0)  # 통과 신호 → 상폐 전액 손실
     # 걸러진 신호 → 관측 최대(0.05)도 1.3^N 도 아닌 +inf — 정리매매는 가격제한폭이 없음 (Codex 37차)
@@ -1358,6 +1358,46 @@ def test_worst_case_holds_when_all_censored_samples_were_kept() -> None:
         return mx.Pred("A", date(2016, 3, 2), date(2016, 3, 2), p, 0.5, 400, label, ret)
 
     pool = [pred(0.9, 1, 0.10), pred(0.8, 1, 0.08), pred(0.2, 0, -0.30), pred(0.1, 0, -0.40)]
-    d = mx.discrimination(mx.worst_case_fill(pool, [pred(0.7, None, None)]))
+    d = mx.discrimination(mx.censored_fill(pool, [pred(0.7, None, None)], adverse=True))
     assert d.removed_mean < d.kept_mean  # 검열 표본이 통과 쪽뿐이면 -100% 로도 판정 가능
     assert mx._fmt(math.inf) == "+inf" and mx._fmt(math.nan) == "n/a"
+
+
+# -- Codex 38차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_censored_best_case_fill_mirrors_worst_case() -> None:
+    def pred(p: float) -> Any:
+        return mx.Pred("D", date(2016, 3, 2), date(2016, 3, 2), p, 0.5, 400, None, None)
+
+    kept, removed = mx.censored_fill([], [pred(0.8), pred(0.2)], adverse=False)
+    assert (kept.label, kept.net_ret) == (1, math.inf)
+    assert (removed.label, removed.net_ret) == (0, -1.0)
+
+
+def test_g0_b_nominal_fail_that_censoring_could_reverse_is_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
+    (tmp_path / "universe.json").write_text(json.dumps({"delisted": ["800000"]}))
+    monkeypatch.setattr(mx, "unavailable_note", lambda: "상폐 1종목")
+    rng = np.random.default_rng(1)
+    preds = []
+    for i in range(360):  # 판별력은 있지만 제외 평균이 통과 평균보다 살짝 높음 → 명목 실패
+        p = float(rng.uniform())
+        y = int(rng.uniform() < p)
+        ret = (0.03 if y else -0.03) + (0.035 if p < 0.5 else 0.0)
+        preds.append(mx.Pred("A", date(2017, 1, 2) + timedelta(days=i), date(2017, 1, 2), p, 0.5,
+                             400, y, ret))
+    censored = [mx.Pred("800000", date(2018, 1, 2), date(2018, 1, 2), 0.2, 0.5, 400, None, None)]
+
+    def fake(model: str, universe: str, n: int, template: Any, ckpt: Any) -> Any:
+        return ([*preds, *censored] if universe == "B" else preds), "ok"
+
+    monkeypatch.setattr(mx, "load_complete_preds", fake)
+    missing: list[str] = []
+    mx.g0_section([], {}, "ckpt", missing)
+    # 걸러진 검열 표본 하나가 -100% 면 제외 평균이 내려가 통과할 수 있음 → 기각 확정이 아니라 판정 불가
+    assert any("우측 검열" in m for m in missing)

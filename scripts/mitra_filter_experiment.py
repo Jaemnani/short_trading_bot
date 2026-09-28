@@ -1767,14 +1767,22 @@ def g0_section(
         censored = censored_delisted(mitra) if universe == "B" else []
         if censored:
             # 상폐 직전 N봉 안의 셋업은 t+N 종가가 없어 라벨이 없다(우측 검열). 사전등록 라벨
-            # 정의를 바꾸지 않고, 가장 불리한 결과로 채워도 판정이 유지되는지만 본다.
-            lines.append(f"  - 상폐 직전 우측 검열 표본 {len(censored)}개 — 최악 가정(통과 → "
-                         "-100%·라벨 0, 제외 → +inf·라벨 1 — 정리매매는 가격제한폭이 없어 유한 상한 없음)으로 재채점:")
-            worst = _g0_checks([], universe, n, worst_case_fill(pool, censored), dl)
-            lines.append(f"    - 최악 가정에서도 {'유지 ✓' if worst else '뒤집힘 ✗'}")
-            if passed and not worst:
-                missing.append(f"유니버스 B: 상폐 직전 우측 검열 표본 {len(censored)}개가 G0 ④ 를 "
-                               "뒤집을 수 있음 (라벨 규칙은 사전등록 밖 — 새 가설로만 재론)")
+            # 정의를 바꾸지 않고, 검열 표본을 양쪽 극단으로 채운 두 경계로만 판정한다:
+            # 최악에서도 통과 → 통과 확정, 최선에서도 실패 → 실패 확정, 그 사이 → 판정 불가.
+            lines.append(f"  - 상폐 직전 우측 검열 표본 {len(censored)}개 — 라벨 없음, 양 극단으로 "
+                         "채워 재채점 (수익 범위 -100%~+inf — 정리매매는 가격제한폭이 없음):")
+            worst = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=True), dl)
+            best = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=False), dl)
+            lines.append(f"    - 최악 가정 {'통과 ✓' if worst else '실패 ✗'} · "
+                         f"최선 가정 {'통과 ✓' if best else '실패 ✗'}")
+            if worst:
+                passed = True
+            elif not best:
+                passed = False
+            else:
+                passed = False
+                missing.append(f"유니버스 B: 상폐 직전 우측 검열 표본 {len(censored)}개의 결과에 따라 "
+                               "G0 ④ 가 달라짐 (라벨 규칙은 사전등록 밖 — 새 가설로만 재론)")
         ok = ok and passed
     return ok
 
@@ -1817,16 +1825,20 @@ def censored_delisted(preds: Sequence[Pred]) -> list[Pred]:
     return [p for p in preds if p.label is None and p.ticker in delisted]
 
 
-def worst_case_fill(pool: Sequence[Pred], censored: Sequence[Pred]) -> list[Pred]:
-    """검열 표본을 게이트에 가장 불리하게 채운다: 통과(유지)된 신호는 상폐로 전액 손실(라벨 0,
-    -100% — 증명 가능한 하한), 걸러진 신호는 수익 +∞(라벨 1).
+def censored_fill(
+    pool: Sequence[Pred], censored: Sequence[Pred], *, adverse: bool
+) -> list[Pred]:
+    """검열 표본을 게이트에 가장 불리하게(``adverse``) 또는 가장 유리하게 채운다.
 
-    상한을 +∞ 로 두는 이유: 상폐 직전 정리매매 기간에는 가격제한폭이 없어 증명 가능한 유한
-    상한이 없다(관측 최대값·1.3^N 모두 상한이 아님). 따라서 걸러진 검열 표본이 하나라도 있으면
-    ③ 이 최악 가정에서 뒤집혀 B 는 판정 불가가 되고, 검열 표본이 전부 통과 쪽일 때만 판정한다."""
-    best = math.inf
-    filled = [replace(p, label=0, net_ret=-1.0) if keep(p, 0.0)
-              else replace(p, label=1, net_ret=best) for p in censored]
+    수익 범위는 증명 가능한 경계 [-100%, +∞] — 하한은 전액 손실, 상한은 상폐 직전 정리매매에
+    가격제한폭이 없어 유한값이 없다(관측 최대값·1.3^N 모두 상한이 아님).
+    - 불리: 통과(유지) 신호 → -100%·라벨 0, 걸러진 신호 → +∞·라벨 1
+    - 유리: 통과 신호 → +∞·라벨 1, 걸러진 신호 → -100%·라벨 0"""
+    good, bad = (1, math.inf), (0, -1.0)
+    filled = []
+    for p in censored:
+        label, ret = (bad if adverse else good) if keep(p, 0.0) else (good if adverse else bad)
+        filled.append(replace(p, label=label, net_ret=ret))
     return [*pool, *filled]
 
 
