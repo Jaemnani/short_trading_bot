@@ -261,8 +261,22 @@ def check_fetch_resume(
         )
 
 
+def available_baseline(universe: dict[str, Any]) -> set[str]:
+    """마지막으로 **완료된** 상폐 조회에서 정상 수신된 상폐 종목(``delisted_available``).
+
+    미완료 실행이 바꾼 ``unavailable`` 로 다시 계산하지 않는다 — 실패한 재시도가 기준을 깎아
+    두 번째 실패 때 B 가 조용히 줄어드는 것을 막는다. 기준이 없던 이전 형식은 완료 상태일
+    때만 ``delisted - unavailable`` 로 복원한다."""
+    if "delisted_available" in universe:
+        return set(universe["delisted_available"])
+    if universe.get("fetch_complete") is True and "unavailable" in universe:
+        return set(universe.get("delisted", [])) - set(universe["unavailable"])
+    return set()
+
+
 def finish_fetch(
-    universe: dict[str, Any], failed: Sequence[str], prior_available: Iterable[str] = ()
+    universe: dict[str, Any], failed: Sequence[str], prior_available: Iterable[str] = (),
+    delisted_fetched: bool = False,
 ) -> list[str]:
     """fetch 종료 상태 기록. 필수 실패가 하나라도 있으면 **미완료**로 남겨 범위 표시를 보존한다
     — 재실행이 check_fetch_resume 에 따라 같은 범위의 ``--refresh`` 로 전 종목을 다시 받게 해,
@@ -270,12 +284,19 @@ def finish_fetch(
 
     필수 실패 = 지수·평가·시총 상위 종목의 실패 + ``prior_available``(이전 완료 fetch 에서
     정상 수신된 상폐 종목)의 새 실패. 일시 장애로 B 가 조용히 줄지 않게 한다 — '조회 불가'로
-    인정하는 건 처음부터 받을 수 없던 상폐 종목뿐. 반환: 필수 실패 종목."""
+    인정하는 건 처음부터 받을 수 없던 상폐 종목뿐.
+
+    완료되고 상폐 종목을 실제로 조회한 실행만 기준(``delisted_available``)을 갱신한다 — 미완료
+    실행은 기준을 그대로 둬 재시도에서도 보호가 유지된다. 반환: 필수 실패 종목."""
     delisted = set(universe.get("delisted", []))
     keep = set(prior_available)
     required_failed = [c for c in dict.fromkeys(failed) if c not in delisted or c in keep]
     universe["required_failed"] = required_failed
     universe["fetch_complete"] = not required_failed
+    if keep:
+        universe["delisted_available"] = sorted(keep)  # 기준 보존 (이전 형식에서 복원한 경우 포함)
+    if universe["fetch_complete"] and delisted_fetched:
+        universe["delisted_available"] = sorted(delisted - set(universe.get("unavailable", [])))
     return required_failed
 
 
@@ -351,10 +372,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
     # 이전에 완료된 상폐 조회에서 정상 수신된 종목 — 이번에 실패하면 B 축소 대신 미완료 처리
-    prior_available = (
-        set(universe.get("delisted", [])) - set(universe.get("unavailable", []))
-        if "unavailable" in universe else set()
-    )
+    prior_available = available_baseline(universe)
     if "top" in universe and universe.get("schema") != UNIVERSE_SCHEMA and not args.refresh_universe:
         # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
         print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
@@ -430,9 +448,13 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         universe["unavailable"] = sorted(c for c in delisted if not _has_bars(BARS_DIR / f"{c}.csv"))
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     lagging = lagging_codes([*universe["eval"], *universe["top"]])
+    truncated = late_start_codes([KS11, *universe["eval"]])
+    if truncated:
+        print(f"⚠️ {SUPPORT_START} 부터의 이력이 앞부분에서 잘린 필수 일봉 {truncated} (잘린 응답 의심)")
     if lagging:
         print(f"⚠️ KS11 보다 {MAX_LAG_DAYS}거래일 넘게 뒤처진 현행 종목 {lagging[:10]} (잘린 응답 의심)")
-    required_failed = finish_fetch(universe, [*failed, *lagging], prior_available)
+    required_failed = finish_fetch(universe, [*failed, *lagging, *truncated], prior_available,
+                                   delisted_fetched=bool(args.delisted))
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
@@ -1170,6 +1192,12 @@ def universe_tickers(universe: str) -> list[str]:
             f"유니버스 {universe}: KS11({ks_last})보다 늦게 끝나는 일봉 {ahead[:10]} — "
             "`fetch --refresh` 로 한 시점 스냅샷을 다시 받을 것"
         )
+    truncated = late_start_codes([KS11, *u["eval"]])
+    if truncated:
+        raise SystemExit(
+            f"유니버스 {universe}: {SUPPORT_START} 부터의 이력이 잘린 필수 일봉 {truncated} — "
+            "`fetch --refresh` 필요"
+        )
     behind = lagging_codes([*u["eval"], *u["top"]])
     if behind:
         raise SystemExit(
@@ -1196,6 +1224,25 @@ def lagging_codes(codes: Iterable[str]) -> list[str]:
     cutoff = days[-1 - MAX_LAG_DAYS]
     return [c for c in dict.fromkeys(codes)
             if _has_bars(BARS_DIR / f"{c}.csv") and _last_day(BARS_DIR / f"{c}.csv") < cutoff]
+
+
+MAX_START_GAP_DAYS = 14  # 달력일 — 연초 휴장(설 연휴 포함)을 넘는 시작 지연은 앞부분 잘림으로 본다
+
+
+def late_start_codes(codes: Iterable[str]) -> list[str]:
+    """``SUPPORT_START`` 부터의 이력이 앞부분에서 잘린(첫 봉이 너무 늦은) 일봉을 가진 종목.
+
+    KS11 과 평가 3종목(모두 2010 년 이전 상장)만 대상 — 시총 상위의 신규 상장 종목은 늦게
+    시작하는 게 정상이다. 잘린 응답으로 지지·평가 기간 앞부분이 조용히 빠진 채 판정하지 않게."""
+    limit = SUPPORT_START + timedelta(days=MAX_START_GAP_DAYS)
+    return [c for c in dict.fromkeys(codes)
+            if _has_bars(BARS_DIR / f"{c}.csv") and _first_day(BARS_DIR / f"{c}.csv") > limit]
+
+
+def _first_day(path: Path) -> date:
+    with path.open() as f:
+        next(f)  # 헤더
+        return date.fromisoformat(next(f).split(",")[0])
 
 
 def _last_day(path: Path) -> date:

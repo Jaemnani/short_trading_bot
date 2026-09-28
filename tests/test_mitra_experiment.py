@@ -396,7 +396,7 @@ def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
     (tmp_path / "bars").mkdir()
     for t in bars:
         (tmp_path / "bars" / f"{t}.csv").write_text(
-            "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
+            "date,open,high,low,close,volume\n2010-01-04,1,1,1,1,1\n2016-01-04,1,1,1,1,1\n"
         )
     (tmp_path / "universe.json").write_text(
         json.dumps({"fetch_complete": True, "schema": mx.UNIVERSE_SCHEMA, **u})
@@ -981,11 +981,48 @@ def test_current_tickers_lagging_ks11_are_rejected(
     _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
     days = [date(2016, 1, 4) + timedelta(days=i) for i in range(10)]
     rows = "".join(f"{d.isoformat()},1,1,1,1,1\n" for d in days)
-    header = "date,open,high,low,close,volume\n"
+    header = "date,open,high,low,close,volume\n2010-01-04,1,1,1,1,1\n"
     for t in ["KS11", *EVAL, *TOP]:
         (tmp_path / "bars" / f"{t}.csv").write_text(header + rows)
     mx.universe_tickers("A")  # 전부 최신 → 통과
     (tmp_path / "bars" / f"{TOP[3]}.csv").write_text(header + rows.splitlines(True)[0])
     assert mx.lagging_codes([*EVAL, *TOP]) == [TOP[3]]  # 중간에서 잘린 응답
     with pytest.raises(SystemExit, match=TOP[3]):
+        mx.universe_tickers("A")
+
+
+# -- Codex 27차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_delisted_baseline_survives_failed_retries() -> None:
+    # 완료된 fetch: 111110·222220 정상 수신, 333330 조회 불가 → 기준 확정
+    u: dict[str, Any] = {"delisted": ["111110", "222220", "333330"], "unavailable": ["333330"]}
+    assert mx.finish_fetch(u, ["333330"], mx.available_baseline(u), delisted_fetched=True) == []
+    assert u["delisted_available"] == ["111110", "222220"]
+    # 1차 재시도: 222220 이 일시 실패 → unavailable 에 들어가지만 fetch 는 미완료
+    u["unavailable"] = ["222220", "333330"]
+    assert mx.finish_fetch(u, ["222220", "333330"], mx.available_baseline(u), True) == ["222220"]
+    # 2차 재시도: 기준은 미완료 실행이 바꾼 unavailable 로 깎이지 않는다 → 여전히 필수 실패
+    assert mx.available_baseline(u) == {"111110", "222220"}
+    assert mx.finish_fetch(u, ["222220", "333330"], mx.available_baseline(u), True) == ["222220"]
+    assert u["fetch_complete"] is False
+
+
+def test_prefix_truncated_mandatory_history_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    mx.universe_tickers("A")  # 전부 2010-01-04 부터 → 통과
+    # 신규 상장 시총 상위 종목은 늦게 시작해도 정상
+    (tmp_path / "bars" / f"{TOP[0]}.csv").write_text(
+        "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
+    )
+    mx.universe_tickers("A")
+    # 평가 종목이 2017 부터만 온 응답 → 앞부분 잘림
+    (tmp_path / "bars" / f"{EVAL[1]}.csv").write_text(
+        "date,open,high,low,close,volume\n2015-06-01,1,1,1,1,1\n2016-01-04,1,1,1,1,1\n"
+    )
+    assert mx.late_start_codes(["KS11", *EVAL]) == [EVAL[1]]
+    with pytest.raises(SystemExit, match=EVAL[1]):
         mx.universe_tickers("A")
