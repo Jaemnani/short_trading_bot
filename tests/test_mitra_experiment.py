@@ -839,3 +839,22 @@ def test_universe_rejects_legacy_schema(tmp_path: Path, monkeypatch: pytest.Monk
     (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
     with pytest.raises(SystemExit, match="--refresh-universe"):
         mx.universe_tickers("A")
+
+
+# -- Codex 19차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_write_atomic_keeps_previous_file_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "universe.json"
+    mx.write_atomic(path, '{"top": ["000010"]}')
+    assert path.read_text() == '{"top": ["000010"]}'
+
+    def boom(*_a: Any) -> None:
+        raise OSError("power loss")
+
+    monkeypatch.setattr(mx.os, "replace", boom)  # 교체 직전 중단
+    with pytest.raises(OSError):
+        mx.write_atomic(path, '{"top": [')
+    assert path.read_text() == '{"top": ["000010"]}'  # 잘린 JSON 이 남지 않음

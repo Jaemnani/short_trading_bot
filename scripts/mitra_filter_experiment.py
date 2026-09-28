@@ -149,6 +149,18 @@ class Series:
         return out
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """임시 파일에 다 쓴 뒤 교체(원자적). 중단·전원 차단에도 기존 파일이 잘린 채 남지 않는다 —
+    universe.json 등 재개 상태·메타데이터가 깨져 재개 자체가 불가능해지는 것을 막는다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_series(s: Series, path: Path) -> None:
     """임시 파일에 다 쓴 뒤 교체(원자적) — 중단돼도 잘린 CSV 가 정상 파일로 남지 않는다."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +316,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe["fetch_delisted"] = bool(args.delisted)
     universe["fetch_refresh_universe"] = bool(args.refresh_universe)
     ROOT.mkdir(parents=True, exist_ok=True)
-    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
+    write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         top = top_by_marcap(listing.to_dict("records"))
@@ -333,7 +345,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if args.delisted:
         targets += universe.get("delisted", [])
     universe["b_stale"] = b_stale_after(universe, args.refresh, args.refresh_universe, args.delisted)
-    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
+    write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
         path = BARS_DIR / f"{code}.csv"
@@ -360,11 +372,11 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     delisted = set(universe.get("delisted", []))
     if args.delisted:  # 상폐 종목을 실제로 조회한 실행만 '조회 불가' 목록을 갱신한다
         universe["unavailable"] = sorted(c for c in delisted if not _has_bars(BARS_DIR / f"{c}.csv"))
-    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
+    write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     required_failed = [c for c in failed if c not in delisted]
     universe["required_failed"] = required_failed
     universe["fetch_complete"] = True
-    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
+    write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
         print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — 재실행 전엔 predict 불가")
@@ -662,7 +674,7 @@ def _build_one(job: tuple[str, str, str, dict[str, Any]]) -> tuple[str, int]:
     ]
     payload = {"bars_sha": file_sha(Path(bars_path)), "ks_sha": file_sha(BARS_DIR / f"{KS11}.csv"),
                "rows": rows}
-    _samples_path(Path(cache_dir), ticker).write_text(json.dumps(payload))
+    write_atomic(_samples_path(Path(cache_dir), ticker), json.dumps(payload))
     return ticker, len(rows)
 
 
@@ -984,7 +996,7 @@ def claim_run(path: Path, run: dict[str, Any]) -> None:
     if path.exists():
         raise SystemExit(f"{path.name}: 실행 경로 기록 없는 예측 파일 — 지우고 다시 실행")
     path.parent.mkdir(parents=True, exist_ok=True)
-    rp.write_text(json.dumps(run))
+    write_atomic(rp, json.dumps(run))
 
 
 def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
@@ -1172,7 +1184,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
         walk_forward(pool, queries, n, predictor, blocks, done=done, on_block=on_block)
         final = read_preds(path)
         complete = is_complete(final, expected)
-        marker_path(path).write_text(json.dumps({
+        write_atomic(marker_path(path), json.dumps({
             "fingerprint": fp, "complete": complete, "blocks": len(expected),
             "queries": sum(len(v) for v in expected.values()), "rows": len(final), "run": run,
         }))
@@ -1512,7 +1524,7 @@ def final_verdict(missing: Sequence[str], g0: bool, g1_center: bool, g2: bool, g
 def _write_report(lines: list[str]) -> None:
     report = "\n".join(lines) + "\n"
     ROOT.mkdir(parents=True, exist_ok=True)
-    (ROOT / "report.md").write_text(report, encoding="utf-8")
+    write_atomic(ROOT / "report.md", report)
     print(report)
 
 
@@ -1653,7 +1665,7 @@ def cmd_latency(args: argparse.Namespace) -> None:
             "support": MAX_SUPPORT,
             "features": len(FEATURES)}
     ROOT.mkdir(parents=True, exist_ok=True)
-    (ROOT / "latency.json").write_text(json.dumps(info))
+    write_atomic(ROOT / "latency.json", json.dumps(info))
     print(info)
 
 
