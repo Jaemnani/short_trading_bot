@@ -634,3 +634,33 @@ def test_checkpoint_id_tracks_inference_implementation(
     old = mx.resolve_checkpoint(str(ckpt))[1]
     monkeypatch.setattr(mx, "mitra_impl", lambda: "autogluon.tabular=1.7.0,torch=2.13.0")
     assert mx.resolve_checkpoint(str(ckpt))[1] != old  # 같은 가중치, 다른 AutoGluon
+
+
+# -- Codex 11차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_save_series_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "005930.csv"
+    mx.save_series(_series("005930", 30, 1), path)
+    good = path.read_text()
+
+    def boom(*_a: Any) -> None:
+        raise OSError("boom")
+
+    # 쓰기 완료 전 실패 → 기존 파일 그대로, 잘린 파일이 정상 경로에 남지 않음
+    monkeypatch.setattr(mx.os, "replace", boom)
+    with pytest.raises(OSError):
+        mx.save_series(_series("005930", 60, 2), path)
+    assert path.read_text() == good
+
+
+def test_impl_key_is_part_of_cache_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path)
+    (tmp_path / "KS11.csv").write_text("a\n")
+    th = mx.template_hash(TEMPLATE)
+    fp = mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None)
+    monkeypatch.setattr(mx, "impl_key", lambda: "changed-strategy-code")
+    assert mx.template_hash(TEMPLATE) != th
+    assert mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None) != fp

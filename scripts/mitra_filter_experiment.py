@@ -32,6 +32,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -145,12 +146,15 @@ class Series:
 
 
 def save_series(s: Series, path: Path) -> None:
+    """임시 파일에 다 쓴 뒤 교체(원자적) — 중단돼도 잘린 CSV 가 정상 파일로 남지 않는다."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["date", "open", "high", "low", "close", "volume"])
         for i, d in enumerate(s.days):
             w.writerow([d.isoformat(), s.open[i], s.high[i], s.low[i], s.close[i], s.volume[i]])
+    os.replace(tmp, path)
 
 
 def load_series(ticker: str, path: Path) -> Series:
@@ -221,7 +225,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 break
         universe.update({"created": date.today().isoformat(), "top": top})
     universe["eval"] = list(EVAL_TICKERS)
-    if args.delisted and "delisted" not in universe:
+    # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회
+    if args.delisted and ("delisted" not in universe or args.refresh or args.refresh_universe):
         dl = fdr.StockListing("KRX-DELISTING")
         codes: list[str] = []
         for _, r in dl.iterrows():
@@ -334,6 +339,23 @@ def _watchlist_arg(value: str) -> Path | None:
     return None if value.lower() == "none" else Path(value)
 
 
+def impl_key() -> str:
+    """표본(셋업 판정·지표)·라벨(비용)을 만드는 봇 본체 구현의 소스 해시.
+
+    FEATURE_VERSION 은 이 스크립트의 피처 코드만 대변하므로, 본체 전략·지표 코드가 바뀌면
+    이 키로 표본·예측 캐시를 무효화한다 (G1 백테스트는 항상 현재 구현으로 돈다)."""
+    import short_trading_bot.backtest.costs as costs_mod
+    import short_trading_bot.market.indicators as ind_mod
+    import short_trading_bot.strategy.algorithms.pullback_daily as pb_mod
+    import short_trading_bot.strategy.base as base_mod
+
+    h = hashlib.sha1()
+    for mod in (pb_mod, base_mod, ind_mod, costs_mod):
+        assert mod.__file__ is not None
+        h.update(f"{mod.__name__}:{file_sha(Path(mod.__file__))};".encode())
+    return h.hexdigest()[:16]
+
+
 def cost_key() -> list[float]:
     """라벨(순수익)과 백테스트가 같이 쓰는 비용 모델 파라미터 — 캐시 키에 들어간다."""
     c = CostModel()
@@ -343,7 +365,7 @@ def cost_key() -> list[float]:
 def template_hash(template: dict[str, Any]) -> str:
     blob = json.dumps(
         {"t": template, "fv": FEATURE_VERSION, "h": HORIZONS, "liq": MIN_AVG_VALUE,
-         "cost": cost_key()},
+         "cost": cost_key(), "impl": impl_key()},
         sort_keys=True,
     )
     return hashlib.sha1(blob.encode()).hexdigest()[:10]
@@ -411,6 +433,7 @@ def experiment_fingerprint(
         "fixed": [EVAL_START.isoformat(), SUPPORT_START.isoformat(), REFRESH_DAYS, MAX_SUPPORT,
                   MIN_SUPPORT, MIN_CLASS, MIN_AVG_VALUE, list(EVAL_TICKERS), UNIVERSE_TOP],
         "cost": cost_key(),
+        "impl": impl_key(),
     }
     return hashlib.sha1(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:12]
 
