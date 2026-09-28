@@ -234,7 +234,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
         path = BARS_DIR / f"{code}.csv"
-        if path.exists() and not args.refresh:
+        if _has_bars(path) and not args.refresh:  # 헤더만 남은 파일은 다시 받는다
             continue
         df = None
         for symbol in (code, f"KRX-DELISTING:{code}"):
@@ -244,11 +244,12 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 df = None
             if df is not None and len(df) > 0:
                 break
-        if df is None or len(df) == 0:
+        series = _frame_to_series(code, df) if df is not None and len(df) > 0 else None
+        if series is None or not series.days:  # 원본이 비었거나 정규화 후 유효 봉 0개
             failed.append(code)
             path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
             continue
-        save_series(_frame_to_series(code, df), path)
+        save_series(series, path)
         if n % 50 == 0:
             print(f"  {n}/{len(targets)} …", flush=True)
     # 조회 불가로 인정하는 것은 상폐 종목뿐 (유니버스 B 에서 명시적으로 제외·보고). 그 외 실패는
@@ -312,9 +313,17 @@ def _watchlist_arg(value: str) -> Path | None:
     return None if value.lower() == "none" else Path(value)
 
 
+def cost_key() -> list[float]:
+    """라벨(순수익)과 백테스트가 같이 쓰는 비용 모델 파라미터 — 캐시 키에 들어간다."""
+    c = CostModel()
+    return [c.fee_bps, c.sell_tax_bps, c.slippage_bps]
+
+
 def template_hash(template: dict[str, Any]) -> str:
     blob = json.dumps(
-        {"t": template, "fv": FEATURE_VERSION, "h": HORIZONS, "liq": MIN_AVG_VALUE}, sort_keys=True
+        {"t": template, "fv": FEATURE_VERSION, "h": HORIZONS, "liq": MIN_AVG_VALUE,
+         "cost": cost_key()},
+        sort_keys=True,
     )
     return hashlib.sha1(blob.encode()).hexdigest()[:10]
 
@@ -334,7 +343,8 @@ def experiment_fingerprint(
         "model": model, "universe": universe, "tickers": list(tickers), "template": template,
         "fv": FEATURE_VERSION, "hf_model": hf_model if model == "mitra" else None, "bars": bars,
         "fixed": [EVAL_START.isoformat(), SUPPORT_START.isoformat(), REFRESH_DAYS, MAX_SUPPORT,
-                  MIN_SUPPORT, MIN_CLASS, MIN_AVG_VALUE, list(EVAL_TICKERS)],
+                  MIN_SUPPORT, MIN_CLASS, MIN_AVG_VALUE, list(EVAL_TICKERS), UNIVERSE_TOP],
+        "cost": cost_key(),
     }
     return hashlib.sha1(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -865,12 +875,20 @@ def universe_tickers(universe: str) -> list[str]:
         unavailable = set(u.get("unavailable", []))
         tickers += [c for c in u["delisted"] if c not in unavailable]
     tickers = list(dict.fromkeys(tickers))
-    missing = [t for t in (KS11, *tickers) if not (BARS_DIR / f"{t}.csv").exists()]
+    missing = [t for t in (KS11, *tickers) if not _has_bars(BARS_DIR / f"{t}.csv")]
     if missing:
         raise SystemExit(
             f"유니버스 {universe}: 일봉 없는 종목 {len(missing)}개 {missing[:10]} — fetch 재실행 필요"
         )
     return tickers
+
+
+def _has_bars(path: Path) -> bool:
+    """헤더만 있는 CSV 는 일봉 없음으로 본다."""
+    if not path.exists():
+        return False
+    with path.open() as f:
+        return sum(1 for _ in zip(range(2), f, strict=False)) >= 2
 
 
 def unavailable_note() -> str:

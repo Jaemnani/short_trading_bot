@@ -394,7 +394,9 @@ def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
     monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
     (tmp_path / "bars").mkdir()
     for t in bars:
-        (tmp_path / "bars" / f"{t}.csv").write_text("date,open,high,low,close,volume\n")
+        (tmp_path / "bars" / f"{t}.csv").write_text(
+            "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
+        )
     (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
 
 
@@ -516,3 +518,29 @@ def test_claim_run_pins_execution_path(tmp_path: Path) -> None:
     orphan.write_text("ticker\n")
     with pytest.raises(SystemExit, match="기록 없는"):
         mx.claim_run(orphan, cpu_fast)
+
+
+# -- Codex 6차 리뷰 반영 ----------------------------------------------------------------
+
+
+def test_header_only_bars_count_as_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    (tmp_path / "bars" / f"{EVAL[1]}.csv").write_text("date,open,high,low,close,volume\n")
+    with pytest.raises(SystemExit, match=EVAL[1]):  # 헤더만 있는 CSV → 조용히 빠지지 않고 중단
+        mx.universe_tickers("A")
+
+
+def test_cost_model_is_part_of_cache_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path)
+    (tmp_path / "KS11.csv").write_text("a\n")
+    th = mx.template_hash(TEMPLATE)
+    fp = mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None)
+    real = mx.CostModel
+    monkeypatch.setattr(mx, "CostModel", lambda: replace(real(), sell_tax_bps=15.0))
+    assert mx.template_hash(TEMPLATE) != th
+    assert mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None) != fp
