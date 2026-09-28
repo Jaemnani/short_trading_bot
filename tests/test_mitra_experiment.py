@@ -461,12 +461,13 @@ def test_sample_cache_invalidated_by_ks11_change(
 
 def test_latency_must_match_evaluation_config() -> None:
     run = {"device": "cpu", "fast": True}
-    lat = {"seconds": 10.0, "hf_model": "m2", "support": mx.MAX_SUPPORT,
+    lat = {"seconds": 10.0, "checkpoint": "m2", "support": mx.MAX_SUPPORT,
            "features": len(mx.FEATURES), "device": "cpu", "fast": True}
     assert mx.latency_matches(lat, "m2", run)
-    assert not mx.latency_matches(lat, "other", run)
+    assert not mx.latency_matches(lat, "other", run)  # 가중치 내용이 다름
+    assert not mx.latency_matches(lat, None, run)  # 체크포인트 확인 불가
     assert not mx.latency_matches({**lat, "support": 1000}, "m2", run)
-    assert not mx.latency_matches({k: v for k, v in lat.items() if k != "hf_model"}, "m2", run)
+    assert not mx.latency_matches({k: v for k, v in lat.items() if k != "checkpoint"}, "m2", run)
     # 실제 예측과 다른 장치·경로로 잰 측정은 불인정 (MPS 로 재고 CPU 로 예측 등)
     assert not mx.latency_matches({**lat, "device": "mps"}, "m2", run)
     assert not mx.latency_matches({**lat, "fast": False}, "m2", run)
@@ -590,3 +591,20 @@ def test_evaluate_without_eval_bars_writes_undetermined_report(
     mx.cmd_evaluate(args)  # FileNotFoundError 없이 보고서 작성
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "**판정 불가**" in report and EVAL[-1] in report and "기각" not in report.split("미비")[0]
+
+
+# -- Codex 9차 리뷰 반영 ----------------------------------------------------------------
+
+
+def test_checkpoint_id_tracks_weight_contents(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text('{"dim": 64}')
+    (ckpt / "model.safetensors").write_bytes(b"weights-v1")
+    path, cid = mx.resolve_checkpoint(str(ckpt))
+    assert path == str(ckpt) and mx.resolve_checkpoint(str(ckpt))[1] == cid
+    (ckpt / "model.safetensors").write_bytes(b"weights-v2")  # 같은 경로, 가중치 교체
+    assert mx.resolve_checkpoint(str(ckpt))[1] != cid
+    (ckpt / "config.json").unlink()
+    with pytest.raises(SystemExit, match=r"config\.json"):
+        mx.resolve_checkpoint(str(ckpt))

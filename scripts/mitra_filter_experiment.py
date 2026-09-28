@@ -346,19 +346,49 @@ def template_hash(template: dict[str, Any]) -> str:
 
 
 def file_sha(path: Path) -> str:
-    return hashlib.sha1(path.read_bytes()).hexdigest()
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+CHECKPOINT_FILES = ("config.json", "model.safetensors")
+
+
+def resolve_checkpoint(hf_model: str) -> tuple[str, str]:
+    """Mitra 체크포인트를 로컬 스냅샷 하나로 고정하고 (디렉터리, 내용 해시) 를 돌려준다.
+
+    예측·지연 측정은 반환된 디렉터리로만 모델을 적재하고, 지문·메타데이터에는 내용 해시를 쓴다
+    — 같은 이름으로 가중치가 바뀌어도(로컬 교체·HF 저장소 갱신) 옛 예측과 섞이지 않는다."""
+    path = Path(hf_model)
+    if not path.is_dir():
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(hf_model, allow_patterns=list(CHECKPOINT_FILES)))
+        except Exception as e:
+            raise SystemExit(f"Mitra 체크포인트 `{hf_model}` 확인 불가: {e}") from e
+    absent = [f for f in CHECKPOINT_FILES if not (path / f).is_file()]
+    if absent:
+        raise SystemExit(f"Mitra 체크포인트 `{hf_model}` 에 {absent} 없음")
+    h = hashlib.sha1()
+    for name in CHECKPOINT_FILES:
+        h.update(f"{name}:{file_sha(path / name)};".encode())
+    return str(path), h.hexdigest()[:16]
 
 
 def experiment_fingerprint(
     model: str, universe: str, template: dict[str, Any], tickers: Sequence[str],
-    hf_model: str | None,
+    checkpoint: str | None,
 ) -> str:
     """예측 캐시 키: 실험 구성 전체 + 일봉 캐시 내용. 하나라도 바뀌면 다른 파일로 새로 예측한다."""
     bars = {t: file_sha(BARS_DIR / f"{t}.csv") for t in (KS11, *tickers)
             if (BARS_DIR / f"{t}.csv").exists()}
     blob = {
         "model": model, "universe": universe, "tickers": list(tickers), "template": template,
-        "fv": FEATURE_VERSION, "hf_model": hf_model if model == "mitra" else None, "bars": bars,
+        "fv": FEATURE_VERSION, "checkpoint": checkpoint if model == "mitra" else None,
+        "bars": bars,
         "fixed": [EVAL_START.isoformat(), SUPPORT_START.isoformat(), REFRESH_DAYS, MAX_SUPPORT,
                   MIN_SUPPORT, MIN_CLASS, MIN_AVG_VALUE, list(EVAL_TICKERS), UNIVERSE_TOP],
         "cost": cost_key(),
@@ -942,11 +972,13 @@ def cmd_predict(args: argparse.Namespace) -> None:
     ks = load_series(KS11, BARS_DIR / f"{KS11}.csv")
     blocks = block_starts(ks.days, EVAL_START, REFRESH_DAYS)
     print(f"표본 {len(samples)} · 지지 풀 {len(pool)} · 질의 {len(queries)} · 블록 {len(blocks)}")
-    predictor: Predictor = (
-        MitraPredictor(args.hf_model, args.device, fast=not args.slow)
-        if args.model == "mitra" else LogitPredictor()
-    )
-    fp = experiment_fingerprint(args.model, args.universe, template, tickers, args.hf_model)
+    checkpoint: str | None = None
+    predictor: Predictor = LogitPredictor()
+    if args.model == "mitra":
+        ckpt_dir, checkpoint = resolve_checkpoint(args.hf_model)
+        print(f"Mitra 체크포인트: {args.hf_model} → {ckpt_dir} (내용 해시 {checkpoint})")
+        predictor = MitraPredictor(ckpt_dir, args.device, fast=not args.slow)
+    fp = experiment_fingerprint(args.model, args.universe, template, tickers, checkpoint)
     run: dict[str, Any] = {}
     if isinstance(predictor, MitraPredictor):
         run = {"device": predictor.device, "fast": predictor.fast}
@@ -983,25 +1015,27 @@ def cmd_predict(args: argparse.Namespace) -> None:
 
 
 def load_complete_preds(
-    model: str, universe: str, horizon: int, template: dict[str, Any], hf_model: str
+    model: str, universe: str, horizon: int, template: dict[str, Any], checkpoint: str | None
 ) -> tuple[list[Pred] | None, str]:
     """현재 구성과 지문이 같고 완전성 표시가 된 예측만 돌려준다. 아니면 (None, 사유)."""
-    marker = load_marker(model, universe, horizon, template, hf_model)
+    marker = load_marker(model, universe, horizon, template, checkpoint)
     if isinstance(marker, str):
         return None, marker
     return read_preds(Path(marker["_preds"])), "ok"
 
 
 def load_marker(
-    model: str, universe: str, horizon: int, template: dict[str, Any], hf_model: str
+    model: str, universe: str, horizon: int, template: dict[str, Any], checkpoint: str | None
 ) -> dict[str, Any] | str:
     """현재 구성의 완전한 예측 표시(.done.json) 내용, 아니면 사유 문자열."""
+    if model == "mitra" and checkpoint is None:
+        return f"{model}/{universe}/N{horizon}: Mitra 체크포인트 확인 불가 → 예측 대조 불가"
     try:
         tickers = universe_tickers(universe)
     except (SystemExit, FileNotFoundError) as e:
         return f"유니버스 {universe} 없음 ({e})"
     path = preds_path(model, universe, horizon,
-                      experiment_fingerprint(model, universe, template, tickers, hf_model))
+                      experiment_fingerprint(model, universe, template, tickers, checkpoint))
     marker = marker_path(path)
     if not path.exists() or not marker.exists():
         return f"{model}/{universe}/N{horizon}: 현재 구성의 예측 없음 (`{path.name}`)"
@@ -1237,14 +1271,14 @@ def _stats_row(r: RunStats) -> str:
 
 
 def g0_section(
-    lines: list[str], template: dict[str, Any], hf_model: str, missing: list[str]
+    lines: list[str], template: dict[str, Any], checkpoint: str | None, missing: list[str]
 ) -> bool:
     """G0 채점. 전제 자료(완전한 예측)가 없으면 ``missing`` 에 적고 판정 불가로 둔다."""
     n = CENTER[0]
     ok = True
     for universe in ("A", "B"):
-        mitra, why_m = load_complete_preds("mitra", universe, n, template, hf_model)
-        logit, why_l = load_complete_preds("logit", universe, n, template, hf_model)
+        mitra, why_m = load_complete_preds("mitra", universe, n, template, checkpoint)
+        logit, why_l = load_complete_preds("logit", universe, n, template, None)
         if mitra is None:
             lines.append(f"- 유니버스 {universe}: {why_m} → **G0 판정 불가**")
             missing.append(why_m)
@@ -1331,8 +1365,16 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         _write_report(lines + _verdict_lines("판정 불가", missing, "평가 전제 자료 없음"))
         return
 
+    checkpoint: str | None = None
+    try:
+        _ckpt_dir, checkpoint = resolve_checkpoint(args.hf_model)
+        lines.append(f"- Mitra 체크포인트: `{args.hf_model}` → 내용 해시 `{checkpoint}`")
+    except SystemExit as e:
+        missing.append(str(e))
+        lines.append(f"- Mitra 체크포인트 확인 불가: {e}")
+
     lines += ["", "## G0 판별력", ""]
-    g0 = g0_section(lines, template, args.hf_model, missing)
+    g0 = g0_section(lines, template, checkpoint, missing)
 
     tape = tape_for(EVAL_TICKERS, EVAL_START - timedelta(days=450))  # 지표 창(300봉) 포화
     base = run_arm("현행", template, tape, {})
@@ -1346,7 +1388,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     passes: dict[tuple[int, float], bool] = {}
     reasons: dict[tuple[int, float], list[str]] = {}
     for n in HORIZONS:
-        preds, why = load_complete_preds("mitra", "A", n, template, args.hf_model)
+        preds, why = load_complete_preds("mitra", "A", n, template, checkpoint)
         if preds is None:
             missing.append(why)
         for d in DELTAS:
@@ -1373,14 +1415,14 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     lat_path = ROOT / "latency.json"
     lat = json.loads(lat_path.read_text()) if lat_path.exists() else None
-    center_run = load_marker("mitra", "A", CENTER[0], template, args.hf_model)
+    center_run = load_marker("mitra", "A", CENTER[0], template, checkpoint)
     run = center_run.get("run") if isinstance(center_run, dict) else None
-    lat_ok = lat is not None and latency_matches(lat, args.hf_model, run)
+    lat_ok = lat is not None and latency_matches(lat, checkpoint, run)
     if lat is None:
         missing.append("latency 측정 없음 (`latency` 실행)")
     elif not lat_ok:
         missing.append("latency 측정이 현재 구성·예측 실행 경로와 다름 (같은 장치·경로로 재측정)")
-        lat = {**lat, "불일치": f"현재 구성(hf_model={args.hf_model}, 지지 {MAX_SUPPORT}, "
+        lat = {**lat, "불일치": f"현재 구성(체크포인트 {checkpoint}, 지지 {MAX_SUPPORT}, "
                               f"피처 {len(FEATURES)}, 예측 실행 {run})과 다름 → 같은 장치·경로로 "
                               "latency 재측정 필요"}
     g3 = lat is not None and lat_ok and float(lat["seconds"]) <= G3_MAX_LATENCY_S
@@ -1396,12 +1438,15 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     ))
 
 
-def latency_matches(lat: dict[str, Any], hf_model: str, run: dict[str, Any] | None) -> bool:
+def latency_matches(
+    lat: dict[str, Any], checkpoint: str | None, run: dict[str, Any] | None
+) -> bool:
     """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수)과, 실제 예측에 쓴 실행 경로
     (``run`` = 예측 완료 표시의 장치·빠른/공개 경로)로 잰 측정만 인정한다."""
     return (
         run is not None and bool(run)
-        and lat.get("hf_model") == hf_model and lat.get("support") == MAX_SUPPORT
+        and checkpoint is not None and lat.get("checkpoint") == checkpoint
+        and lat.get("support") == MAX_SUPPORT
         and lat.get("features") == len(FEATURES)
         and lat.get("device") == run.get("device") and lat.get("fast") == run.get("fast")
     )
@@ -1413,14 +1458,16 @@ def cmd_latency(args: argparse.Namespace) -> None:
     xs = rng.normal(size=(MAX_SUPPORT, len(FEATURES)))
     ys = (xs[:, 0] + rng.normal(size=MAX_SUPPORT) > 0).astype(np.int64)
     xq = rng.normal(size=(1, len(FEATURES)))
-    predictor = MitraPredictor(args.hf_model, args.device, fast=not args.slow)
+    ckpt_dir, checkpoint = resolve_checkpoint(args.hf_model)
+    predictor = MitraPredictor(ckpt_dir, args.device, fast=not args.slow)
     times: list[float] = []
     for _ in range(3):
         t0 = time.perf_counter()
         predictor.predict(xs, ys, xq)
         times.append(time.perf_counter() - t0)
     info = {"seconds": round(min(times), 2), "runs": [round(t, 2) for t in times],
-            "hf_model": args.hf_model, "device": predictor.device, "fast": predictor.fast,
+            "hf_model": args.hf_model, "checkpoint": checkpoint,
+            "device": predictor.device, "fast": predictor.fast,
             "support": MAX_SUPPORT,
             "features": len(FEATURES)}
     ROOT.mkdir(parents=True, exist_ok=True)
