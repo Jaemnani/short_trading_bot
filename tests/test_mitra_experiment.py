@@ -550,13 +550,25 @@ def test_cost_model_is_part_of_cache_keys(
 
 
 def test_interrupted_refresh_must_resume_with_refresh() -> None:
-    mx.check_fetch_resume({}, refresh=False)  # 처음
-    mx.check_fetch_resume({"fetch_complete": True, "fetch_mode": "refresh"}, refresh=False)
-    mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, refresh=False)
-    interrupted = {"fetch_complete": False, "fetch_mode": "refresh"}
+    mx.check_fetch_resume({}, refresh=False, delisted=False)  # 처음
+    done = {"fetch_complete": True, "fetch_mode": "refresh", "fetch_delisted": True}
+    mx.check_fetch_resume(done, refresh=False, delisted=False)  # 완료된 뒤엔 자유
+    mx.check_fetch_resume({"fetch_complete": False, "fetch_mode": "normal"}, False, False)
+    interrupted = {"fetch_complete": False, "fetch_mode": "refresh", "fetch_delisted": False}
     with pytest.raises(SystemExit, match="--refresh"):
-        mx.check_fetch_resume(interrupted, refresh=False)
-    mx.check_fetch_resume(interrupted, refresh=True)
+        mx.check_fetch_resume(interrupted, refresh=False, delisted=False)
+    mx.check_fetch_resume(interrupted, refresh=True, delisted=False)
+
+
+def test_interrupted_delisted_fetch_must_resume_with_delisted() -> None:
+    interrupted = {"fetch_complete": False, "fetch_mode": "refresh", "fetch_delisted": True}
+    with pytest.raises(SystemExit, match="--delisted"):  # --refresh 만으로는 부족
+        mx.check_fetch_resume(interrupted, refresh=True, delisted=False)
+    normal = {"fetch_complete": False, "fetch_mode": "normal", "fetch_delisted": True}
+    with pytest.raises(SystemExit, match="--delisted"):
+        mx.check_fetch_resume(normal, refresh=False, delisted=False)
+    mx.check_fetch_resume(interrupted, refresh=True, delisted=True)
+    mx.check_fetch_resume(normal, refresh=True, delisted=True)  # 더 넓은 범위 재개는 허용
 
 
 def test_missing_prerequisites_are_undetermined_not_rejected() -> None:

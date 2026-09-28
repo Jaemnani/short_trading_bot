@@ -185,12 +185,19 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
     return Series(ticker, days, arr[0], arr[1], arr[2], arr[3], arr[4])
 
 
-def check_fetch_resume(universe: dict[str, Any], refresh: bool) -> None:
-    """중단된 ``--refresh`` 는 ``--refresh`` 로만 이어갈 수 있다 — 일반 fetch 는 기존 파일을
-    건너뛰므로 옛·새 일봉이 섞인 상태를 '완료'로 승인하게 된다."""
-    if universe.get("fetch_complete") is False and universe.get("fetch_mode") == "refresh" \
-            and not refresh:
+def check_fetch_resume(universe: dict[str, Any], refresh: bool, delisted: bool) -> None:
+    """중단된 fetch 는 같은(또는 더 넓은) 범위로만 이어갈 수 있다.
+
+    - ``--refresh`` 중단 → ``--refresh`` 필요 (일반 fetch 는 기존 파일을 건너뛰어 옛·새 일봉
+      혼합을 '완료'로 승인하게 된다)
+    - ``--delisted`` 중단 → ``--delisted`` 필요 (빠지면 상폐 일봉이 일부만 받아진 채 완료 처리)
+    """
+    if universe.get("fetch_complete") is not False:
+        return
+    if universe.get("fetch_mode") == "refresh" and not refresh:
         raise SystemExit("이전 `fetch --refresh` 가 중단됨 — 같은 `--refresh` 로 다시 실행")
+    if universe.get("fetch_delisted") and not delisted:
+        raise SystemExit("이전 `fetch --delisted` 가 중단됨 — 같은 `--delisted` 로 다시 실행")
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
@@ -200,7 +207,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe: dict[str, Any] = (
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
-    check_fetch_resume(universe, args.refresh)
+    check_fetch_resume(universe, args.refresh, args.delisted)
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         if "Marcap" in listing.columns:
@@ -240,6 +247,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     # 진행 중 표시: 중단되면(예: --refresh 도중) 옛·새 일봉이 섞인 캐시를 후속 명령이 거부한다.
     universe["fetch_complete"] = False
     universe["fetch_mode"] = "refresh" if args.refresh else "normal"
+    universe["fetch_delisted"] = bool(args.delisted)
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
@@ -265,9 +273,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     # 조회 불가로 인정하는 것은 상폐 종목뿐 (유니버스 B 에서 명시적으로 제외·보고). 그 외 실패는
     # predict 가 거부한다 — 조용히 빠진 종목으로 '완전한' 예측이 만들어지지 않게.
     delisted = set(universe.get("delisted", []))
-    universe["unavailable"] = sorted(
-        c for c in delisted if not (BARS_DIR / f"{c}.csv").exists()
-    )
+    if args.delisted:  # 상폐 종목을 실제로 조회한 실행만 '조회 불가' 목록을 갱신한다
+        universe["unavailable"] = sorted(c for c in delisted if not _has_bars(BARS_DIR / f"{c}.csv"))
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     required_failed = [c for c in failed if c not in delisted]
     universe["required_failed"] = required_failed
@@ -276,7 +283,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
         print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — 재실행 전엔 predict 불가")
-    if universe["unavailable"]:
+    if args.delisted and universe["unavailable"]:
         print(f"상폐 {len(delisted)}종목 중 조회 불가 {len(universe['unavailable'])} — B 에서 제외")
 
 
