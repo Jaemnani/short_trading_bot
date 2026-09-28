@@ -1299,3 +1299,54 @@ def test_new_delisted_ticker_ending_long_before_delisting_is_excluded(
     assert cut in u["unavailable"] and cut not in u["delisted_available"]  # 잘린 이력으로 채점 안 함
     assert not (mx.BARS_DIR / f"{cut}.csv").exists()
     assert _FakeFdr.DELISTED[5] in u["delisted_available"]  # 정상 응답은 그대로
+
+
+# -- Codex 35차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_worst_case_fill_for_right_censored_delisted_samples() -> None:
+    def pred(ticker: str, p: float, label: int | None, ret: float | None) -> Any:
+        return mx.Pred(ticker, date(2016, 3, 2), date(2016, 3, 2), p, 0.5, 400, label, ret)
+
+    pool = [pred("A", 0.7, 1, 0.05), pred("A", 0.3, 0, -0.02)]
+    censored = [pred("D", 0.8, None, None), pred("D", 0.2, None, None)]
+    filled = mx.worst_case_fill(pool, censored)
+    kept, removed = filled[2], filled[3]
+    assert (kept.label, kept.net_ret) == (0, -1.0)  # 통과 신호 → 상폐 전액 손실
+    assert (removed.label, removed.net_ret) == (1, 0.05)  # 걸러진 신호 → 관측 최대 수익
+    assert censored[0].label is None  # 원본은 그대로
+    d = mx.discrimination(filled)
+    assert d.kept_mean < d.removed_mean  # 최악 가정이면 ③ 이 뒤집힘 → B 는 판정 불가로 보고
+
+
+def test_g0_b_is_undetermined_when_censoring_could_flip_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
+    (tmp_path / "universe.json").write_text(json.dumps({"delisted": ["800000"]}))
+    monkeypatch.setattr(mx, "unavailable_note", lambda: "상폐 1종목")
+    rng = np.random.default_rng(0)
+    preds = []
+    for i in range(400):  # 판별력 있는 표본: p 가 높을수록 라벨 1·수익 +
+        p = float(rng.uniform())
+        y = int(rng.uniform() < p)
+        preds.append(mx.Pred("A", date(2017, 1, 2) + timedelta(days=i), date(2017, 1, 2), p, 0.5,
+                             400, y, 0.03 if y else -0.03))
+    censored = [mx.Pred("800000", date(2018, 1, 2) + timedelta(days=i), date(2018, 1, 2),
+                        0.9 if i % 2 else 0.1, 0.5, 400, None, None) for i in range(400)]
+
+    def fake(model: str, universe: str, n: int, template: Any, ckpt: Any) -> Any:
+        return ([*preds, *censored] if universe == "B" else preds), "ok"
+
+    monkeypatch.setattr(mx, "load_complete_preds", fake)
+    lines: list[str] = []
+    missing: list[str] = []
+    mx.g0_section(lines, {}, "ckpt", missing)
+    assert any("우측 검열" in m for m in missing)  # 명목상 통과해도 B 는 판정 불가
+    missing.clear()
+    monkeypatch.setattr(mx, "load_complete_preds",
+                        lambda model, universe, n, t, c: (preds, "ok"))  # 검열 없음
+    mx.g0_section([], {}, "ckpt", missing)
+    assert not any("우측 검열" in m for m in missing)

@@ -41,7 +41,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1760,31 +1760,68 @@ def g0_section(
         if logit is None:
             lines.append(f"  - ({why_l})")
         pool = [p for p in mitra if p.label is not None]
-        dm = discrimination(pool)
         dl = discrimination([p for p in logit if p.label is not None]) if logit is not None else None
-        logit_desc = f"로지스틱 AUC {dl.auc:.4f}" if dl is not None else "로지스틱 예측 없음"
-        lines.append(f"- 유니버스 {universe} (N={n}, 표본 {dm.n}): Mitra AUC **{dm.auc:.4f}**"
-                     f" · {logit_desc}")
-        checks = [("AUC ≥ 0.53", dm.auc >= G0_MIN_AUC)]
-        if universe == "A":
-            checks.append(("Mitra > 로지스틱", dl is not None and dm.auc > dl.auc))
-        spread_ok = dm.removed_mean < dm.kept_mean
-        lines.append(f"  - 전체: 통과 평균 {_fmt(dm.kept_mean)} vs 제외 평균 {_fmt(dm.removed_mean)}"
-                     f" (제외 {dm.n_removed})")
-        for name, s, e in BEAR_WINDOWS:
-            w = discrimination([p for p in pool if s <= p.day <= e])
-            if w.n_removed >= G0_MIN_REMOVED_PER_WINDOW:
-                spread_ok = spread_ok and w.removed_mean < w.kept_mean
-                lines.append(f"  - 하락장 {name}: 통과 {_fmt(w.kept_mean)} vs 제외 "
-                             f"{_fmt(w.removed_mean)} (제외 {w.n_removed})")
-            else:
-                lines.append(f"  - 하락장 {name}: 제외 표본 {w.n_removed} < "
-                             f"{G0_MIN_REMOVED_PER_WINDOW} → 판정 제외")
-        checks.append(("제외 평균 < 통과 평균 (전체·하락장)", spread_ok))
-        for name, passed in checks:
-            lines.append(f"  - {'✓' if passed else '✗'} {name}")
-            ok = ok and passed
+        passed = _g0_checks(lines, universe, n, pool, dl)
+        censored = censored_delisted(mitra) if universe == "B" else []
+        if censored:
+            # 상폐 직전 N봉 안의 셋업은 t+N 종가가 없어 라벨이 없다(우측 검열). 사전등록 라벨
+            # 정의를 바꾸지 않고, 가장 불리한 결과로 채워도 판정이 유지되는지만 본다.
+            lines.append(f"  - 상폐 직전 우측 검열 표본 {len(censored)}개 — 최악 가정(통과 → "
+                         "-100%·라벨 0, 제외 → 관측 최대 수익·라벨 1)으로 재채점:")
+            worst = _g0_checks([], universe, n, worst_case_fill(pool, censored), dl)
+            lines.append(f"    - 최악 가정에서도 {'유지 ✓' if worst else '뒤집힘 ✗'}")
+            if passed and not worst:
+                missing.append(f"유니버스 B: 상폐 직전 우측 검열 표본 {len(censored)}개가 G0 ④ 를 "
+                               "뒤집을 수 있음 (라벨 규칙은 사전등록 밖 — 새 가설로만 재론)")
+        ok = ok and passed
     return ok
+
+
+def _g0_checks(
+    lines: list[str], universe: str, n: int, pool: Sequence[Pred], dl: Discrimination | None
+) -> bool:
+    """G0 ①·②·③ (라벨이 있는 표본 ``pool``). 결과 줄을 ``lines`` 에 덧붙이고 통과 여부 반환."""
+    dm = discrimination(pool)
+    logit_desc = f"로지스틱 AUC {dl.auc:.4f}" if dl is not None else "로지스틱 예측 없음"
+    lines.append(f"- 유니버스 {universe} (N={n}, 표본 {dm.n}): Mitra AUC **{dm.auc:.4f}**"
+                 f" · {logit_desc}")
+    checks = [("AUC ≥ 0.53", dm.auc >= G0_MIN_AUC)]
+    if universe == "A":
+        checks.append(("Mitra > 로지스틱", dl is not None and dm.auc > dl.auc))
+    spread_ok = dm.removed_mean < dm.kept_mean
+    lines.append(f"  - 전체: 통과 평균 {_fmt(dm.kept_mean)} vs 제외 평균 {_fmt(dm.removed_mean)}"
+                 f" (제외 {dm.n_removed})")
+    for name, s, e in BEAR_WINDOWS:
+        w = discrimination([p for p in pool if s <= p.day <= e])
+        if w.n_removed >= G0_MIN_REMOVED_PER_WINDOW:
+            spread_ok = spread_ok and w.removed_mean < w.kept_mean
+            lines.append(f"  - 하락장 {name}: 통과 {_fmt(w.kept_mean)} vs 제외 "
+                         f"{_fmt(w.removed_mean)} (제외 {w.n_removed})")
+        else:
+            lines.append(f"  - 하락장 {name}: 제외 표본 {w.n_removed} < "
+                         f"{G0_MIN_REMOVED_PER_WINDOW} → 판정 제외")
+    checks.append(("제외 평균 < 통과 평균 (전체·하락장)", spread_ok))
+    ok = True
+    for name, passed in checks:
+        lines.append(f"  - {'✓' if passed else '✗'} {name}")
+        ok = ok and passed
+    return ok
+
+
+def censored_delisted(preds: Sequence[Pred]) -> list[Pred]:
+    """상폐 종목의 라벨 없는 예측 — 상폐로 t+N 종가가 없는 우측 검열 표본."""
+    u = json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
+    delisted = set(u.get("delisted", []))
+    return [p for p in preds if p.label is None and p.ticker in delisted]
+
+
+def worst_case_fill(pool: Sequence[Pred], censored: Sequence[Pred]) -> list[Pred]:
+    """검열 표본을 게이트에 가장 불리하게 채운다: 통과(유지)된 신호는 상폐로 전액 손실(라벨 0,
+    -100%), 걸러진 신호는 관측 최대 수익(라벨 1). 이래도 G0 가 유지되면 검열이 판정을 못 바꾼다."""
+    best = max((p.net_ret for p in pool if p.net_ret is not None), default=0.0)
+    filled = [replace(p, label=0, net_ret=-1.0) if keep(p, 0.0)
+              else replace(p, label=1, net_ret=best) for p in censored]
+    return [*pool, *filled]
 
 
 def final_verdict(missing: Sequence[str], g0: bool, g1_center: bool, g2: bool, g3: bool) -> str:
