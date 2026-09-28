@@ -229,18 +229,26 @@ def b_stale_after(
     return prior
 
 
-DELISTED_MIN_KEEP = 0.5  # 재조회한 상폐 목록이 기존의 절반 미만이면 조회 이상으로 본다
+MIN_DELISTED = 100  # 2010년 이후 KOSPI·KOSDAQ 보통주 상폐의 현실적 하한 — 미만이면 조회 이상
 
 
 def check_delisted_list(new: list[str], previous: list[str] | None) -> list[str]:
-    """재조회한 상폐 목록 검증. 비었거나 기존 대비 급감(상폐는 누적만 늘어난다)이면 SystemExit —
-    일시 장애·컬럼 변경으로 B 가 A 와 같아져 생존편향 대조가 무의미해지는 것을 막는다."""
-    if not new:
-        raise SystemExit("상폐 목록 조회 결과가 비어 있음(일시 장애·형식 변경 의심) — 나중에 재시도")
-    if previous and len(new) < len(previous) * DELISTED_MIN_KEEP:
+    """재조회한 상폐 목록 검증 — 생존편향 대조군(B)이 조용히 줄어드는 것을 막는다.
+
+    - 상폐 목록은 **누적**만 된다: 기존 코드가 하나라도 빠지면(페이지 누락·형식 변경) SystemExit.
+    - 최초 조회도 ``MIN_DELISTED`` 미만이면(형식 오류로 몇 종목만 남음 등) SystemExit.
+    실패 시 기존 목록을 덮지 않고, 이미 기록된 fetch 미완료 표시로 후속 명령이 거부된다."""
+    if len(new) < MIN_DELISTED:
         raise SystemExit(
-            f"상폐 목록이 {len(previous)} → {len(new)} 로 급감(조회 이상 의심) — 나중에 재시도"
+            f"상폐 목록 {len(new)}종목 < {MIN_DELISTED} (일시 장애·형식 변경 의심) — 나중에 재시도"
         )
+    if previous:
+        lost = sorted(set(previous) - set(new))
+        if lost:
+            raise SystemExit(
+                f"상폐 목록에서 기존 {len(lost)}종목이 빠짐 {lost[:5]} (누적 목록이어야 함, "
+                "조회 이상 의심) — 나중에 재시도"
+            )
     return new
 
 
@@ -1024,8 +1032,11 @@ def universe_tickers(universe: str) -> list[str]:
                              "`fetch --refresh --delisted` 필요")
         unavailable = set(u.get("unavailable", []))
         usable = [c for c in u["delisted"] if c not in unavailable]
-        if not usable:  # 상폐가 하나도 없으면 B == A — 생존편향 대조가 성립하지 않는다
-            raise SystemExit("유니버스 B 에 쓸 상폐 종목이 없음 — `fetch --refresh --delisted` 필요")
+        if len(usable) < MIN_DELISTED:  # 한 줌이면 B ≈ A — 생존편향 대조가 성립하지 않는다
+            raise SystemExit(
+                f"유니버스 B 에 쓸 상폐 종목이 {len(usable)}개 < {MIN_DELISTED} — "
+                "`fetch --refresh --delisted` 필요"
+            )
         tickers += usable
     tickers = list(dict.fromkeys(tickers))
     missing = [t for t in (KS11, *tickers) if not _has_bars(BARS_DIR / f"{t}.csv")]

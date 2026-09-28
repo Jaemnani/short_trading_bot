@@ -434,12 +434,13 @@ def test_universe_rejects_incomplete_fetch_or_wrong_size(
 def test_universe_b_excludes_only_recorded_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    u = {"eval": EVAL, "top": TOP, "delisted": ["111110", "222220", "333330"],
-         "unavailable": ["222220"]}
-    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP, "111110", "333330"], u)
-    assert mx.universe_tickers("B") == [*EVAL, *TOP, "111110", "333330"]
-    (tmp_path / "bars" / "333330.csv").unlink()  # 기록되지 않은 누락 → 거부
-    with pytest.raises(SystemExit, match="333330"):
+    dl = [f"8{i:04d}0" for i in range(mx.MIN_DELISTED + 2)]
+    u = {"eval": EVAL, "top": TOP, "delisted": dl, "unavailable": [dl[1]]}
+    usable = [c for c in dl if c != dl[1]]
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP, *usable], u)
+    assert mx.universe_tickers("B") == [*EVAL, *TOP, *usable]
+    (tmp_path / "bars" / f"{dl[2]}.csv").unlink()  # 기록되지 않은 누락 → 거부
+    with pytest.raises(SystemExit, match=dl[2]):
         mx.universe_tickers("B")
 
 
@@ -769,14 +770,19 @@ def test_read_preds_drops_unterminated_last_row_even_if_parseable(tmp_path: Path
     assert [r.ticker for r in mx.read_preds(path)] == ["A"]
 
 
-def test_check_delisted_list_rejects_empty_or_collapsed() -> None:
-    prev = [f"{i:05d}0" for i in range(100)]
-    assert mx.check_delisted_list([*prev, "999990"], prev) == [*prev, "999990"]
-    with pytest.raises(SystemExit, match="비어"):
+def test_check_delisted_list_requires_cumulative_and_minimum_size() -> None:
+    prev = [f"{i:05d}0" for i in range(mx.MIN_DELISTED * 3)]  # 60% 도 최소 규모 이상이 되게
+    assert mx.check_delisted_list([*prev, "999990"], prev) == [*prev, "999990"]  # 누적 증가 OK
+    with pytest.raises(SystemExit, match="<"):
         mx.check_delisted_list([], prev)
-    with pytest.raises(SystemExit, match="급감"):
-        mx.check_delisted_list(prev[:40], prev)
-    assert mx.check_delisted_list(["000010"], None) == ["000010"]  # 최초 조회
+    # 60% 만 돌아온 경우(절반 이상이라도) — 기존 종목이 빠졌으니 누적성 위반으로 거부
+    with pytest.raises(SystemExit, match="빠짐"):
+        mx.check_delisted_list(prev[: int(len(prev) * 0.6)], prev)
+    with pytest.raises(SystemExit, match="빠짐"):  # 크기는 같아도 구성이 바뀌면 거부
+        mx.check_delisted_list([*prev[1:], "999990"], prev)
+    with pytest.raises(SystemExit, match="<"):  # 최초 조회도 현실적 최소 규모 필요
+        mx.check_delisted_list(["000010"], None)
+    assert len(mx.check_delisted_list(prev, None)) == len(prev)
 
 
 def test_universe_b_rejects_when_no_usable_delisted(
@@ -784,5 +790,14 @@ def test_universe_b_rejects_when_no_usable_delisted(
 ) -> None:
     u = {"eval": EVAL, "top": TOP, "delisted": ["111110"], "unavailable": ["111110"]}
     _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
-    with pytest.raises(SystemExit, match="상폐 종목이 없음"):
+    with pytest.raises(SystemExit, match="상폐 종목이 0개"):
+        mx.universe_tickers("B")
+    import json
+
+    few = {"eval": EVAL, "top": TOP, "delisted": ["111110"], "unavailable": []}
+    (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **few}))
+    (tmp_path / "bars" / "111110.csv").write_text(
+        "date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n"
+    )
+    with pytest.raises(SystemExit, match="1개 <"):  # 한 종목뿐인 B 도 거부
         mx.universe_tickers("B")
