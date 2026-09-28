@@ -204,6 +204,22 @@ def check_fetch_resume(universe: dict[str, Any], refresh: bool, delisted: bool) 
         raise SystemExit("이전 `fetch --delisted` 가 중단됨 — 같은 `--delisted` 로 다시 실행")
 
 
+def b_stale_after(
+    universe: dict[str, Any], refresh: bool, refresh_universe: bool, delisted: bool
+) -> bool:
+    """이번 fetch 뒤 B 가 혼합 스냅샷인지. 일봉(--refresh)이나 현행 목록(--refresh-universe)을
+    새 시점으로 바꾸는 실행은 상폐 쪽도 함께(--delisted: 목록 재조회·일봉 수신) 갱신해야 B 가 한
+    시점 스냅샷으로 유지된다. 둘 다 아니면 이전 상태를 유지한다."""
+    if "delisted" not in universe:
+        return False
+    prior = bool(universe.get("b_stale", False))
+    if refresh:  # 일봉 전체를 새로 받는 실행만 이전 표시를 해제할 수 있다
+        return not delisted
+    if refresh_universe:  # 기존 일봉은 그대로라 이전 표시는 유지
+        return prior or not delisted
+    return prior
+
+
 def cmd_fetch(args: argparse.Namespace) -> None:
     import FinanceDataReader as fdr
 
@@ -212,6 +228,13 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
     )
     check_fetch_resume(universe, args.refresh, args.delisted)
+    # 진행 중 표시를 유니버스 목록·일봉을 바꾸기 **전에** 영속화 — 어느 지점에서 중단되든
+    # 후속 명령이 옛·새 상태가 섞인 캐시를 거부한다.
+    universe["fetch_complete"] = False
+    universe["fetch_mode"] = "refresh" if args.refresh else "normal"
+    universe["fetch_delisted"] = bool(args.delisted)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
         if "Marcap" in listing.columns:
@@ -243,20 +266,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             ):
                 codes.append(code)
         universe["delisted"] = sorted(set(codes))
-    ROOT.mkdir(parents=True, exist_ok=True)
-    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
-
     targets = [KS11, *universe["eval"], *universe["top"]]
     if args.delisted:
         targets += universe.get("delisted", [])
-    # 진행 중 표시: 중단되면(예: --refresh 도중) 옛·새 일봉이 섞인 캐시를 후속 명령이 거부한다.
-    universe["fetch_complete"] = False
-    universe["fetch_mode"] = "refresh" if args.refresh else "normal"
-    universe["fetch_delisted"] = bool(args.delisted)
-    if args.refresh and "delisted" in universe:
-        # 상폐 일봉까지 새로 받는 --refresh --delisted 만 B 를 최신 스냅샷으로 되돌린다.
-        # --delisted 없는 --refresh 는 상폐 일봉만 옛 시점에 남겨 B 를 혼합 스냅샷으로 만든다.
-        universe["b_stale"] = not args.delisted
+    universe["b_stale"] = b_stale_after(universe, args.refresh, args.refresh_universe, args.delisted)
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
@@ -339,20 +352,22 @@ def _watchlist_arg(value: str) -> Path | None:
     return None if value.lower() == "none" else Path(value)
 
 
+IMPL_PACKAGES = ("domain", "strategy", "market", "backtest")
+
+
 def impl_key() -> str:
-    """표본(셋업 판정·지표)·라벨(비용)을 만드는 봇 본체 구현의 소스 해시.
+    """표본(셋업 판정·지표·템플릿·팩토리)·라벨(비용)·백테스트를 이루는 봇 본체 구현의 소스 해시.
 
-    FEATURE_VERSION 은 이 스크립트의 피처 코드만 대변하므로, 본체 전략·지표 코드가 바뀌면
-    이 키로 표본·예측 캐시를 무효화한다 (G1 백테스트는 항상 현재 구현으로 돈다)."""
-    import short_trading_bot.backtest.costs as costs_mod
-    import short_trading_bot.market.indicators as ind_mod
-    import short_trading_bot.strategy.algorithms.pullback_daily as pb_mod
-    import short_trading_bot.strategy.base as base_mod
+    모듈을 골라 넣으면 누락(팩토리·포지션·템플릿 등)이 생기므로 관련 패키지의 ``.py`` 전체를
+    해시한다. FEATURE_VERSION 은 이 스크립트의 피처 코드만 대변하므로, 본체 코드가 바뀌면 이
+    키로 표본·예측 캐시를 무효화한다 (G1 백테스트는 항상 현재 구현으로 돈다)."""
+    import short_trading_bot
 
+    root = Path(short_trading_bot.__file__).parent
     h = hashlib.sha1()
-    for mod in (pb_mod, base_mod, ind_mod, costs_mod):
-        assert mod.__file__ is not None
-        h.update(f"{mod.__name__}:{file_sha(Path(mod.__file__))};".encode())
+    for pkg in IMPL_PACKAGES:
+        for path in sorted((root / pkg).rglob("*.py")):
+            h.update(f"{path.relative_to(root).as_posix()}:{file_sha(path)};".encode())
     return h.hexdigest()[:16]
 
 

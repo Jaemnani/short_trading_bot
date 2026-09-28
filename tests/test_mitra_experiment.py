@@ -664,3 +664,42 @@ def test_impl_key_is_part_of_cache_keys(
     monkeypatch.setattr(mx, "impl_key", lambda: "changed-strategy-code")
     assert mx.template_hash(TEMPLATE) != th
     assert mx.experiment_fingerprint("logit", "A", TEMPLATE, [], None) != fp
+
+
+# -- Codex 12차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_impl_key_covers_whole_runtime_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    import short_trading_bot
+
+    src = Path(short_trading_bot.__file__).parent
+    fake = tmp_path / "short_trading_bot"
+    for pkg in mx.IMPL_PACKAGES:
+        shutil.copytree(src / pkg, fake / pkg)
+    (fake / "__init__.py").write_text("")
+    monkeypatch.setattr(short_trading_bot, "__file__", str(fake / "__init__.py"))
+    before = mx.impl_key()
+    # 셋업 구성 경로의 모듈(팩토리·포지션·템플릿)이 바뀌어도 키가 바뀐다
+    for rel in ("domain/factory.py", "domain/position.py", "strategy/templates.py"):
+        target = fake / rel
+        target.write_text(target.read_text() + "\n# changed\n")
+        assert mx.impl_key() != before
+        before = mx.impl_key()
+
+
+def test_b_stale_after_top_only_or_bars_only_refresh() -> None:
+    with_b = {"delisted": ["111110"], "b_stale": False}
+    assert mx.b_stale_after(with_b, refresh=False, refresh_universe=True, delisted=False)
+    assert mx.b_stale_after(with_b, refresh=True, refresh_universe=False, delisted=False)
+    assert not mx.b_stale_after(with_b, refresh=True, refresh_universe=True, delisted=True)
+    assert not mx.b_stale_after(with_b, refresh=False, refresh_universe=True, delisted=True)
+    stale = {**with_b, "b_stale": True}
+    assert mx.b_stale_after(stale, refresh=False, refresh_universe=False, delisted=True)  # 유지
+    # 기존 일봉을 다시 받지 않는 --refresh-universe --delisted 는 이전 표시를 해제하지 못함
+    assert mx.b_stale_after(stale, refresh=False, refresh_universe=True, delisted=True)
+    assert not mx.b_stale_after(stale, refresh=True, refresh_universe=False, delisted=True)
+    assert not mx.b_stale_after({}, refresh=True, refresh_universe=True, delisted=False)  # B 없음
