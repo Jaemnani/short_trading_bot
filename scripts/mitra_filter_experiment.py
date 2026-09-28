@@ -263,24 +263,40 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 # -- 템플릿 ----------------------------------------------------------------------------------
 
 
-def load_template(watchlist: Path) -> tuple[dict[str, Any], str]:
-    """평가 3종목의 1D 눌림목 템플릿 (셋 다 같아야 한다 — Backtester 는 템플릿 1개)."""
-    if watchlist.exists():
-        data = json.loads(watchlist.read_text(encoding="utf-8")).get("watchlist", {})
-        found: list[dict[str, Any]] = []
-        for key, cfg in data.items():
-            ticker = key.split("@")[0]
-            if (
-                ticker in EVAL_TICKERS and cfg.get("strategy_id") == "pullback_daily_v1"
-                and cfg.get("resolution", "1D") == "1D"
-            ):
-                found.append(cfg)
-        if found:
-            if any(json.dumps(c, sort_keys=True) != json.dumps(found[0], sort_keys=True)
-                   for c in found):
-                raise SystemExit("평가 3종목의 1D 템플릿이 서로 다름 — 사전등록 전제 위반")
-            return dict(found[0]), str(watchlist)
-    return dict(DEFAULT_TEMPLATE), "DEFAULT_TEMPLATE (watchlist.json 없음)"
+def load_template(watchlist: Path | None) -> tuple[dict[str, Any], str]:
+    """평가 3종목의 1D 눌림목 템플릿 (Backtester 는 템플릿 1개 — 셋 다 같아야 한다).
+
+    - ``watchlist`` 가 None(``--watchlist none``) 이거나 파일이 없으면 운용 기본값 (사전등록).
+    - 파일이 있으면 세 종목 **모두** 1D 눌림목 항목이 있고 서로 같아야 한다. 일부만 있거나
+      다르면 SystemExit — 한 종목 설정을 다른 종목에 조용히 덮어씌우지 않는다.
+    """
+    if watchlist is None:
+        return dict(DEFAULT_TEMPLATE), "DEFAULT_TEMPLATE (--watchlist none 명시)"
+    if not watchlist.exists():
+        return dict(DEFAULT_TEMPLATE), f"DEFAULT_TEMPLATE ({watchlist} 없음)"
+    data = json.loads(watchlist.read_text(encoding="utf-8")).get("watchlist", {})
+    by_ticker: dict[str, list[dict[str, Any]]] = {t: [] for t in EVAL_TICKERS}
+    for key, cfg in data.items():
+        ticker = key.split("@")[0]
+        if (
+            ticker in by_ticker and cfg.get("strategy_id") == "pullback_daily_v1"
+            and cfg.get("resolution", "1D") == "1D"
+        ):
+            by_ticker[ticker].append(cfg)
+    missing = [t for t, cfgs in by_ticker.items() if not cfgs]
+    if missing:
+        raise SystemExit(
+            f"{watchlist}: 평가 종목 {missing} 의 1D 눌림목 항목 없음 — 워치리스트를 맞추거나 "
+            "`--watchlist none` 으로 운용 기본값을 명시 선택"
+        )
+    blobs = {json.dumps(c, sort_keys=True) for cfgs in by_ticker.values() for c in cfgs}
+    if len(blobs) != 1:
+        raise SystemExit(f"{watchlist}: 평가 3종목의 1D 눌림목 템플릿이 서로 다름 — 사전등록 전제 위반")
+    return dict(by_ticker[EVAL_TICKERS[0]][0]), str(watchlist)
+
+
+def _watchlist_arg(value: str) -> Path | None:
+    return None if value.lower() == "none" else Path(value)
 
 
 def template_hash(template: dict[str, Any]) -> str:
@@ -566,6 +582,8 @@ class MitraPredictor:
             kwargs["device"] = device
         self._kwargs = kwargs
         self._cls = MitraClassifier
+        self.device = str(MitraClassifier(**kwargs).device)  # 'auto' 가 실제로 고른 장치
+        self.fast = fast
         self._fast: tuple[Any, Any, str] | None = None
         if fast:
             from autogluon.tabular.models.mitra.sklearn_interface import DEFAULT_CLASSES
@@ -835,7 +853,7 @@ def split_pool_queries(
 
 
 def cmd_predict(args: argparse.Namespace) -> None:
-    template, source = load_template(Path(args.watchlist))
+    template, source = load_template(_watchlist_arg(args.watchlist))
     print(f"템플릿: {source}")
     tickers = universe_tickers(args.universe)
     samples = load_samples(tickers, template, args.jobs)
@@ -871,9 +889,12 @@ def cmd_predict(args: argparse.Namespace) -> None:
         walk_forward(pool, queries, n, predictor, blocks, done=done, on_block=on_block)
         final = read_preds(path)
         complete = is_complete(final, expected)
+        run: dict[str, Any] = {}
+        if isinstance(predictor, MitraPredictor):
+            run = {"device": predictor.device, "fast": predictor.fast}
         marker_path(path).write_text(json.dumps({
             "fingerprint": fp, "complete": complete, "blocks": len(expected),
-            "queries": sum(len(v) for v in expected.values()), "rows": len(final),
+            "queries": sum(len(v) for v in expected.values()), "rows": len(final), "run": run,
         }))
         state = "완료" if complete else "불완전 — 다시 실행하면 이어서 진행"
         print(f"N={n} {state} → {path} ({time.time() - t0:.0f}s)")
@@ -883,18 +904,29 @@ def load_complete_preds(
     model: str, universe: str, horizon: int, template: dict[str, Any], hf_model: str
 ) -> tuple[list[Pred] | None, str]:
     """현재 구성과 지문이 같고 완전성 표시가 된 예측만 돌려준다. 아니면 (None, 사유)."""
+    marker = load_marker(model, universe, horizon, template, hf_model)
+    if isinstance(marker, str):
+        return None, marker
+    return read_preds(Path(marker["_preds"])), "ok"
+
+
+def load_marker(
+    model: str, universe: str, horizon: int, template: dict[str, Any], hf_model: str
+) -> dict[str, Any] | str:
+    """현재 구성의 완전한 예측 표시(.done.json) 내용, 아니면 사유 문자열."""
     try:
         tickers = universe_tickers(universe)
     except (SystemExit, FileNotFoundError) as e:
-        return None, f"유니버스 {universe} 없음 ({e})"
+        return f"유니버스 {universe} 없음 ({e})"
     path = preds_path(model, universe, horizon,
                       experiment_fingerprint(model, universe, template, tickers, hf_model))
     marker = marker_path(path)
     if not path.exists() or not marker.exists():
-        return None, f"{model}/{universe}/N{horizon}: 현재 구성의 예측 없음 (`{path.name}`)"
-    if not json.loads(marker.read_text()).get("complete"):
-        return None, f"{model}/{universe}/N{horizon}: 예측 불완전 — predict 재실행 필요"
-    return read_preds(path), "ok"
+        return f"{model}/{universe}/N{horizon}: 현재 구성의 예측 없음 (`{path.name}`)"
+    info: dict[str, Any] = json.loads(marker.read_text())
+    if not info.get("complete"):
+        return f"{model}/{universe}/N{horizon}: 예측 불완전 — predict 재실행 필요"
+    return {**info, "_preds": str(path)}
 
 
 # -- 평가 ------------------------------------------------------------------------------------
@@ -1171,7 +1203,7 @@ def g0_section(lines: list[str], template: dict[str, Any], hf_model: str) -> boo
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
-    template, source = load_template(Path(args.watchlist))
+    template, source = load_template(_watchlist_arg(args.watchlist))
     lines = [
         f"# H-M1 실험 결과 ({date.today().isoformat()})", "",
         f"- 템플릿: {source} — `{json.dumps(template, ensure_ascii=False)}`",
@@ -1211,10 +1243,13 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     lat_path = ROOT / "latency.json"
     lat = json.loads(lat_path.read_text()) if lat_path.exists() else None
-    lat_ok = lat is not None and latency_matches(lat, args.hf_model)
+    center_run = load_marker("mitra", "A", CENTER[0], template, args.hf_model)
+    run = center_run.get("run") if isinstance(center_run, dict) else None
+    lat_ok = lat is not None and latency_matches(lat, args.hf_model, run)
     if lat is not None and not lat_ok:
         lat = {**lat, "불일치": f"현재 구성(hf_model={args.hf_model}, 지지 {MAX_SUPPORT}, "
-                              f"피처 {len(FEATURES)})과 다름 → latency 재측정 필요"}
+                              f"피처 {len(FEATURES)}, 예측 실행 {run})과 다름 → 같은 장치·경로로 "
+                              "latency 재측정 필요"}
     g3 = lat is not None and lat_ok and float(lat["seconds"]) <= G3_MAX_LATENCY_S
     lines += ["", "## G3 지연", "",
               f"- {lat if lat else '측정 없음 (`latency` 먼저 실행)'} → {'✓' if g3 else '✗'}"]
@@ -1231,11 +1266,14 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print(report)
 
 
-def latency_matches(lat: dict[str, Any], hf_model: str) -> bool:
-    """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수)으로 잰 측정만 인정한다."""
+def latency_matches(lat: dict[str, Any], hf_model: str, run: dict[str, Any] | None) -> bool:
+    """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수)과, 실제 예측에 쓴 실행 경로
+    (``run`` = 예측 완료 표시의 장치·빠른/공개 경로)로 잰 측정만 인정한다."""
     return (
-        lat.get("hf_model") == hf_model and lat.get("support") == MAX_SUPPORT
+        run is not None and bool(run)
+        and lat.get("hf_model") == hf_model and lat.get("support") == MAX_SUPPORT
         and lat.get("features") == len(FEATURES)
+        and lat.get("device") == run.get("device") and lat.get("fast") == run.get("fast")
     )
 
 
@@ -1252,7 +1290,7 @@ def cmd_latency(args: argparse.Namespace) -> None:
         predictor.predict(xs, ys, xq)
         times.append(time.perf_counter() - t0)
     info = {"seconds": round(min(times), 2), "runs": [round(t, 2) for t in times],
-            "hf_model": args.hf_model, "device": args.device, "fast": not args.slow,
+            "hf_model": args.hf_model, "device": predictor.device, "fast": predictor.fast,
             "support": MAX_SUPPORT,
             "features": len(FEATURES)}
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -1270,7 +1308,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     f.add_argument("--refresh-universe", action="store_true", help="시총 상위 목록 다시 뽑기")
     for name in ("predict", "evaluate", "latency"):
         p = sub.add_parser(name)
-        p.add_argument("--watchlist", default="watchlist.json")
+        p.add_argument("--watchlist", default="watchlist.json",
+                       help="평가 템플릿 원천. none = 운용 기본값 명시 선택")
         p.add_argument("--hf-model", default=MITRA_HF_MODEL)
         p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
         if name == "predict":

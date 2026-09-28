@@ -67,4 +67,7 @@
   - 같은 입력에서도 Mitra 출력이 실행마다 ±0.03~0.04 흔들림(bf16·지지 순열, 무작위 가중치 기준). 예측은 CSV로 캐시되므로 `evaluate`는 재현 가능.
 - **다음 할 일 (iMac)**: docstring 순서대로 `fetch`(+`--delisted`는 오래 걸림, 밤에) → logit A/B → `latency` → mitra A(N 5·10·20)/B(N10) → `evaluate` → `data/mitra/report.md` 판정을 `BACKLOG.md`/`STRATEGIES.md`에 기록.
   - `fetch`의 상폐 종목 조회(`KRX-DELISTING:` 접두 폴백)는 네트워크 차단으로 미실측 — 실패 목록이 출력되니 확인.
+  - 평가 템플릿은 `watchlist.json`의 005930·000660·005380 **세 종목 모두**의 1D 눌림목 항목(서로 동일)이어야 한다. 일부만 있으면 중단 — 운용 기본값을 쓰려면 `--watchlist none`.
+  - `latency`는 `predict --model mitra`와 **같은 장치·경로**(`--device`, `--slow` 여부)로 재야 G3에 반영된다.
+  - Codex 크로스리뷰(PR #27)로 보강된 안전장치: 예측 캐시는 실험 구성 지문별 파일, 반쯤 쓰인 블록은 재실행 시 폐기·재예측, 완전성 표시(`.done.json`) 없는 예측은 채점 거부, 일봉 누락 종목 거부(조회 불가 상폐만 B에서 명시 제외), 하락장 구간 데이터 부족은 G1 실패.
   - AutoGluon 1.6.3 기본값은 v1(`mitra-classifier`). v2(`mitra-classifier-2`) 체크포인트가 1.6.3 `Tab2D.from_pretrained`와 호환되는지 미확인 — 안 되면 AutoGluon 업그레이드 후 `--slow`로 먼저 확인.

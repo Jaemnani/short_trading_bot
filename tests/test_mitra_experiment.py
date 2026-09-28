@@ -311,7 +311,9 @@ def test_mitra_adapter_fast_and_public_paths(tmp_path: Path) -> None:
     ys = (xs[:, 0] > 0).astype(np.int64)
     xq = rng.normal(size=(7, 8))
     for fast in (True, False):
-        p = mx.MitraPredictor(str(tmp_path / "tiny"), "cpu", fast=fast).predict(xs, ys, xq)
+        predictor = mx.MitraPredictor(str(tmp_path / "tiny"), "cpu", fast=fast)
+        assert (predictor.device, predictor.fast) == ("cpu", fast)  # G3 대조용 실행 경로
+        p = predictor.predict(xs, ys, xq)
         assert p.shape == (7,)
         assert np.all((p >= 0) & (p <= 1))
 
@@ -433,9 +435,44 @@ def test_sample_cache_invalidated_by_ks11_change(
 
 
 def test_latency_must_match_evaluation_config() -> None:
+    run = {"device": "cpu", "fast": True}
     lat = {"seconds": 10.0, "hf_model": "m2", "support": mx.MAX_SUPPORT,
-           "features": len(mx.FEATURES)}
-    assert mx.latency_matches(lat, "m2")
-    assert not mx.latency_matches(lat, "other")
-    assert not mx.latency_matches({**lat, "support": 1000}, "m2")
-    assert not mx.latency_matches({k: v for k, v in lat.items() if k != "hf_model"}, "m2")
+           "features": len(mx.FEATURES), "device": "cpu", "fast": True}
+    assert mx.latency_matches(lat, "m2", run)
+    assert not mx.latency_matches(lat, "other", run)
+    assert not mx.latency_matches({**lat, "support": 1000}, "m2", run)
+    assert not mx.latency_matches({k: v for k, v in lat.items() if k != "hf_model"}, "m2", run)
+    # 실제 예측과 다른 장치·경로로 잰 측정은 불인정 (MPS 로 재고 CPU 로 예측 등)
+    assert not mx.latency_matches({**lat, "device": "mps"}, "m2", run)
+    assert not mx.latency_matches({**lat, "fast": False}, "m2", run)
+    assert not mx.latency_matches(lat, "m2", None)  # 완전한 Mitra 예측 없음
+
+
+def _watchlist(tmp_path: Path, entries: dict[str, Any]) -> Path:
+    import json
+
+    path = tmp_path / "watchlist.json"
+    path.write_text(json.dumps({"watchlist": entries}))
+    return path
+
+
+def test_load_template_requires_all_eval_tickers(tmp_path: Path) -> None:
+    cfg = {**TEMPLATE}
+    full = {f"{t}@1D": cfg for t in mx.EVAL_TICKERS}
+    tmpl, source = mx.load_template(_watchlist(tmp_path, full))
+    assert tmpl == cfg and source.endswith("watchlist.json")
+    # 005380 누락 (watchlist.example.json 과 같은 형태) → 조용히 덮어쓰지 않고 중단
+    partial = {k: v for k, v in full.items() if not k.startswith("005380")}
+    with pytest.raises(SystemExit, match="005380"):
+        mx.load_template(_watchlist(tmp_path, partial))
+    # 한 종목이 다른 전략이면 역시 누락
+    other = {**full, "005380@1D": {**cfg, "strategy_id": "trend_long_v1"}}
+    with pytest.raises(SystemExit, match="005380"):
+        mx.load_template(_watchlist(tmp_path, other))
+    # 파라미터가 다르면 중단
+    diff = {**full, "005380@1D": {**cfg, "risk_per_trade": 0.01}}
+    with pytest.raises(SystemExit, match="서로 다름"):
+        mx.load_template(_watchlist(tmp_path, diff))
+    # 기본값은 명시 선택 또는 파일 없음일 때만
+    assert mx.load_template(None)[0] == mx.DEFAULT_TEMPLATE
+    assert mx.load_template(tmp_path / "absent.json")[0] == mx.DEFAULT_TEMPLATE
