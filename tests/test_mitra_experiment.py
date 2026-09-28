@@ -997,7 +997,7 @@ def test_current_tickers_lagging_ks11_are_rejected(
 def test_delisted_baseline_survives_failed_retries() -> None:
     # 완료된 fetch: 111110·222220 정상 수신, 333330 조회 불가 → 기준 확정
     u: dict[str, Any] = {"delisted": ["111110", "222220", "333330"], "unavailable": ["333330"],
-                         "fetch_complete": True}
+                         "fetch_complete": True, "delisted_failed_once": ["333330"]}
     assert mx.finish_fetch(u, ["333330"], mx.available_baseline(u), delisted_fetched=True) == []
     assert u["delisted_available"] == ["111110", "222220"]
     # 1차 재시도: 222220 이 일시 실패 → unavailable 에 들어가지만 fetch 는 미완료
@@ -1092,7 +1092,7 @@ class _FakeFdr:
         self.bars: dict[str, tuple[date, date] | None] = {
             c: full for c in [mx.KS11, *EVAL, *TOP]
         }
-        self.bars.update({c: (date(2011, 1, 3), date(2014, 6, 30)) for c in self.DELISTED})
+        self.bars.update({c: (date(2010, 1, 4), date(2014, 6, 30)) for c in self.DELISTED})
 
     def StockListing(self, name: str) -> Any:  # FDR API 이름 그대로
         import pandas as pd
@@ -1100,7 +1100,7 @@ class _FakeFdr:
         if name == "KOSPI":
             return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(TOP)])
         return pd.DataFrame([{"Symbol": c, "Name": "x", "Market": "KOSDAQ",
-                              "DelistingDate": "2014-07-01", "SecuGroup": "주권"}
+                              "DelistingDate": "2014-07-01", "SecuGroup": "주권", "ListingDate": "2005-01-03"}
                              for c in self.DELISTED])
 
     def DataReader(self, symbol: str, start: str) -> Any:
@@ -1142,7 +1142,7 @@ def test_fetch_rejects_shrunk_response_for_existing_current_ticker(
     # 새로고침에서 시총 상위 종목이 앞부분이 잘린 응답(현재까지는 끝남)을 돌려줌
     fetch_env.bars[TOP[5]] = (date(2014, 1, 2), date(2016, 3, 31))
     # 이전에 정상 수신된 상폐 종목은 뒷부분이 잘린 응답
-    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2011, 1, 3), date(2012, 1, 2))
+    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2010, 1, 4), date(2012, 1, 2))
     u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
     assert u["fetch_complete"] is False
     assert set(u["required_failed"]) == {TOP[5], _FakeFdr.DELISTED[7]}
@@ -1151,7 +1151,7 @@ def test_fetch_rejects_shrunk_response_for_existing_current_ticker(
     with pytest.raises(SystemExit, match="--refresh"):  # 옵션 없는 재개 거부
         _run_fetch(fetch_env, monkeypatch, "--delisted")
     fetch_env.bars[TOP[5]] = (date(2010, 1, 4), date(2016, 3, 31))  # 복구
-    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2011, 1, 3), date(2014, 6, 30))
+    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2010, 1, 4), date(2014, 6, 30))
     u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
     assert u["fetch_complete"] is True and u["required_failed"] == []
 
@@ -1189,7 +1189,7 @@ def test_former_top_ticker_moved_to_delisted_stays_protected(
             return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(codes)])
         df = real_listing(name)
         extra = {"Symbol": gone, "Name": "x", "Market": "KOSPI", "DelistingDate": "2016-03-31",
-                 "SecuGroup": "주권"}
+                 "SecuGroup": "주권", "ListingDate": "2005-01-03"}
         return pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
 
     monkeypatch.setattr(fetch_env, "StockListing", listing)
@@ -1208,10 +1208,10 @@ def test_parse_delisted_requires_security_type_column() -> None:
     import pandas as pd
 
     rows = [{"Symbol": "111110", "Name": "a", "Market": "KOSPI", "DelistingDate": "2014-07-01",
-             "SecuGroup": "주권"},
+             "SecuGroup": "주권", "ListingDate": "2005-01-03"},
             {"Symbol": "222220", "Name": "b", "Market": "KOSPI", "DelistingDate": "2014-07-01",
-             "SecuGroup": "ETF"}]
-    assert mx.parse_delisted(pd.DataFrame(rows)) == {"111110": "2014-07-01"}  # 실제 '주권'만
+             "SecuGroup": "ETF", "ListingDate": "2005-01-03"}]
+    assert mx.parse_delisted(pd.DataFrame(rows)) == {"111110": ["2005-01-03", "2014-07-01"]}
     with pytest.raises(SystemExit, match="SecuGroup"):
         mx.parse_delisted(pd.DataFrame(rows).drop(columns=["SecuGroup"]))
 
@@ -1237,7 +1237,7 @@ def test_former_top_stays_protected_across_separate_universe_and_delisted_refres
         if not delisted_now[0]:
             return df
         extra = {"Symbol": gone, "Name": "x", "Market": "KOSPI", "DelistingDate": "2016-03-31",
-                 "SecuGroup": "주권"}
+                 "SecuGroup": "주권", "ListingDate": "2005-01-03"}
         return pd.concat([df, pd.DataFrame([extra])], ignore_index=True)
 
     monkeypatch.setattr(fetch_env, "StockListing", listing)
@@ -1293,8 +1293,10 @@ def test_new_delisted_ticker_ending_long_before_delisting_is_excluded(
     fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cut = _FakeFdr.DELISTED[4]
-    fetch_env.bars[cut] = (date(2011, 1, 3), date(2012, 1, 2))  # 상폐일(2014-07-01)보다 2년 이상 이름
+    fetch_env.bars[cut] = (date(2010, 1, 4), date(2012, 1, 2))  # 상폐일(2014-07-01)보다 2년 이상 이름
     u = _run_fetch(fetch_env, monkeypatch, "--delisted")
+    assert u["fetch_complete"] is False and cut in u["required_failed"]  # 첫 실패는 재시도 요구
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")  # 두 번째 실행도 실패 → 확정
     assert u["fetch_complete"] is True
     assert cut in u["unavailable"] and cut not in u["delisted_available"]  # 잘린 이력으로 채점 안 함
     assert not (mx.BARS_DIR / f"{cut}.csv").exists()
@@ -1421,3 +1423,32 @@ def test_auc_bounds_follow_probability_rank_not_gate() -> None:
                     [*(q.label for q in pool), *combo])
              for combo in itertools.product([0, 1], repeat=len(censored))]
     assert lo == pytest.approx(min(brute)) and hi == pytest.approx(max(brute))  # 전수 대조
+
+
+# -- Codex 40차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_first_delisted_fetch_mass_failure_requires_retry(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    down = _FakeFdr.DELISTED[: len(_FakeFdr.DELISTED) // 2]
+    saved = {c: fetch_env.bars[c] for c in down}
+    for c in down:
+        fetch_env.bars[c] = None  # 최초 조회 중 일시 장애로 절반 실패
+    u = _run_fetch(fetch_env, monkeypatch, "--delisted")
+    assert u["fetch_complete"] is False  # 한 번의 실행으로 B 축소를 승인하지 않음
+    fetch_env.bars.update(saved)  # 장애 복구 후 재시도
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is True and u["unavailable"] == []
+    assert u["delisted_failed_once"] == []
+
+
+def test_new_delisted_ticker_with_truncated_prefix_is_rejected(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cut = _FakeFdr.DELISTED[6]
+    fetch_env.bars[cut] = (date(2013, 1, 2), date(2014, 6, 30))  # 2005 상장인데 2013 부터만 옴
+    _run_fetch(fetch_env, monkeypatch, "--delisted")
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is True and cut in u["unavailable"]
+    assert not (mx.BARS_DIR / f"{cut}.csv").exists()
