@@ -473,6 +473,23 @@ def test_load_template_requires_all_eval_tickers(tmp_path: Path) -> None:
     diff = {**full, "005380@1D": {**cfg, "risk_per_trade": 0.01}}
     with pytest.raises(SystemExit, match="서로 다름"):
         mx.load_template(_watchlist(tmp_path, diff))
-    # 기본값은 명시 선택 또는 파일 없음일 때만
+    # 기본값은 `--watchlist none` 명시 선택일 때만 — 파일이 없으면 중단
     assert mx.load_template(None)[0] == mx.DEFAULT_TEMPLATE
-    assert mx.load_template(tmp_path / "absent.json")[0] == mx.DEFAULT_TEMPLATE
+    with pytest.raises(SystemExit, match="--watchlist none"):
+        mx.load_template(tmp_path / "absent.json")
+
+
+def test_claim_run_pins_execution_path(tmp_path: Path) -> None:
+    path = tmp_path / "preds" / "mitra_A_N10_x.csv"
+    cpu_fast = {"device": "cpu", "fast": True}
+    mx.claim_run(path, cpu_fast)
+    mx.claim_run(path, cpu_fast)  # 같은 경로로 재개는 허용
+    with pytest.raises(SystemExit, match="실행 경로"):
+        mx.claim_run(path, {"device": "mps", "fast": True})
+    with pytest.raises(SystemExit, match="실행 경로"):
+        mx.claim_run(path, {"device": "cpu", "fast": False})
+    # 실행 경로 기록 없이 남은 예측 파일은 출처 불명 → 거부
+    orphan = tmp_path / "preds" / "mitra_A_N5_x.csv"
+    orphan.write_text("ticker\n")
+    with pytest.raises(SystemExit, match="기록 없는"):
+        mx.claim_run(orphan, cpu_fast)

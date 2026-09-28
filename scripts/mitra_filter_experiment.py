@@ -21,6 +21,7 @@
     .venv/bin/python scripts/mitra_filter_experiment.py evaluate              # → data/mitra/report.md
 
 ``predict`` 는 블록 단위로 이어쓰기 한다 (중단 후 재실행하면 이어서 진행).
+평가 템플릿은 ``--watchlist``(기본 watchlist.json)에서 읽는다. 운용 기본값은 ``--watchlist none``.
 """
 
 from __future__ import annotations
@@ -266,14 +267,18 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 def load_template(watchlist: Path | None) -> tuple[dict[str, Any], str]:
     """평가 3종목의 1D 눌림목 템플릿 (Backtester 는 템플릿 1개 — 셋 다 같아야 한다).
 
-    - ``watchlist`` 가 None(``--watchlist none``) 이거나 파일이 없으면 운용 기본값 (사전등록).
+    - 운용 기본값은 ``--watchlist none``(``watchlist`` = None)으로 **명시 선택**할 때만 쓴다.
+      파일이 없으면 SystemExit — 운용 설정과 다른 실험이 조용히 채점되지 않게.
     - 파일이 있으면 세 종목 **모두** 1D 눌림목 항목이 있고 서로 같아야 한다. 일부만 있거나
       다르면 SystemExit — 한 종목 설정을 다른 종목에 조용히 덮어씌우지 않는다.
     """
     if watchlist is None:
         return dict(DEFAULT_TEMPLATE), "DEFAULT_TEMPLATE (--watchlist none 명시)"
     if not watchlist.exists():
-        return dict(DEFAULT_TEMPLATE), f"DEFAULT_TEMPLATE ({watchlist} 없음)"
+        raise SystemExit(
+            f"{watchlist} 없음 — 운용 워치리스트 경로를 주거나 `--watchlist none` 으로 운용 기본값을 "
+            "명시 선택"
+        )
     data = json.loads(watchlist.read_text(encoding="utf-8")).get("watchlist", {})
     by_ticker: dict[str, list[dict[str, Any]]] = {t: [] for t in EVAL_TICKERS}
     for key, cfg in data.items():
@@ -773,6 +778,30 @@ def marker_path(path: Path) -> Path:
     return path.with_name(path.stem + ".done.json")
 
 
+def run_path(path: Path) -> Path:
+    return path.with_name(path.stem + ".run.json")
+
+
+def claim_run(path: Path, run: dict[str, Any]) -> None:
+    """예측 파일의 실행 경로(장치·빠른/공개 경로)를 처음 만들 때 고정한다.
+
+    다른 경로로 이어 쓰거나 재사용하면 SystemExit — 완료 표시의 실행 경로가 CSV 를 실제로
+    만든 경로임을 보장한다 (G3 대조의 전제)."""
+    rp = run_path(path)
+    if rp.exists():
+        prev = json.loads(rp.read_text())
+        if prev != run:
+            raise SystemExit(
+                f"{path.name}: 기존 예측은 실행 경로 {prev} 로 만들어짐 (지금 {run}) — 같은 "
+                "--device/--slow 로 재개하거나 해당 예측 파일들을 지우고 처음부터"
+            )
+        return
+    if path.exists():
+        raise SystemExit(f"{path.name}: 실행 경로 기록 없는 예측 파일 — 지우고 다시 실행")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rp.write_text(json.dumps(run))
+
+
 def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
     path.unlink(missing_ok=True)
     if rows:
@@ -866,8 +895,12 @@ def cmd_predict(args: argparse.Namespace) -> None:
         if args.model == "mitra" else LogitPredictor()
     )
     fp = experiment_fingerprint(args.model, args.universe, template, tickers, args.hf_model)
+    run: dict[str, Any] = {}
+    if isinstance(predictor, MitraPredictor):
+        run = {"device": predictor.device, "fast": predictor.fast}
     for n in (int(h) for h in args.horizons.split(",")):
         path = preds_path(args.model, args.universe, n, fp)
+        claim_run(path, run)
         marker_path(path).unlink(missing_ok=True)
         expected = expected_keys(plan_blocks(pool, queries, n, blocks)[1])
         existing = read_preds(path)
@@ -889,9 +922,6 @@ def cmd_predict(args: argparse.Namespace) -> None:
         walk_forward(pool, queries, n, predictor, blocks, done=done, on_block=on_block)
         final = read_preds(path)
         complete = is_complete(final, expected)
-        run: dict[str, Any] = {}
-        if isinstance(predictor, MitraPredictor):
-            run = {"device": predictor.device, "fast": predictor.fast}
         marker_path(path).write_text(json.dumps({
             "fingerprint": fp, "complete": complete, "blocks": len(expected),
             "queries": sum(len(v) for v in expected.values()), "rows": len(final), "run": run,
