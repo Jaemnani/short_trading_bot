@@ -858,3 +858,27 @@ def test_write_atomic_keeps_previous_file_on_failure(
     with pytest.raises(OSError):
         mx.write_atomic(path, '{"top": [')
     assert path.read_text() == '{"top": ["000010"]}'  # 잘린 JSON 이 남지 않음
+
+
+# -- Codex 20차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_write_atomic_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import stat
+
+    synced: list[bool] = []  # fsync 된 fd 가 디렉터리인지
+    real_fsync = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        real_fsync(fd)
+
+    monkeypatch.setattr(mx.os, "fsync", spy)
+    mx.write_atomic(tmp_path / "universe.json", "{}")
+    assert synced == [False, True]  # 파일 내용 → rename 을 담은 디렉터리 순
+    synced.clear()
+    mx.save_series(_series("005930", 5, 1), tmp_path / "005930.csv")
+    assert synced == [False, True]

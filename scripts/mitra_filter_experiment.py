@@ -159,6 +159,22 @@ def write_atomic(path: Path, text: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """rename 을 담은 디렉터리 엔트리까지 영속화 — 전원 차단 후 이전 파일(예: fetch_complete=true 인
+    universe.json)이 되살아나지 않게. 디렉터리 fsync 를 지원하지 않는 플랫폼에선 조용히 넘어간다."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def save_series(s: Series, path: Path) -> None:
@@ -170,7 +186,10 @@ def save_series(s: Series, path: Path) -> None:
         w.writerow(["date", "open", "high", "low", "close", "volume"])
         for i, d in enumerate(s.days):
             w.writerow([d.isoformat(), s.open[i], s.high[i], s.low[i], s.close[i], s.volume[i]])
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
 def load_series(ticker: str, path: Path) -> Series:
