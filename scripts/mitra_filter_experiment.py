@@ -272,8 +272,30 @@ def load_template(watchlist: Path) -> tuple[dict[str, Any], str]:
 
 
 def template_hash(template: dict[str, Any]) -> str:
-    blob = json.dumps({"t": template, "fv": FEATURE_VERSION, "h": HORIZONS}, sort_keys=True)
+    blob = json.dumps(
+        {"t": template, "fv": FEATURE_VERSION, "h": HORIZONS, "liq": MIN_AVG_VALUE}, sort_keys=True
+    )
     return hashlib.sha1(blob.encode()).hexdigest()[:10]
+
+
+def file_sha(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def experiment_fingerprint(
+    model: str, universe: str, template: dict[str, Any], tickers: Sequence[str],
+    hf_model: str | None,
+) -> str:
+    """예측 캐시 키: 실험 구성 전체 + 일봉 캐시 내용. 하나라도 바뀌면 다른 파일로 새로 예측한다."""
+    bars = {t: file_sha(BARS_DIR / f"{t}.csv") for t in (KS11, *tickers)
+            if (BARS_DIR / f"{t}.csv").exists()}
+    blob = {
+        "model": model, "universe": universe, "tickers": list(tickers), "template": template,
+        "fv": FEATURE_VERSION, "hf_model": hf_model if model == "mitra" else None, "bars": bars,
+        "fixed": [EVAL_START.isoformat(), SUPPORT_START.isoformat(), REFRESH_DAYS, MAX_SUPPORT,
+                  MIN_SUPPORT, MIN_CLASS, MIN_AVG_VALUE, list(EVAL_TICKERS)],
+    }
+    return hashlib.sha1(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:12]
 
 
 # -- 피처·표본 --------------------------------------------------------------------------------
@@ -420,8 +442,19 @@ def _build_one(job: tuple[str, str, str, dict[str, Any]]) -> tuple[str, int]:
          "f": {str(n): [ld.isoformat(), r] for n, (ld, r) in smp.fwd.items()}}
         for smp in samples
     ]
-    _samples_path(Path(cache_dir), ticker).write_text(json.dumps(rows))
+    payload = {"bars_sha": file_sha(Path(bars_path)), "rows": rows}
+    _samples_path(Path(cache_dir), ticker).write_text(json.dumps(payload))
     return ticker, len(rows)
+
+
+def _cache_fresh(path: Path, bars: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        cached = json.loads(path.read_text())
+    except ValueError:
+        return False
+    return isinstance(cached, dict) and cached.get("bars_sha") == file_sha(bars)
 
 
 def load_samples(tickers: Iterable[str], template: dict[str, Any], jobs: int) -> list[Sample]:
@@ -430,7 +463,8 @@ def load_samples(tickers: Iterable[str], template: dict[str, Any], jobs: int) ->
     todo = [
         (t, str(BARS_DIR / f"{t}.csv"), str(cache), template)
         for t in tickers
-        if (BARS_DIR / f"{t}.csv").exists() and not _samples_path(cache, t).exists()
+        if (BARS_DIR / f"{t}.csv").exists()
+        and not _cache_fresh(_samples_path(cache, t), BARS_DIR / f"{t}.csv")
     ]
     if todo:
         print(f"표본 생성: {len(todo)}종목 (jobs={jobs}) …", flush=True)
@@ -443,7 +477,7 @@ def load_samples(tickers: Iterable[str], template: dict[str, Any], jobs: int) ->
         path = _samples_path(cache, t)
         if not path.exists():
             continue
-        for r in json.loads(path.read_text()):
+        for r in json.loads(path.read_text())["rows"]:
             out.append(Sample(
                 t, date.fromisoformat(r["d"]), tuple(r["x"]), bool(r["l"]),
                 {int(n): (date.fromisoformat(ld), float(ret)) for n, (ld, ret) in r["f"].items()},
@@ -577,6 +611,61 @@ def block_starts(calendar: Sequence[date], start: date, every: int) -> list[date
     return days[::every]
 
 
+@dataclass(slots=True)
+class BlockPlan:
+    """예측 대상 블록 하나: 지지 구간 [lo, hi) (라벨 확정일 순 정렬 인덱스) + 질의."""
+
+    block: date
+    lo: int
+    hi: int
+    queries: list[Sample]
+
+
+@dataclass(slots=True)
+class Support:
+    xs: FloatArr
+    ys: NDArray[np.int64]
+
+
+def plan_blocks(
+    pool: Sequence[Sample],
+    queries: Sequence[Sample],
+    horizon: int,
+    blocks: Sequence[date],
+    *,
+    max_support: int = MAX_SUPPORT,
+    min_support: int = MIN_SUPPORT,
+    min_class: int = MIN_CLASS,
+) -> tuple[Support, list[BlockPlan]]:
+    """블록 [b_k, b_{k+1}) 의 질의와, '라벨 확정일 < b_k' 인 최근 지지 표본 구간.
+
+    지지가 얇은 블록(행 < min_support 또는 한 클래스 < min_class)은 계획에서 빠진다 —
+    예측 없음 = 게이트 통과(현행 동작)."""
+    labeled = sorted((s for s in pool if horizon in s.fwd), key=lambda s: s.fwd[horizon][0])
+    ys_all = np.asarray([1 if s.fwd[horizon][1] > 0 else 0 for s in labeled], dtype=np.int64)
+    support = Support(np.asarray([s.x for s in labeled], dtype=np.float64), ys_all)
+    if not labeled:
+        return support, []
+    label_days = [s.fwd[horizon][0] for s in labeled]
+    by_block: dict[date, list[Sample]] = {}
+    for q in queries:
+        k = bisect.bisect_right(blocks, q.day) - 1
+        if k >= 0:
+            by_block.setdefault(blocks[k], []).append(q)
+    plans: list[BlockPlan] = []
+    for b in blocks:
+        qs = by_block.get(b)
+        if not qs:
+            continue
+        hi = bisect.bisect_left(label_days, b)  # 라벨 확정일 < b 만 (엄격)
+        lo = max(0, hi - max_support)
+        pos = int(ys_all[lo:hi].sum())
+        if hi - lo < min_support or pos < min_class or (hi - lo) - pos < min_class:
+            continue
+        plans.append(BlockPlan(b, lo, hi, qs))
+    return support, plans
+
+
 def walk_forward(
     pool: Sequence[Sample],
     queries: Sequence[Sample],
@@ -591,38 +680,23 @@ def walk_forward(
     min_class: int = MIN_CLASS,
 ) -> list[Pred]:
     """블록 [b_k, b_{k+1}) 의 질의를 '라벨 확정일 < b_k' 인 지지 표본만으로 예측한다."""
-    labeled = sorted((s for s in pool if horizon in s.fwd), key=lambda s: s.fwd[horizon][0])
-    if not labeled:
-        return []
-    label_days = [s.fwd[horizon][0] for s in labeled]
-    xs_all = np.asarray([s.x for s in labeled], dtype=np.float64)
-    ys_all = np.asarray([1 if s.fwd[horizon][1] > 0 else 0 for s in labeled], dtype=np.int64)
-    by_block: dict[date, list[Sample]] = {}
-    for q in queries:
-        k = bisect.bisect_right(blocks, q.day) - 1
-        if k >= 0:
-            by_block.setdefault(blocks[k], []).append(q)
+    support, plans = plan_blocks(pool, queries, horizon, blocks, max_support=max_support,
+                                 min_support=min_support, min_class=min_class)
     out: list[Pred] = []
-    for b in blocks:
-        qs = by_block.get(b)
-        if not qs or (done is not None and b in done):
+    for plan in plans:
+        if done is not None and plan.block in done:
             continue
-        hi = bisect.bisect_left(label_days, b)  # 라벨 확정일 < b 만 (엄격)
-        lo = max(0, hi - max_support)
-        ys = ys_all[lo:hi]
-        pos = int(ys.sum())
-        if hi - lo < min_support or pos < min_class or (hi - lo) - pos < min_class:
-            continue  # 예측 없음 → 게이트는 통과(현행 동작)
-        xq = np.asarray([q.x for q in qs], dtype=np.float64)
-        p = predictor.predict(xs_all[lo:hi], ys, xq)
+        ys = support.ys[plan.lo : plan.hi]
+        xq = np.asarray([q.x for q in plan.queries], dtype=np.float64)
+        p = predictor.predict(support.xs[plan.lo : plan.hi], ys, xq)
         base = float(ys.mean())
         rows = [
             Pred(
-                q.ticker, q.day, b, float(p[j]), base, hi - lo,
+                q.ticker, q.day, plan.block, float(p[j]), base, plan.hi - plan.lo,
                 (1 if q.fwd[horizon][1] > 0 else 0) if horizon in q.fwd else None,
                 q.fwd[horizon][1] if horizon in q.fwd else None,
             )
-            for j, q in enumerate(qs)
+            for j, q in enumerate(plan.queries)
         ]
         out += rows
         if on_block is not None:
@@ -630,11 +704,44 @@ def walk_forward(
     return out
 
 
+def expected_keys(plans: Sequence[BlockPlan]) -> dict[date, set[tuple[str, date]]]:
+    return {p.block: {(q.ticker, q.day) for q in p.queries} for p in plans}
+
+
+def complete_blocks(
+    rows: Sequence[Pred], expected: dict[date, set[tuple[str, date]]]
+) -> set[date]:
+    """질의 키가 계획과 정확히 일치(누락·중복·초과 없음)하는 블록만 완료로 본다."""
+    got: dict[date, list[tuple[str, date]]] = {}
+    for r in rows:
+        got.setdefault(r.block, []).append((r.ticker, r.day))
+    return {
+        b for b, keys in got.items()
+        if b in expected and len(keys) == len(set(keys)) and set(keys) == expected[b]
+    }
+
+
+def is_complete(rows: Sequence[Pred], expected: dict[date, set[tuple[str, date]]]) -> bool:
+    return complete_blocks(rows, expected) == set(expected) and {r.block for r in rows} <= set(
+        expected
+    )
+
+
 PRED_FIELDS = ("ticker", "day", "block", "p", "base", "n_support", "label", "net_ret")
 
 
-def preds_path(model: str, universe: str, horizon: int) -> Path:
-    return PREDS_DIR / f"{model}_{universe}_N{horizon}.csv"
+def preds_path(model: str, universe: str, horizon: int, fingerprint: str) -> Path:
+    return PREDS_DIR / f"{model}_{universe}_N{horizon}_{fingerprint}.csv"
+
+
+def marker_path(path: Path) -> Path:
+    return path.with_name(path.stem + ".done.json")
+
+
+def _rewrite_preds(path: Path, rows: list[Pred]) -> None:
+    path.unlink(missing_ok=True)
+    if rows:
+        _append_preds(path, rows)
 
 
 def read_preds(path: Path) -> list[Pred]:
@@ -707,9 +814,17 @@ def cmd_predict(args: argparse.Namespace) -> None:
         MitraPredictor(args.hf_model, args.device, fast=not args.slow)
         if args.model == "mitra" else LogitPredictor()
     )
+    fp = experiment_fingerprint(args.model, args.universe, template, tickers, args.hf_model)
     for n in (int(h) for h in args.horizons.split(",")):
-        path = preds_path(args.model, args.universe, n)
-        done = {p.block for p in read_preds(path)}
+        path = preds_path(args.model, args.universe, n, fp)
+        marker_path(path).unlink(missing_ok=True)
+        expected = expected_keys(plan_blocks(pool, queries, n, blocks)[1])
+        existing = read_preds(path)
+        done = complete_blocks(existing, expected)
+        kept = [r for r in existing if r.block in done]
+        if len(kept) != len(existing):  # 중단으로 반쯤 쓰인 블록 등은 버리고 다시 예측
+            print(f"  N={n}: 불완전 행 {len(existing) - len(kept)}개 폐기 후 이어서 진행")
+            _rewrite_preds(path, kept)
         t0 = time.time()
         count = [0]
 
@@ -721,7 +836,32 @@ def cmd_predict(args: argparse.Namespace) -> None:
                 print(f"  N={n}: 블록 {count[0]} ({time.time() - t0:.0f}s)", flush=True)
 
         walk_forward(pool, queries, n, predictor, blocks, done=done, on_block=on_block)
-        print(f"N={n} 완료 → {path} ({time.time() - t0:.0f}s)")
+        final = read_preds(path)
+        complete = is_complete(final, expected)
+        marker_path(path).write_text(json.dumps({
+            "fingerprint": fp, "complete": complete, "blocks": len(expected),
+            "queries": sum(len(v) for v in expected.values()), "rows": len(final),
+        }))
+        state = "완료" if complete else "불완전 — 다시 실행하면 이어서 진행"
+        print(f"N={n} {state} → {path} ({time.time() - t0:.0f}s)")
+
+
+def load_complete_preds(
+    model: str, universe: str, horizon: int, template: dict[str, Any], hf_model: str
+) -> tuple[list[Pred] | None, str]:
+    """현재 구성과 지문이 같고 완전성 표시가 된 예측만 돌려준다. 아니면 (None, 사유)."""
+    try:
+        tickers = universe_tickers(universe)
+    except (SystemExit, FileNotFoundError) as e:
+        return None, f"유니버스 {universe} 없음 ({e})"
+    path = preds_path(model, universe, horizon,
+                      experiment_fingerprint(model, universe, template, tickers, hf_model))
+    marker = marker_path(path)
+    if not path.exists() or not marker.exists():
+        return None, f"{model}/{universe}/N{horizon}: 현재 구성의 예측 없음 (`{path.name}`)"
+    if not json.loads(marker.read_text()).get("complete"):
+        return None, f"{model}/{universe}/N{horizon}: 예측 불완전 — predict 재실행 필요"
+    return read_preds(path), "ok"
 
 
 # -- 평가 ------------------------------------------------------------------------------------
@@ -852,9 +992,10 @@ def rolling_windows(
 
 
 def window_return(curve: Sequence[tuple[date, float]], start: date, end: date) -> float:
+    """구간 수익. 구간 안 관측이 없거나 데이터가 종료일 전에 끝나면 NaN (동률 통과 방지)."""
     before = [v for d, v in curve if d < start]
-    inside = [v for d, v in curve if d <= end]
-    if not before or not inside:
+    inside = [v for d, v in curve if start <= d <= end]
+    if not before or not inside or not curve or curve[-1][0] < end:
         return math.nan
     return inside[-1] / before[-1] - 1
 
@@ -904,7 +1045,9 @@ def g1_pass(arm: RunStats, base: RunStats) -> tuple[bool, list[str]]:
         why.append(f"MDD {arm.mdd:.4f} > {base.mdd:.4f}")
     for name, v in arm.bear.items():
         ref = base.bear.get(name, math.nan)
-        if math.isfinite(v) and math.isfinite(ref) and v < ref - 1e-12:
+        if not (math.isfinite(v) and math.isfinite(ref)):
+            why.append(f"하락장 {name} 데이터 부족 → 비교 불가")
+        elif v < ref - 1e-12:
             why.append(f"하락장 {name} {v:+.4f} < {ref:+.4f}")
     if arm.filtered < G1_MIN_FILTERED:
         why.append(f"걸러진 진입 {arm.filtered} < {G1_MIN_FILTERED}")
@@ -946,19 +1089,27 @@ def _stats_row(r: RunStats) -> str:
             f"{roll(r12)} | {roll(r6)} | {bear} |")
 
 
-def g0_section(lines: list[str]) -> bool:
+def g0_section(lines: list[str], template: dict[str, Any], hf_model: str) -> bool:
     n = CENTER[0]
     ok = True
     for universe in ("A", "B"):
-        mitra = read_preds(preds_path("mitra", universe, n))
-        logit = read_preds(preds_path("logit", universe, n))
-        if not mitra:
-            lines.append(f"- 유니버스 {universe}: Mitra 예측 없음 → **G0 판정 불가(미충족)**")
+        mitra, why_m = load_complete_preds("mitra", universe, n, template, hf_model)
+        logit, why_l = load_complete_preds("logit", universe, n, template, hf_model)
+        if mitra is None:
+            lines.append(f"- 유니버스 {universe}: {why_m} → **G0 판정 불가(미충족)**")
             ok = False
             continue
+        if logit is not None and {(p.ticker, p.day) for p in logit} != {
+            (p.ticker, p.day) for p in mitra
+        }:
+            lines.append(f"- 유니버스 {universe}: Mitra/로지스틱 표본 불일치 → **G0 판정 불가**")
+            ok = False
+            continue
+        if logit is None:
+            lines.append(f"  - ({why_l})")
         pool = [p for p in mitra if p.label is not None]
         dm = discrimination(pool)
-        dl = discrimination([p for p in logit if p.label is not None]) if logit else None
+        dl = discrimination([p for p in logit if p.label is not None]) if logit is not None else None
         logit_desc = f"로지스틱 AUC {dl.auc:.4f}" if dl is not None else "로지스틱 예측 없음"
         lines.append(f"- 유니버스 {universe} (N={n}, 표본 {dm.n}): Mitra AUC **{dm.auc:.4f}**"
                      f" · {logit_desc}")
@@ -992,7 +1143,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         f"- 평가: {', '.join(EVAL_TICKERS)} · {EVAL_START} ~ 데이터 끝 · 시작자본 {STARTING_EQUITY:,}",
         "", "## G0 판별력", "",
     ]
-    g0 = g0_section(lines)
+    g0 = g0_section(lines, template, args.hf_model)
 
     tape = tape_for(EVAL_TICKERS, EVAL_START - timedelta(days=450))  # 지표 창(300봉) 포화
     base = run_arm("현행", template, tape, {})
@@ -1000,11 +1151,11 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     passes: dict[tuple[int, float], bool] = {}
     reasons: dict[tuple[int, float], list[str]] = {}
     for n in HORIZONS:
-        preds = read_preds(preds_path("mitra", "A", n))
+        preds, why = load_complete_preds("mitra", "A", n, template, args.hf_model)
         for d in DELTAS:
-            if not preds:
+            if preds is None:
                 passes[(n, d)] = False
-                reasons[(n, d)] = ["예측 없음"]
+                reasons[(n, d)] = [why]
                 continue
             arm = run_arm(f"N={n} δ={d:+.2f}", template, tape, gate_from(preds, d))
             arms[(n, d)] = arm

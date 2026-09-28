@@ -314,3 +314,68 @@ def test_mitra_adapter_fast_and_public_paths(tmp_path: Path) -> None:
         p = mx.MitraPredictor(str(tmp_path / "tiny"), "cpu", fast=fast).predict(xs, ys, xq)
         assert p.shape == (7,)
         assert np.all((p >= 0) & (p <= 1))
+
+
+# -- Codex 리뷰 반영 회귀 테스트 ----------------------------------------------------------
+
+
+def test_window_return_requires_observations_and_coverage() -> None:
+    curve = [(date(2017, 12, 29), 100.0), (date(2018, 6, 1), 90.0), (date(2019, 1, 2), 95.0)]
+    assert mx.window_return(curve, date(2018, 1, 1), date(2018, 12, 31)) == pytest.approx(-0.1)
+    # 구간 안 관측 없음 → 0% 동률이 아니라 NaN
+    gap = [(date(2017, 12, 29), 100.0), (date(2019, 1, 2), 95.0)]
+    assert math.isnan(mx.window_return(gap, date(2018, 1, 1), date(2018, 12, 31)))
+    # 데이터가 구간 종료 전에 끝남 → NaN
+    short = [(date(2026, 6, 30), 100.0), (date(2026, 7, 15), 97.0)]
+    assert math.isnan(mx.window_return(short, date(2026, 7, 1), date(2026, 8, 31)))
+
+
+def test_g1_fails_when_bear_window_not_comparable() -> None:
+    base = _stats("현행", (0.7, 0.10, -0.2), 0.15, bear=math.nan)
+    ok, why = mx.g1_pass(_stats("a", (0.7, 0.12, -0.2), 0.15, bear=math.nan), base)
+    assert not ok and any("데이터 부족" in w for w in why)
+
+
+def _pred(ticker: str, day: date, block: date) -> Any:
+    return mx.Pred(ticker, day, block, 0.5, 0.5, 300, 1, 0.01)
+
+
+def test_completeness_rejects_partial_duplicate_and_extra_blocks() -> None:
+    b1, b2 = date(2016, 1, 4), date(2016, 1, 11)
+    expected = {b1: {("A", date(2016, 1, 4)), ("B", date(2016, 1, 5))},
+                b2: {("A", date(2016, 1, 12))}}
+    full = [_pred("A", date(2016, 1, 4), b1), _pred("B", date(2016, 1, 5), b1),
+            _pred("A", date(2016, 1, 12), b2)]
+    assert mx.is_complete(full, expected)
+    partial = full[:1] + full[2:]  # b1 반쯤 기록 (중단)
+    assert mx.complete_blocks(partial, expected) == {b2}
+    assert not mx.is_complete(partial, expected)
+    dup = [*full, _pred("A", date(2016, 1, 12), b2)]
+    assert mx.complete_blocks(dup, expected) == {b1}
+    extra = [*full, _pred("C", date(2016, 1, 20), date(2016, 1, 18))]
+    assert not mx.is_complete(extra, expected)
+
+
+def test_plan_blocks_matches_walk_forward_output() -> None:
+    samples = _synthetic_samples()
+    blocks = [date(2015, 1, 1) + timedelta(days=k) for k in range(0, 400, 7)]
+    _support, plans = mx.plan_blocks(samples, samples, 10, blocks, min_support=20, min_class=5)
+    preds = mx.walk_forward(samples, samples, 10, _Spy(), blocks, min_support=20, min_class=5)
+    assert mx.is_complete(preds, mx.expected_keys(plans))
+
+
+def test_fingerprint_tracks_config_and_bars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path)
+    (tmp_path / "KS11.csv").write_text("date,open,high,low,close,volume\n")
+    (tmp_path / "005930.csv").write_text("date,open,high,low,close,volume\n")
+    fp = mx.experiment_fingerprint("mitra", "A", TEMPLATE, ["005930"], "m2")
+    assert fp == mx.experiment_fingerprint("mitra", "A", TEMPLATE, ["005930"], "m2")
+    changed = {**TEMPLATE, "risk_per_trade": 0.01}
+    assert fp != mx.experiment_fingerprint("mitra", "A", changed, ["005930"], "m2")
+    assert fp != mx.experiment_fingerprint("mitra", "A", TEMPLATE, ["005930"], "other")
+    assert fp != mx.experiment_fingerprint("mitra", "A", TEMPLATE, ["005930", "000660"], "m2")
+    (tmp_path / "005930.csv").write_text("date,open,high,low,close,volume\n2016-01-04,1,1,1,1,1\n")
+    assert fp != mx.experiment_fingerprint("mitra", "A", TEMPLATE, ["005930"], "m2")
+    # 로지스틱은 체크포인트와 무관
+    assert mx.experiment_fingerprint("logit", "A", TEMPLATE, ["005930"], "x") == \
+        mx.experiment_fingerprint("logit", "A", TEMPLATE, ["005930"], "y")
