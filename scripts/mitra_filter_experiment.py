@@ -229,6 +229,31 @@ def b_stale_after(
     return prior
 
 
+def top_by_marcap(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """KOSPI 시총 상위 ``UNIVERSE_TOP`` 보통주 코드 (사전등록 유니버스 A).
+
+    시총(``Marcap``)이 없거나 숫자가 아닌 행이 있으면 SystemExit — 제공처 행 순서로 대신 뽑으면
+    '상위 100' 이 아닌 유니버스가 조용히 만들어지므로."""
+    ranked: list[tuple[float, str]] = []
+    for r in rows:
+        code = str(r.get("Code", ""))
+        if not code.endswith("0"):  # 보통주만 (우선주 코드는 5/7/9/K 로 끝남)
+            continue
+        try:
+            cap = float(r["Marcap"])
+        except (KeyError, TypeError, ValueError):
+            raise SystemExit(
+                f"KOSPI 목록에 시가총액(Marcap) 없음·비정상 ({code}) — 상위 {UNIVERSE_TOP} 선정 불가"
+            ) from None
+        if not math.isfinite(cap) or cap <= 0:
+            raise SystemExit(f"KOSPI 목록 시가총액 비정상 ({code}: {cap}) — 상위 선정 불가")
+        ranked.append((cap, code))
+    if len(ranked) < UNIVERSE_TOP:
+        raise SystemExit(f"KOSPI 보통주 {len(ranked)}개 < {UNIVERSE_TOP} — 목록 조회 이상")
+    ranked.sort(key=lambda x: -x[0])
+    return [code for _, code in ranked[:UNIVERSE_TOP]]
+
+
 MIN_DELISTED = 100  # 2010년 이후 KOSPI·KOSDAQ 보통주 상폐의 현실적 하한 — 미만이면 조회 이상
 
 
@@ -275,15 +300,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     if "top" not in universe or args.refresh_universe:
         listing = fdr.StockListing("KOSPI")
-        if "Marcap" in listing.columns:
-            listing = listing.sort_values("Marcap", ascending=False)
-        top: list[str] = []
-        for _, r in listing.iterrows():
-            code = str(r["Code"])
-            if code.endswith("0"):  # 보통주만 (우선주 코드는 5/7/9/K 로 끝남)
-                top.append(code)
-            if len(top) >= UNIVERSE_TOP:
-                break
+        top = top_by_marcap(listing.to_dict("records"))
         universe.update({"created": date.today().isoformat(), "top": top})
     universe["eval"] = list(EVAL_TICKERS)
     # B 를 새 스냅샷으로 유효화하는 실행(--refresh·--refresh-universe)은 상폐 목록 자체도 다시 조회

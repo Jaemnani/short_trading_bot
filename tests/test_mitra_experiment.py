@@ -801,3 +801,21 @@ def test_universe_b_rejects_when_no_usable_delisted(
     )
     with pytest.raises(SystemExit, match="1개 <"):  # 한 종목뿐인 B 도 거부
         mx.universe_tickers("B")
+
+
+# -- Codex 17차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_top_by_marcap_sorts_and_requires_marcap() -> None:
+    rows = [{"Code": f"{i:05d}0", "Marcap": float(i)} for i in range(1, 151)]
+    rows.append({"Code": "999995", "Marcap": 1e20})  # 우선주는 제외
+    top = mx.top_by_marcap(reversed(rows))  # 제공처 순서와 무관하게 시총 순
+    assert len(top) == mx.UNIVERSE_TOP and top[0] == "001500" and "999995" not in top
+    no_cap = [{"Code": r["Code"]} for r in rows]  # 컬럼 누락·이름 변경
+    with pytest.raises(SystemExit, match="Marcap"):
+        mx.top_by_marcap(no_cap)
+    bad = [*rows[:-1], {"Code": "888880", "Marcap": float("nan")}]
+    with pytest.raises(SystemExit, match="비정상"):
+        mx.top_by_marcap(bad)
+    with pytest.raises(SystemExit, match="< 100"):
+        mx.top_by_marcap(rows[:50])
