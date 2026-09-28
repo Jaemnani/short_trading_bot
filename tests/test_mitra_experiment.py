@@ -959,3 +959,33 @@ def test_impl_key_covers_experiment_script_source(tmp_path: Path,
     before = mx.impl_key()
     script.write_text("A = 2\n")  # 예측 구현 수정
     assert mx.impl_key() != before
+
+
+# -- Codex 26차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_new_failure_of_previously_fetched_delisted_keeps_fetch_incomplete() -> None:
+    u: dict[str, Any] = {"delisted": ["111110", "222220", "333330"]}
+    # 222220 은 이전 완료 fetch 에서 정상 수신됨, 333330 은 목록에 새로 들어온 종목
+    assert mx.finish_fetch(u, ["222220", "333330"], prior_available={"111110", "222220"}) == [
+        "222220"
+    ]
+    assert u["fetch_complete"] is False  # B 를 조용히 축소하지 않는다
+    assert mx.finish_fetch(u, ["333330"], prior_available={"111110", "222220"}) == []
+
+
+def test_current_tickers_lagging_ks11_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    days = [date(2016, 1, 4) + timedelta(days=i) for i in range(10)]
+    rows = "".join(f"{d.isoformat()},1,1,1,1,1\n" for d in days)
+    header = "date,open,high,low,close,volume\n"
+    for t in ["KS11", *EVAL, *TOP]:
+        (tmp_path / "bars" / f"{t}.csv").write_text(header + rows)
+    mx.universe_tickers("A")  # 전부 최신 → 통과
+    (tmp_path / "bars" / f"{TOP[3]}.csv").write_text(header + rows.splitlines(True)[0])
+    assert mx.lagging_codes([*EVAL, *TOP]) == [TOP[3]]  # 중간에서 잘린 응답
+    with pytest.raises(SystemExit, match=TOP[3]):
+        mx.universe_tickers("A")
