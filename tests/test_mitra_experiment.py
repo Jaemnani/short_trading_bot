@@ -467,7 +467,8 @@ def test_sample_cache_invalidated_by_ks11_change(
 def test_latency_must_match_evaluation_config() -> None:
     run = {"device": "cpu", "fast": True}
     lat = {"seconds": 10.0, "checkpoint": "m2", "support": mx.MAX_SUPPORT,
-           "features": len(mx.FEATURES), "device": "cpu", "fast": True}
+           "features": len(mx.FEATURES), "device": "cpu", "fast": True,
+           "code": mx.impl_key()}
     assert mx.latency_matches(lat, "m2", run)
     assert not mx.latency_matches(lat, "other", run)  # 가중치 내용이 다름
     assert not mx.latency_matches(lat, None, run)  # 체크포인트 확인 불가
@@ -477,6 +478,7 @@ def test_latency_must_match_evaluation_config() -> None:
     assert not mx.latency_matches({**lat, "device": "mps"}, "m2", run)
     assert not mx.latency_matches({**lat, "fast": False}, "m2", run)
     assert not mx.latency_matches(lat, "m2", None)  # 완전한 Mitra 예측 없음
+    assert not mx.latency_matches({**lat, "code": "old"}, "m2", run)  # 실험 구현이 바뀜
 
 
 def _watchlist(tmp_path: Path, entries: dict[str, Any]) -> Path:

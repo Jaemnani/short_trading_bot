@@ -1716,11 +1716,12 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def latency_matches(
     lat: dict[str, Any], checkpoint: str | None, run: dict[str, Any] | None
 ) -> bool:
-    """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수)과, 실제 예측에 쓴 실행 경로
-    (``run`` = 예측 완료 표시의 장치·빠른/공개 경로)로 잰 측정만 인정한다."""
+    """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수·실험 구현 해시)과, 실제 예측에 쓴
+    실행 경로(``run`` = 예측 완료 표시의 장치·빠른/공개 경로)로 잰 측정만 인정한다."""
     return (
         run is not None and bool(run)
         and checkpoint is not None and lat.get("checkpoint") == checkpoint
+        and lat.get("code") == impl_key()  # 예측기·모델 초기화 코드가 바뀌면 재측정
         and lat.get("support") == MAX_SUPPORT
         and lat.get("features") == len(FEATURES)
         and lat.get("device") == run.get("device") and lat.get("fast") == run.get("fast")
@@ -1748,7 +1749,7 @@ def cmd_latency(args: argparse.Namespace) -> None:
             "hf_model": args.hf_model, "checkpoint": checkpoint,
             "device": predictor.device, "fast": predictor.fast,
             "support": MAX_SUPPORT,
-            "features": len(FEATURES)}
+            "features": len(FEATURES), "code": impl_key()}
     ROOT.mkdir(parents=True, exist_ok=True)
     write_atomic(ROOT / "latency.json", json.dumps(info))
     print(info)
