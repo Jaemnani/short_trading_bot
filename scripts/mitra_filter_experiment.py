@@ -248,6 +248,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe["fetch_complete"] = False
     universe["fetch_mode"] = "refresh" if args.refresh else "normal"
     universe["fetch_delisted"] = bool(args.delisted)
+    if args.refresh and "delisted" in universe:
+        # 상폐 일봉까지 새로 받는 --refresh --delisted 만 B 를 최신 스냅샷으로 되돌린다.
+        # --delisted 없는 --refresh 는 상폐 일봉만 옛 시점에 남겨 B 를 혼합 스냅샷으로 만든다.
+        universe["b_stale"] = not args.delisted
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
@@ -356,11 +360,25 @@ def file_sha(path: Path) -> str:
 CHECKPOINT_FILES = ("config.json", "model.safetensors")
 
 
-def resolve_checkpoint(hf_model: str) -> tuple[str, str]:
-    """Mitra 체크포인트를 로컬 스냅샷 하나로 고정하고 (디렉터리, 내용 해시) 를 돌려준다.
+def mitra_impl() -> str:
+    """Mitra 추론 구현 식별자 — 같은 가중치라도 AutoGluon·torch 버전이 다르면 다른 실행으로 본다."""
+    from importlib.metadata import PackageNotFoundError, version
 
-    예측·지연 측정은 반환된 디렉터리로만 모델을 적재하고, 지문·메타데이터에는 내용 해시를 쓴다
-    — 같은 이름으로 가중치가 바뀌어도(로컬 교체·HF 저장소 갱신) 옛 예측과 섞이지 않는다."""
+    parts = []
+    for pkg in ("autogluon.tabular", "torch"):
+        try:
+            parts.append(f"{pkg}={version(pkg)}")
+        except PackageNotFoundError:
+            parts.append(f"{pkg}=none")
+    return ",".join(parts)
+
+
+def resolve_checkpoint(hf_model: str) -> tuple[str, str]:
+    """Mitra 체크포인트를 로컬 스냅샷 하나로 고정하고 (디렉터리, 식별자) 를 돌려준다.
+
+    식별자 = 가중치 파일 내용 해시 + 추론 구현(``mitra_impl``). 예측·지연 측정은 반환된
+    디렉터리로만 모델을 적재하고, 지문·메타데이터에는 식별자를 쓴다 — 같은 이름으로 가중치가
+    바뀌거나(로컬 교체·HF 저장소 갱신) AutoGluon·torch 가 바뀌면 옛 예측과 섞이지 않는다."""
     path = Path(hf_model)
     if not path.is_dir():
         try:
@@ -375,6 +393,7 @@ def resolve_checkpoint(hf_model: str) -> tuple[str, str]:
     h = hashlib.sha1()
     for name in CHECKPOINT_FILES:
         h.update(f"{name}:{file_sha(path / name)};".encode())
+    h.update(f"impl:{mitra_impl()}".encode())
     return str(path), h.hexdigest()[:16]
 
 
@@ -919,6 +938,9 @@ def universe_tickers(universe: str) -> list[str]:
     if universe == "B":
         if "delisted" not in u:
             raise SystemExit("유니버스 B 는 먼저 `fetch --delisted` 필요")
+        if u.get("b_stale"):
+            raise SystemExit("상폐 일봉이 --refresh 에서 빠져 B 가 혼합 스냅샷 — "
+                             "`fetch --refresh --delisted` 필요")
         unavailable = set(u.get("unavailable", []))
         tickers += [c for c in u["delisted"] if c not in unavailable]
     tickers = list(dict.fromkeys(tickers))
@@ -1453,19 +1475,23 @@ def latency_matches(
 
 
 def cmd_latency(args: argparse.Namespace) -> None:
-    """지지 5,000행, 32피처, 질의 1행 — 모델 적재 포함 1회 예측 시간(3회 중 최솟값)."""
+    """지지 5,000행, 32피처, 질의 1행 — 매 회 모델을 새로 적재해 첫 예측까지 잰 시간.
+
+    장마감 판단을 새 프로세스로 돌리는 운용과 같게 적재·초기화 비용을 포함하고, 3회 중
+    최댓값(보수적)을 G3 에 쓴다."""
     rng = np.random.default_rng(0)
     xs = rng.normal(size=(MAX_SUPPORT, len(FEATURES)))
     ys = (xs[:, 0] + rng.normal(size=MAX_SUPPORT) > 0).astype(np.int64)
     xq = rng.normal(size=(1, len(FEATURES)))
     ckpt_dir, checkpoint = resolve_checkpoint(args.hf_model)
-    predictor = MitraPredictor(ckpt_dir, args.device, fast=not args.slow)
     times: list[float] = []
     for _ in range(3):
         t0 = time.perf_counter()
+        predictor = MitraPredictor(ckpt_dir, args.device, fast=not args.slow)
         predictor.predict(xs, ys, xq)
         times.append(time.perf_counter() - t0)
-    info = {"seconds": round(min(times), 2), "runs": [round(t, 2) for t in times],
+    info = {"seconds": round(max(times), 2), "runs": [round(t, 2) for t in times],
+            "includes": "model_load+first_predict", "impl": mitra_impl(),
             "hf_model": args.hf_model, "checkpoint": checkpoint,
             "device": predictor.device, "fast": predictor.fast,
             "support": MAX_SUPPORT,

@@ -608,3 +608,29 @@ def test_checkpoint_id_tracks_weight_contents(tmp_path: Path) -> None:
     (ckpt / "config.json").unlink()
     with pytest.raises(SystemExit, match=r"config\.json"):
         mx.resolve_checkpoint(str(ckpt))
+
+
+# -- Codex 10차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_universe_b_rejected_after_refresh_without_delisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": EVAL, "top": TOP, "delisted": ["111110"], "unavailable": [], "b_stale": True}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP, "111110"], u)
+    assert mx.universe_tickers("A")  # A 는 영향 없음
+    with pytest.raises(SystemExit, match="--refresh --delisted"):
+        mx.universe_tickers("B")
+
+
+def test_checkpoint_id_tracks_inference_implementation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text("{}")
+    (ckpt / "model.safetensors").write_bytes(b"w")
+    monkeypatch.setattr(mx, "mitra_impl", lambda: "autogluon.tabular=1.6.3,torch=2.13.0")
+    old = mx.resolve_checkpoint(str(ckpt))[1]
+    monkeypatch.setattr(mx, "mitra_impl", lambda: "autogluon.tabular=1.7.0,torch=2.13.0")
+    assert mx.resolve_checkpoint(str(ckpt))[1] != old  # 같은 가중치, 다른 AutoGluon
