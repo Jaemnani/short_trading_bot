@@ -73,6 +73,7 @@ MAX_SUPPORT = 5000
 MIN_SUPPORT = 300
 MIN_CLASS = 50
 MIN_AVG_VALUE = 5e9  # 20일 평균 거래대금 50억
+UNIVERSE_TOP = 100  # 지지 유니버스 A = KOSPI 시총 상위 100 보통주
 STARTING_EQUITY = Decimal(10_000_000)
 BEAR_WINDOWS = (
     ("2018", date(2018, 1, 1), date(2018, 12, 31)),
@@ -200,7 +201,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             code = str(r["Code"])
             if code.endswith("0"):  # 보통주만 (우선주 코드는 5/7/9/K 로 끝남)
                 top.append(code)
-            if len(top) >= args.top:
+            if len(top) >= UNIVERSE_TOP:
                 break
         universe.update({"created": date.today().isoformat(), "top": top})
     universe["eval"] = list(EVAL_TICKERS)
@@ -227,6 +228,9 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     targets = [KS11, *universe["eval"], *universe["top"]]
     if args.delisted:
         targets += universe.get("delisted", [])
+    # 진행 중 표시: 중단되면(예: --refresh 도중) 옛·새 일봉이 섞인 캐시를 후속 명령이 거부한다.
+    universe["fetch_complete"] = False
+    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
     for n, code in enumerate(dict.fromkeys(targets), 1):
         path = BARS_DIR / f"{code}.csv"
@@ -242,6 +246,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
                 break
         if df is None or len(df) == 0:
             failed.append(code)
+            path.unlink(missing_ok=True)  # 새로고침 실패 → 옛 일봉을 남기지 않는다 (섞임 방지)
             continue
         save_series(_frame_to_series(code, df), path)
         if n % 50 == 0:
@@ -254,6 +259,9 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     )
     UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     required_failed = [c for c in failed if c not in delisted]
+    universe["required_failed"] = required_failed
+    universe["fetch_complete"] = True
+    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
     if required_failed:
         print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — 재실행 전엔 predict 불가")
@@ -841,6 +849,15 @@ def universe_tickers(universe: str) -> list[str]:
 
     일봉이 하나라도 없으면 SystemExit — 누락 종목을 조용히 뺀 채 완전하다고 채점하지 않는다."""
     u = json.loads(UNIVERSE_FILE.read_text())
+    if not u.get("fetch_complete", False):
+        raise SystemExit("fetch 가 완료되지 않음(중단된 새로고침 등) — fetch 재실행 필요")
+    if u.get("required_failed"):
+        raise SystemExit(f"필수 종목 조회 실패 {u['required_failed']} — fetch 재실행 필요")
+    if len(u["top"]) != UNIVERSE_TOP or list(u["eval"]) != list(EVAL_TICKERS):
+        raise SystemExit(
+            f"유니버스가 사전등록(시총 상위 {UNIVERSE_TOP} + 평가 {list(EVAL_TICKERS)})과 다름 — "
+            "`fetch --refresh-universe` 로 다시 만들 것"
+        )
     tickers = [*u["eval"], *u["top"]]
     if universe == "B":
         if "delisted" not in u:
@@ -1332,7 +1349,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch", help="FDR 일봉 다운로드·캐시")
-    f.add_argument("--top", type=int, default=100)
     f.add_argument("--delisted", action="store_true", help="유니버스 B(상폐 포함)")
     f.add_argument("--refresh", action="store_true", help="캐시된 일봉도 다시 받기")
     f.add_argument("--refresh-universe", action="store_true", help="시총 상위 목록 다시 뽑기")

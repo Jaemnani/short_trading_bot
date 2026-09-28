@@ -395,24 +395,47 @@ def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
     (tmp_path / "bars").mkdir()
     for t in bars:
         (tmp_path / "bars" / f"{t}.csv").write_text("date,open,high,low,close,volume\n")
-    (tmp_path / "universe.json").write_text(json.dumps(u))
+    (tmp_path / "universe.json").write_text(json.dumps({"fetch_complete": True, **u}))
+
+
+TOP = [f"9{i:04d}0" for i in range(1, mx.UNIVERSE_TOP + 1)]  # 평가 종목과 겹치지 않게
+EVAL = list(mx.EVAL_TICKERS)
 
 
 def test_universe_rejects_missing_bars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    u = {"eval": ["005930"], "top": ["000660", "005380"], "delisted": ["111110", "222220"],
-         "unavailable": ["222220"]}
-    _universe(tmp_path, monkeypatch, ["KS11", "005930", "000660", "111110"], u)
-    with pytest.raises(SystemExit, match="005380"):  # 필수 종목 누락 → 조용히 빼지 않고 중단
+    u = {"eval": EVAL, "top": TOP, "delisted": ["111110", "222220"], "unavailable": ["222220"]}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP[:-1], "111110"], u)
+    with pytest.raises(SystemExit, match=TOP[-1]):  # 필수 종목 누락 → 조용히 빼지 않고 중단
+        mx.universe_tickers("A")
+
+
+def test_universe_rejects_incomplete_fetch_or_wrong_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    u = {"eval": EVAL, "top": TOP}
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP], u)
+    assert len(mx.universe_tickers("A")) == len(EVAL) + mx.UNIVERSE_TOP
+    uf = tmp_path / "universe.json"
+    uf.write_text(json.dumps({**u, "fetch_complete": False}))  # 새로고침 중단
+    with pytest.raises(SystemExit, match="완료되지 않음"):
+        mx.universe_tickers("A")
+    uf.write_text(json.dumps({**u, "fetch_complete": True, "required_failed": [EVAL[0]]}))
+    with pytest.raises(SystemExit, match="조회 실패"):
+        mx.universe_tickers("A")
+    uf.write_text(json.dumps({"eval": EVAL, "top": TOP[:50], "fetch_complete": True}))
+    with pytest.raises(SystemExit, match="사전등록"):  # 상위 100 이 아닌 유니버스
         mx.universe_tickers("A")
 
 
 def test_universe_b_excludes_only_recorded_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    u = {"eval": ["005930"], "top": ["000660"], "delisted": ["111110", "222220", "333330"],
+    u = {"eval": EVAL, "top": TOP, "delisted": ["111110", "222220", "333330"],
          "unavailable": ["222220"]}
-    _universe(tmp_path, monkeypatch, ["KS11", "005930", "000660", "111110", "333330"], u)
-    assert mx.universe_tickers("B") == ["005930", "000660", "111110", "333330"]
+    _universe(tmp_path, monkeypatch, ["KS11", *EVAL, *TOP, "111110", "333330"], u)
+    assert mx.universe_tickers("B") == [*EVAL, *TOP, "111110", "333330"]
     (tmp_path / "bars" / "333330.csv").unlink()  # 기록되지 않은 누락 → 거부
     with pytest.raises(SystemExit, match="333330"):
         mx.universe_tickers("B")
