@@ -1771,8 +1771,14 @@ def g0_section(
             # 최악에서도 통과 → 통과 확정, 최선에서도 실패 → 실패 확정, 그 사이 → 판정 불가.
             lines.append(f"  - 상폐 직전 우측 검열 표본 {len(censored)}개 — 라벨 없음, 양 극단으로 "
                          "채워 재채점 (수익 범위 -100%~+inf — 정리매매는 가격제한폭이 없음):")
-            worst = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=True), dl)
-            best = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=False), dl)
+            # ①(AUC)은 확률 순위로, ③(평균수익)은 게이트 통과 여부로 각각의 경계를 따로 구한다
+            # — 둘을 독립 경계로 쓰면 보수적이다(모든 완성이 통과/실패할 때만 확정).
+            auc_lo, auc_hi = auc_bounds(pool, censored)
+            lines.append(f"    - Mitra AUC 가능 범위 [{auc_lo:.4f}, {auc_hi:.4f}]")
+            worst = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=True), dl,
+                               auc_override=auc_lo)
+            best = _g0_checks([], universe, n, censored_fill(pool, censored, adverse=False), dl,
+                              auc_override=auc_hi)
             lines.append(f"    - 최악 가정 {'통과 ✓' if worst else '실패 ✗'} · "
                          f"최선 가정 {'통과 ✓' if best else '실패 ✗'}")
             if worst:
@@ -1788,10 +1794,15 @@ def g0_section(
 
 
 def _g0_checks(
-    lines: list[str], universe: str, n: int, pool: Sequence[Pred], dl: Discrimination | None
+    lines: list[str], universe: str, n: int, pool: Sequence[Pred], dl: Discrimination | None,
+    auc_override: float | None = None,
 ) -> bool:
-    """G0 ①·②·③ (라벨이 있는 표본 ``pool``). 결과 줄을 ``lines`` 에 덧붙이고 통과 여부 반환."""
+    """G0 ①·②·③ (라벨이 있는 표본 ``pool``). 결과 줄을 ``lines`` 에 덧붙이고 통과 여부 반환.
+
+    ``auc_override``: 검열 표본 경계 채점에서 ① 에 쓸 AUC 경계값 (``pool`` 의 AUC 대신)."""
     dm = discrimination(pool)
+    if auc_override is not None:
+        dm = replace(dm, auc=auc_override)
     logit_desc = f"로지스틱 AUC {dl.auc:.4f}" if dl is not None else "로지스틱 예측 없음"
     lines.append(f"- 유니버스 {universe} (N={n}, 표본 {dm.n}): Mitra AUC **{dm.auc:.4f}**"
                  f" · {logit_desc}")
@@ -1825,10 +1836,33 @@ def censored_delisted(preds: Sequence[Pred]) -> list[Pred]:
     return [p for p in preds if p.label is None and p.ticker in delisted]
 
 
+def auc_bounds(pool: Sequence[Pred], censored: Sequence[Pred]) -> tuple[float, float]:
+    """검열 표본 라벨을 임의로 정할 때 Mitra AUC 의 정확한 최솟값·최댓값.
+
+    양성 개수 k 를 고정하면, 교환 논법으로 검열 표본 중 확률이 가장 낮은 k 개를 양성으로 둘 때
+    AUC 가 최소, 가장 높은 k 개를 양성으로 둘 때 최대다. k = 0..m 을 모두 본다."""
+    scores = [p.p for p in pool]
+    labels = [p.label for p in pool if p.label is not None]
+    cs = sorted(p.p for p in censored)
+    m = len(cs)
+    lo, hi = math.inf, -math.inf
+    for k in range(m + 1):
+        low_pos = [1] * k + [0] * (m - k)   # 낮은 확률 k 개가 양성 → 최소
+        high_pos = [0] * (m - k) + [1] * k  # 높은 확률 k 개가 양성 → 최대
+        a_lo = auc([*scores, *cs], [*labels, *low_pos])
+        a_hi = auc([*scores, *cs], [*labels, *high_pos])
+        if math.isfinite(a_lo):
+            lo = min(lo, a_lo)
+        if math.isfinite(a_hi):
+            hi = max(hi, a_hi)
+    return lo, hi
+
+
 def censored_fill(
     pool: Sequence[Pred], censored: Sequence[Pred], *, adverse: bool
 ) -> list[Pred]:
-    """검열 표본을 게이트에 가장 불리하게(``adverse``) 또는 가장 유리하게 채운다.
+    """검열 표본을 게이트 ③(평균수익)에 가장 불리하게(``adverse``) 또는 가장 유리하게 채운다.
+    ① 의 AUC 경계는 게이트 통과 여부가 아니라 확률 순위로 정해지므로 ``auc_bounds`` 로 따로 구한다.
 
     수익 범위는 증명 가능한 경계 [-100%, +∞] — 하한은 전액 손실, 상한은 상폐 직전 정리매매에
     가격제한폭이 없어 유한값이 없다(관측 최대값·1.3^N 모두 상한이 아님).

@@ -1401,3 +1401,23 @@ def test_g0_b_nominal_fail_that_censoring_could_reverse_is_undetermined(
     mx.g0_section([], {}, "ckpt", missing)
     # 걸러진 검열 표본 하나가 -100% 면 제외 평균이 내려가 통과할 수 있음 → 기각 확정이 아니라 판정 불가
     assert any("우측 검열" in m for m in missing)
+
+
+# -- Codex 39차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_auc_bounds_follow_probability_rank_not_gate() -> None:
+    import itertools
+
+    def pred(p: float, base: float, label: int | None) -> Any:
+        return mx.Pred("A", date(2016, 3, 2), date(2016, 3, 2), p, base, 400, label,
+                       None if label is None else (0.01 if label else -0.01))
+
+    pool = [pred(0.9, 0.5, 1), pred(0.6, 0.5, 0), pred(0.4, 0.5, 1), pred(0.1, 0.5, 0)]
+    # 게이트 통과 여부가 p 순서와 어긋남: 낮은 p(0.3)가 낮은 base 로 통과, 높은 p(0.7)는 제외
+    censored = [pred(0.3, 0.1, None), pred(0.7, 0.9, None), pred(0.5, 0.5, None)]
+    lo, hi = mx.auc_bounds(pool, censored)
+    brute = [mx.auc([*(q.p for q in pool), *(c.p for c in censored)],
+                    [*(q.label for q in pool), *combo])
+             for combo in itertools.product([0, 1], repeat=len(censored))]
+    assert lo == pytest.approx(min(brute)) and hi == pytest.approx(max(brute))  # 전수 대조
