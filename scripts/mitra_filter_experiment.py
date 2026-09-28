@@ -233,6 +233,11 @@ def _frame_to_series(ticker: str, df: Any) -> Series:
     return Series(ticker, days, arr[0], arr[1], arr[2], arr[3], arr[4])
 
 
+def orphan_bars(universe: dict[str, Any]) -> bool:
+    """유니버스 메타데이터(목록)가 없는데 일봉 캐시가 남아 있는지."""
+    return "top" not in universe and BARS_DIR.is_dir() and any(BARS_DIR.glob("*.csv"))
+
+
 def check_fetch_resume(
     universe: dict[str, Any], refresh: bool, delisted: bool, refresh_universe: bool = False
 ) -> None:
@@ -280,7 +285,7 @@ def available_baseline(universe: dict[str, Any]) -> set[str]:
     # 기준 도입 전 버전에서 중단된 캐시: unavailable 이 미완료 실행으로 바뀌었을 수 있어 복원 불가
     raise SystemExit(
         "이전 버전에서 중단된 상폐 캐시라 가용 기준을 복원할 수 없음 — "
-        f"`{UNIVERSE_FILE}` 를 지우고 처음부터 `fetch --delisted` 로 다시 받을 것"
+        f"`{ROOT}` 디렉터리 전체를 지우고 처음부터 `fetch --delisted` 로 다시 받을 것"
     )
 
 
@@ -387,6 +392,11 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         # 이전 형식(시총 선정 검증 없음)의 목록은 믿지 않는다 — 시총으로 다시 뽑고 전체 새로고침
         print("universe.json 형식이 이전 버전 — 시총 상위 100 을 다시 선정합니다(--refresh-universe)")
         args.refresh_universe = True
+    if orphan_bars(universe) and not args.refresh:
+        # 메타데이터 없이 남은 일봉(중단된 이전 실행 등)은 어느 시점 것인지 알 수 없다 — 건너뛰면
+        # 누락 파일만 새 시점으로 받아 혼합 스냅샷이 완료된다.
+        print("universe.json 없이 남은 일봉 캐시 — 전체 일봉 새로고침(--refresh)을 강제합니다")
+        args.refresh = True
     if args.refresh_universe and not args.refresh:
         # 목록을 바꾸면 전 종목 일봉을 같은 시점으로 다시 받아야 한다 — 새 편입 종목만 최신이고
         # 잔류 종목·KS11 은 옛 종료일이면 A·B 모두 종료일이 섞인다.
@@ -431,6 +441,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     universe["b_stale"] = b_stale_after(universe, args.refresh, args.refresh_universe, args.delisted)
     write_atomic(UNIVERSE_FILE, json.dumps(universe, ensure_ascii=False, indent=2))
     failed: list[str] = []
+    delisted_codes = set(universe.get("delisted", [])) - set(universe["eval"]) - set(universe["top"])
     for n, code in enumerate(dict.fromkeys(targets), 1):
         path = BARS_DIR / f"{code}.csv"
         if _has_bars(path) and not args.refresh:  # 헤더만 남은 파일은 다시 받는다
@@ -444,12 +455,13 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             if df is not None and len(df) > 0:
                 break
         series = _frame_to_series(code, df) if df is not None and len(df) > 0 else None
-        if code in prior_available and _has_bars(path) and (
+        protected = code not in delisted_codes or code in prior_available
+        if protected and _has_bars(path) and (
             series is None or not series.days or coverage_shrunk(path, series)
         ):
-            # 이전에 정상 수신된 상폐 종목의 실패·부분 응답: 옛 일봉을 커버리지 기준으로 남겨 두고
-            # 필수 실패로 처리 — fetch 는 미완료라 섞인 파일이 승인되지 않고, 재시도(--refresh)가
-            # 다시 받을 때 이 기준과 대조한다.
+            # 필수 종목(지수·평가·시총 상위)이나 이전에 정상 수신된 상폐 종목의 실패·부분 응답(기존
+            # 일봉보다 늦게 시작·일찍 끝남): 옛 일봉을 커버리지 기준으로 남겨 두고 필수 실패로 처리
+            # — fetch 는 미완료라 섞인 파일이 승인되지 않고, 재시도(--refresh)가 이 기준과 대조한다.
             failed.append(code)
             continue
         if series is None or not series.days:  # 원본이 비었거나 정규화 후 유효 봉 0개

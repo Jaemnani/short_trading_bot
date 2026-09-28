@@ -16,7 +16,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -1065,3 +1065,100 @@ def test_coverage_shrunk_detects_partial_responses(tmp_path: Path) -> None:
     assert not mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2014, 6, 30)))
     assert mx.coverage_shrunk(path, series(date(2013, 1, 2), date(2014, 6, 30)))  # 앞 잘림
     assert mx.coverage_shrunk(path, series(date(2012, 1, 2), date(2013, 1, 2)))  # 뒤 잘림
+
+
+# -- Codex 30차 리뷰 반영 ---------------------------------------------------------------
+
+
+def test_orphan_bars_force_full_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path / "bars")
+    assert not mx.orphan_bars({})  # 처음 — 캐시 없음
+    (tmp_path / "bars").mkdir()
+    (tmp_path / "bars" / "005930.csv").write_text("date,open,high,low,close,volume\n")
+    assert mx.orphan_bars({})  # 메타데이터 없이 남은 일봉 → 전체 새로고침 강제
+    assert not mx.orphan_bars({"top": ["000660"]})
+
+
+class _FakeFdr:
+    """cmd_fetch 통합 테스트용 FinanceDataReader 대역. ``bars[code]`` = (시작, 끝) 또는 None(실패)."""
+
+    DELISTED: ClassVar[list[str]] = [f"8{i:04d}0" for i in range(mx.MIN_DELISTED)]
+
+    def __init__(self) -> None:
+        full = (date(2010, 1, 4), date(2016, 3, 31))
+        self.bars: dict[str, tuple[date, date] | None] = {
+            c: full for c in [mx.KS11, *EVAL, *TOP]
+        }
+        self.bars.update({c: (date(2011, 1, 3), date(2014, 6, 30)) for c in self.DELISTED})
+
+    def StockListing(self, name: str) -> Any:  # FDR API 이름 그대로
+        import pandas as pd
+
+        if name == "KOSPI":
+            return pd.DataFrame([{"Code": c, "Marcap": 1e12 - i} for i, c in enumerate(TOP)])
+        return pd.DataFrame([{"Symbol": c, "Name": "x", "Market": "KOSDAQ",
+                              "DelistingDate": "2014-07-01", "SecuGroup": "주권"}
+                             for c in self.DELISTED])
+
+    def DataReader(self, symbol: str, start: str) -> Any:
+        import pandas as pd
+
+        span = self.bars.get(symbol.removeprefix("KRX-DELISTING:"))
+        if span is None:
+            return pd.DataFrame()
+        idx = pd.bdate_range(span[0], span[1])
+        one = [1.0] * len(idx)
+        return pd.DataFrame({"Open": one, "High": one, "Low": one, "Close": one, "Volume": one},
+                            index=idx)
+
+
+def _run_fetch(fake: _FakeFdr, monkeypatch: pytest.MonkeyPatch, *flags: str) -> dict[str, Any]:
+    import json
+
+    monkeypatch.setitem(sys.modules, "FinanceDataReader", fake)
+    ns = mx.main.__globals__["argparse"].Namespace(
+        delisted="--delisted" in flags, refresh="--refresh" in flags,
+        refresh_universe="--refresh-universe" in flags)
+    mx.cmd_fetch(ns)
+    return dict(json.loads(mx.UNIVERSE_FILE.read_text()))
+
+
+@pytest.fixture
+def fetch_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _FakeFdr:
+    monkeypatch.setattr(mx, "ROOT", tmp_path)
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path / "bars")
+    monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
+    return _FakeFdr()
+
+
+def test_fetch_rejects_shrunk_response_for_existing_current_ticker(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = _run_fetch(fetch_env, monkeypatch, "--delisted")
+    assert u["fetch_complete"] is True and len(mx.universe_tickers("B")) > len(TOP)
+    # 새로고침에서 시총 상위 종목이 앞부분이 잘린 응답(현재까지는 끝남)을 돌려줌
+    fetch_env.bars[TOP[5]] = (date(2014, 1, 2), date(2016, 3, 31))
+    # 이전에 정상 수신된 상폐 종목은 뒷부분이 잘린 응답
+    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2011, 1, 3), date(2012, 1, 2))
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is False
+    assert set(u["required_failed"]) == {TOP[5], _FakeFdr.DELISTED[7]}
+    # 옛 일봉은 커버리지 기준으로 보존 (축소 응답으로 덮지 않음)
+    assert mx._first_day(mx.BARS_DIR / f"{TOP[5]}.csv") == date(2010, 1, 4)
+    with pytest.raises(SystemExit, match="--refresh"):  # 옵션 없는 재개 거부
+        _run_fetch(fetch_env, monkeypatch, "--delisted")
+    fetch_env.bars[TOP[5]] = (date(2010, 1, 4), date(2016, 3, 31))  # 복구
+    fetch_env.bars[_FakeFdr.DELISTED[7]] = (date(2011, 1, 3), date(2014, 6, 30))
+    u = _run_fetch(fetch_env, monkeypatch, "--refresh", "--delisted")
+    assert u["fetch_complete"] is True and u["required_failed"] == []
+
+
+def test_fetch_without_metadata_refreshes_leftover_bars(
+    fetch_env: _FakeFdr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run_fetch(fetch_env, monkeypatch)
+    old = mx.BARS_DIR / f"{EVAL[0]}.csv"
+    old.write_text("date,open,high,low,close,volume\n2010-01-04,1,1,1,1,1\n")  # 옛 시점 일봉
+    mx.UNIVERSE_FILE.unlink()  # 메타데이터만 삭제
+    _run_fetch(fetch_env, monkeypatch)  # 옵션 없이 실행해도 전체 새로고침
+    assert mx._last_day(old) == date(2016, 3, 31)
