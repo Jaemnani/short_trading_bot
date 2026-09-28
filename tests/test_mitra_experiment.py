@@ -379,3 +379,63 @@ def test_fingerprint_tracks_config_and_bars(tmp_path: Path, monkeypatch: pytest.
     # 로지스틱은 체크포인트와 무관
     assert mx.experiment_fingerprint("logit", "A", TEMPLATE, ["005930"], "x") == \
         mx.experiment_fingerprint("logit", "A", TEMPLATE, ["005930"], "y")
+
+
+# -- Codex 2차 리뷰 반영 ----------------------------------------------------------------
+
+
+def _universe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bars: list[str],
+              u: dict[str, Any]) -> None:
+    import json
+
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path / "bars")
+    monkeypatch.setattr(mx, "UNIVERSE_FILE", tmp_path / "universe.json")
+    (tmp_path / "bars").mkdir()
+    for t in bars:
+        (tmp_path / "bars" / f"{t}.csv").write_text("date,open,high,low,close,volume\n")
+    (tmp_path / "universe.json").write_text(json.dumps(u))
+
+
+def test_universe_rejects_missing_bars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    u = {"eval": ["005930"], "top": ["000660", "005380"], "delisted": ["111110", "222220"],
+         "unavailable": ["222220"]}
+    _universe(tmp_path, monkeypatch, ["KS11", "005930", "000660", "111110"], u)
+    with pytest.raises(SystemExit, match="005380"):  # 필수 종목 누락 → 조용히 빼지 않고 중단
+        mx.universe_tickers("A")
+
+
+def test_universe_b_excludes_only_recorded_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {"eval": ["005930"], "top": ["000660"], "delisted": ["111110", "222220", "333330"],
+         "unavailable": ["222220"]}
+    _universe(tmp_path, monkeypatch, ["KS11", "005930", "000660", "111110", "333330"], u)
+    assert mx.universe_tickers("B") == ["005930", "000660", "111110", "333330"]
+    (tmp_path / "bars" / "333330.csv").unlink()  # 기록되지 않은 누락 → 거부
+    with pytest.raises(SystemExit, match="333330"):
+        mx.universe_tickers("B")
+
+
+def test_sample_cache_invalidated_by_ks11_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    monkeypatch.setattr(mx, "BARS_DIR", tmp_path)
+    (tmp_path / "KS11.csv").write_text("a\n")
+    (tmp_path / "005930.csv").write_text("b\n")
+    cache = tmp_path / "005930.json"
+    cache.write_text(json.dumps({"bars_sha": mx.file_sha(tmp_path / "005930.csv"),
+                                 "ks_sha": mx.file_sha(tmp_path / "KS11.csv"), "rows": []}))
+    assert mx._cache_fresh(cache, tmp_path / "005930.csv")
+    (tmp_path / "KS11.csv").write_text("changed\n")
+    assert not mx._cache_fresh(cache, tmp_path / "005930.csv")
+
+
+def test_latency_must_match_evaluation_config() -> None:
+    lat = {"seconds": 10.0, "hf_model": "m2", "support": mx.MAX_SUPPORT,
+           "features": len(mx.FEATURES)}
+    assert mx.latency_matches(lat, "m2")
+    assert not mx.latency_matches(lat, "other")
+    assert not mx.latency_matches({**lat, "support": 1000}, "m2")
+    assert not mx.latency_matches({k: v for k, v in lat.items() if k != "hf_model"}, "m2")

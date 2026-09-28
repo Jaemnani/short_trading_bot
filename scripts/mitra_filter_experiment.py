@@ -245,7 +245,19 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         save_series(_frame_to_series(code, df), path)
         if n % 50 == 0:
             print(f"  {n}/{len(targets)} …", flush=True)
+    # 조회 불가로 인정하는 것은 상폐 종목뿐 (유니버스 B 에서 명시적으로 제외·보고). 그 외 실패는
+    # predict 가 거부한다 — 조용히 빠진 종목으로 '완전한' 예측이 만들어지지 않게.
+    delisted = set(universe.get("delisted", []))
+    universe["unavailable"] = sorted(
+        c for c in delisted if not (BARS_DIR / f"{c}.csv").exists()
+    )
+    UNIVERSE_FILE.write_text(json.dumps(universe, ensure_ascii=False, indent=2))
+    required_failed = [c for c in failed if c not in delisted]
     print(f"fetch 완료: 대상 {len(targets)}, 실패 {len(failed)} {failed[:10]}")
+    if required_failed:
+        print(f"⚠️ 필수 종목(지수·평가·시총 상위) 실패 {required_failed} — 재실행 전엔 predict 불가")
+    if universe["unavailable"]:
+        print(f"상폐 {len(delisted)}종목 중 조회 불가 {len(universe['unavailable'])} — B 에서 제외")
 
 
 # -- 템플릿 ----------------------------------------------------------------------------------
@@ -442,7 +454,8 @@ def _build_one(job: tuple[str, str, str, dict[str, Any]]) -> tuple[str, int]:
          "f": {str(n): [ld.isoformat(), r] for n, (ld, r) in smp.fwd.items()}}
         for smp in samples
     ]
-    payload = {"bars_sha": file_sha(Path(bars_path)), "rows": rows}
+    payload = {"bars_sha": file_sha(Path(bars_path)), "ks_sha": file_sha(BARS_DIR / f"{KS11}.csv"),
+               "rows": rows}
     _samples_path(Path(cache_dir), ticker).write_text(json.dumps(payload))
     return ticker, len(rows)
 
@@ -454,7 +467,11 @@ def _cache_fresh(path: Path, bars: Path) -> bool:
         cached = json.loads(path.read_text())
     except ValueError:
         return False
-    return isinstance(cached, dict) and cached.get("bars_sha") == file_sha(bars)
+    return (
+        isinstance(cached, dict)
+        and cached.get("bars_sha") == file_sha(bars)
+        and cached.get("ks_sha") == file_sha(BARS_DIR / f"{KS11}.csv")  # 시장 피처 원천
+    )
 
 
 def load_samples(tickers: Iterable[str], template: dict[str, Any], jobs: int) -> list[Sample]:
@@ -773,13 +790,29 @@ def _append_preds(path: Path, rows: list[Pred]) -> None:
 
 
 def universe_tickers(universe: str) -> list[str]:
+    """선언된 유니버스 구성 종목. B 는 fetch 가 '조회 불가'로 기록한 상폐 종목만 제외한다.
+
+    일봉이 하나라도 없으면 SystemExit — 누락 종목을 조용히 뺀 채 완전하다고 채점하지 않는다."""
     u = json.loads(UNIVERSE_FILE.read_text())
     tickers = [*u["eval"], *u["top"]]
     if universe == "B":
         if "delisted" not in u:
             raise SystemExit("유니버스 B 는 먼저 `fetch --delisted` 필요")
-        tickers += u["delisted"]
-    return list(dict.fromkeys(tickers))
+        unavailable = set(u.get("unavailable", []))
+        tickers += [c for c in u["delisted"] if c not in unavailable]
+    tickers = list(dict.fromkeys(tickers))
+    missing = [t for t in (KS11, *tickers) if not (BARS_DIR / f"{t}.csv").exists()]
+    if missing:
+        raise SystemExit(
+            f"유니버스 {universe}: 일봉 없는 종목 {len(missing)}개 {missing[:10]} — fetch 재실행 필요"
+        )
+    return tickers
+
+
+def unavailable_note() -> str:
+    u = json.loads(UNIVERSE_FILE.read_text()) if UNIVERSE_FILE.exists() else {}
+    return (f"상폐 {len(u.get('delisted', []))}종목 중 조회 불가 {len(u.get('unavailable', []))}"
+            "종목 제외")
 
 
 def split_pool_queries(
@@ -1105,6 +1138,8 @@ def g0_section(lines: list[str], template: dict[str, Any], hf_model: str) -> boo
             lines.append(f"- 유니버스 {universe}: Mitra/로지스틱 표본 불일치 → **G0 판정 불가**")
             ok = False
             continue
+        if universe == "B":
+            lines.append(f"  - ({unavailable_note()})")
         if logit is None:
             lines.append(f"  - ({why_l})")
         pool = [p for p in mitra if p.label is not None]
@@ -1176,7 +1211,11 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     lat_path = ROOT / "latency.json"
     lat = json.loads(lat_path.read_text()) if lat_path.exists() else None
-    g3 = lat is not None and float(lat["seconds"]) <= G3_MAX_LATENCY_S
+    lat_ok = lat is not None and latency_matches(lat, args.hf_model)
+    if lat is not None and not lat_ok:
+        lat = {**lat, "불일치": f"현재 구성(hf_model={args.hf_model}, 지지 {MAX_SUPPORT}, "
+                              f"피처 {len(FEATURES)})과 다름 → latency 재측정 필요"}
+    g3 = lat is not None and lat_ok and float(lat["seconds"]) <= G3_MAX_LATENCY_S
     lines += ["", "## G3 지연", "",
               f"- {lat if lat else '측정 없음 (`latency` 먼저 실행)'} → {'✓' if g3 else '✗'}"]
 
@@ -1192,6 +1231,14 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print(report)
 
 
+def latency_matches(lat: dict[str, Any], hf_model: str) -> bool:
+    """G3 는 현재 평가 구성(체크포인트·지지 크기·피처 수)으로 잰 측정만 인정한다."""
+    return (
+        lat.get("hf_model") == hf_model and lat.get("support") == MAX_SUPPORT
+        and lat.get("features") == len(FEATURES)
+    )
+
+
 def cmd_latency(args: argparse.Namespace) -> None:
     """지지 5,000행, 32피처, 질의 1행 — 모델 적재 포함 1회 예측 시간(3회 중 최솟값)."""
     rng = np.random.default_rng(0)
@@ -1205,7 +1252,8 @@ def cmd_latency(args: argparse.Namespace) -> None:
         predictor.predict(xs, ys, xq)
         times.append(time.perf_counter() - t0)
     info = {"seconds": round(min(times), 2), "runs": [round(t, 2) for t in times],
-            "device": args.device, "fast": not args.slow, "support": MAX_SUPPORT,
+            "hf_model": args.hf_model, "device": args.device, "fast": not args.slow,
+            "support": MAX_SUPPORT,
             "features": len(FEATURES)}
     ROOT.mkdir(parents=True, exist_ok=True)
     (ROOT / "latency.json").write_text(json.dumps(info))
